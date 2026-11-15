@@ -1,0 +1,19 @@
+services:
+  dm:
+    build: .
+    container_name: lean-dm
+    restart: unless-stopped
+    ports:
+      - "${DM_PORT:-7860}:7860"
+    environment:
+      - DM_BASE_URL=${DM_BASE_URL}
+      - DM_API_KEY=${DM_API_KEY}
+      - DM_MODEL=${DM_MODEL}
+      - SCRIBE_MODEL=${SCRIBE_MODEL}
+      - HISTORY_TURNS=${HISTORY_TURNS:-8}
+      - SUMMARY_EVERY=${SUMMARY_EVERY:-10}
+      - FACTS_CAP=${FACTS_CAP:-200}
+      - CAMPAIGN=${CAMPAIGN:-default}
+    volumes:
+      - ./campaigns:/app/campaigns    # source of truth stays on the host
+      - ./.env:/app/.env:ro           # fallback if you prefer file-based config
