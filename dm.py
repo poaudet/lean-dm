@@ -1,44 +1,30 @@
 #!/usr/bin/env python3
 """
-dm.py — lean chat-based RPG dungeon master (terminal + tiny web UI).
+dm.py v3 — lean chat-based RPG dungeon master (terminal + web UI).
 
-Doctrine: files are the source of truth; the context is assembled by code, never trusted to the model.
+Doctrine: files are the source of truth; context is assembled by code. With a 1M-token model the narrator
+sees the FULL verbatim history; summaries and the ledger are an index and a safety net, not a replacement.
 
+  campaigns/settings.json   all settings (edit on /config in the web UI, or by hand)
   campaigns/<name>/
-    history.jsonl  append-only log of every exchange (/undo and /retry move old text to undone.jsonl)
-    premise.md     pinned canon: character, tone, world rules. Seeded from your first message; edit freely
-    summary.md     rolling summary of everything already folded
-    facts.json     current facts (the scribe adds AND removes entries)
-    state.json     {"folded": N}: how many history messages are already absorbed into summary + facts
-    summaries/     archive of every previous summary
-    undone.jsonl   exchanges removed by /undo and /retry
+    history.jsonl   append-only log (/undo and /retry move old text to undone.jsonl)
+    premise.md      pinned canon (seeded from your first message; edit freely)
+    summary.md      chapters of folded play (appended, never rewritten)
+    ledger.json     keyed canon state: [{id, kind, name, state, status, src, msg}]
+    audit.md        latest continuity audit
+    state.json      {"folded": N, "ledgered": M, "audited": K}
 
-Per-turn context = ONE system message (persona + premise + summary + facts) + every message after the
-fold pointer. When the unfolded tail passes HISTORY_TURNS + FOLD_TURNS exchanges, a background job folds
-the oldest FOLD_TURNS exchanges (player + DM text) into summary + facts and advances the pointer LAST, so a
-crash can duplicate work but never lose it. The verbatim window therefore floats between HISTORY_TURNS and
-HISTORY_TURNS + FOLD_TURNS exchanges, and /undo and /retry can only reach back into that window.
+Prompt = [system: persona + premise (+ chapters if folded)] + verbatim history since `folded`
+         + the player's action, with the canon ledger appended to that last message.
+Everything before the last message is append-only, so provider prefix caching can hit.
 
-Modes:
-  python dm.py                   terminal play (/undo /retry /context /quit)
-  python dm.py --web             small web UI on DM_PORT (default 7860)
+  python dm.py                      terminal play (/undo /retry /context /ledger /audit /rebuild /quit)
+  python dm.py --web                web UI + /config page
   python dm.py --campaign noir
-  python dm.py --show-context    print exactly what the next turn would send, then exit
-
-Configuration — env vars only (a .env file next to this script is loaded first):
-  DM_BASE_URL    OpenAI-compatible endpoint (default https://openrouter.ai/api/v1)
-  DM_API_KEY     API key ("ollama" for local Ollama)          [required]
-  DM_MODEL       narrator model                               [required]
-  SCRIBE_MODEL   cheap summarizer/extractor model (default: DM_MODEL)
-  SCRIBE_TEMP    scribe temperature (default 0; set empty to omit if your model rejects it)
-  HISTORY_TURNS  minimum exchanges kept verbatim (default 8)
-  FOLD_TURNS     exchanges folded per background pass (default 4)
-  FACTS_CAP      max stored facts, newest kept (default 200)
-  DM_PORT        web UI port (default 7860)
-  CAMPAIGN       default campaign name (default "default")
-
-Local servers: make sure the server's context length (Ollama: num_ctx) exceeds the assembled prompt.
-The per-turn "context ≈Nk tok" line and --show-context tell you how big it is.
+  python dm.py --show-context       print what the next turn would send, then exit
+  python dm.py --rebuild-ledger     rebuild ledger.json from the raw history
+  python dm.py --audit              run the continuity audit
+  python dm.py --reset-fold         migrate a v2 campaign: archive summary/facts, folded=0, rebuild ledger
 
 Dependencies: pip install flask requests
 """
@@ -46,70 +32,51 @@ Dependencies: pip install flask requests
 import json, os, sys, pathlib, threading, time, html, re, shutil
 import requests
 from flask import Flask, request, jsonify, Response
+from config import cfg, SETTINGS_PATH
 
-# ---------------- config ----------------
+# ---------------- paths ----------------
 
-def load_dotenv(path=pathlib.Path(__file__).parent / ".env"):
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k, v = k.strip(), v.strip().strip('"').strip("'")
-        os.environ.setdefault(k, v)   # real env wins over .env
-
-load_dotenv()
-
-CFG = {
-    "base_url":    os.environ.get("DM_BASE_URL", "https://openrouter.ai/api/v1"),
-    "api_key":     os.environ.get("DM_API_KEY", ""),
-    "model":       os.environ.get("DM_MODEL", ""),
-    "scribe":      os.environ.get("SCRIBE_MODEL", ""),
-    "scribe_temp": os.environ.get("SCRIBE_TEMP", "0"),
-    "hist_n":      max(1, int(os.environ.get("HISTORY_TURNS", "8"))),
-    "fold_n":      max(1, int(os.environ.get("FOLD_TURNS", "4"))),
-    "facts_cap":   max(1, int(os.environ.get("FACTS_CAP", "200"))),
-    "port":        int(os.environ.get("DM_PORT", "7860")),
-    "campaign":    os.environ.get("CAMPAIGN", "default"),
-}
-CFG["scribe"] = CFG["scribe"] or CFG["model"]
-SCRIBE_EXTRA = {"temperature": float(CFG["scribe_temp"])} if CFG["scribe_temp"].strip() else {}
-
-CAMPAIGN = CFG["campaign"]
+CAMPAIGN = cfg.campaign
 if "--campaign" in sys.argv:
-    CAMPAIGN = sys.argv[sys.argv.index("--campaign") + 1]
+    CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
 ROOT = pathlib.Path(__file__).parent / "campaigns" / CAMPAIGN
 HISTORY, UNDONE = ROOT / "history.jsonl", ROOT / "undone.jsonl"
 PREMISE, SUMMARY = ROOT / "premise.md", ROOT / "summary.md"
-FACTS, STATE, ARCHIVE = ROOT / "facts.json", ROOT / "state.json", ROOT / "summaries"
+LEDGER, AUDIT, STATE = ROOT / "ledger.json", ROOT / "audit.md", ROOT / "state.json"
 
-TURN_LOCK = threading.Lock()   # one player action (turn / undo / retry) at a time
-FOLD_LOCK = threading.Lock()   # one background fold at a time
-FOLD_THREAD = None
-LAST = {"est": 0, "prompt_tokens": None}   # size of the last assembled prompt, for display
+TURN_LOCK = threading.Lock()    # one player action (turn / undo / retry) at a time
+MAINT_LOCK = threading.Lock()   # one maintenance job (ledger / fold / audit) at a time
+STATE_LOCK = threading.Lock()
+JOB_LOCK = threading.Lock()
+MAINT_THREAD = None
+JOB = {"name": "", "running": False, "msg": ""}
+LAST = {"est": 0, "prompt_tokens": None, "cached": None}
 
-SYSTEM = """You are the Dungeon Master of a text RPG.
-Rules:
-- Narrate vividly but concisely (120-220 words per turn). End with the situation awaiting the player's action.
-- Never act or decide for the player. Never mention dice or mechanics.
-- PREMISE and CURRENT FACTS are canon and override your own recollection. Names, debts, wounds, promises and items persist until the story changes them.
-- Speak NPC dialogue directly. Stay consistent with the established world.
-- Vary your openings and imagery; never echo phrasing from earlier turns."""
+KINDS = ("player", "person", "place", "item", "promise", "clock", "rule", "thread")
+RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
+
 
 def validate_config():
-    missing = [k for k in ("api_key", "model") if not CFG[k]]
+    missing = [k for k in ("api_key", "model") if not getattr(cfg, k)]
     if missing:
-        sys.exit(f"Missing required config: {', '.join('DM_' + m.upper() for m in missing)}\n"
-                 f"Set them as env vars or in a .env file next to dm.py.")
+        sys.exit(f"Missing settings: {', '.join(missing)}\nRun `python dm.py --web` and open /config, "
+                 f"or edit {SETTINGS_PATH}")
+
+
+def ensure_configured():
+    if not cfg.api_key or not cfg.model:
+        raise RuntimeError(f"model / API key not set — open /config in the web UI or edit {SETTINGS_PATH}")
+
 
 def print_config():
-    key = CFG["api_key"][:6] + "…" if len(CFG["api_key"]) > 6 else "***"
-    print(f"endpoint={CFG['base_url']}  key={key}")
-    print(f"model={CFG['model']}  scribe={CFG['scribe']}")
-    print(f"campaign='{CAMPAIGN}'  window={CFG['hist_n']}+{CFG['fold_n']} exchanges  facts_cap={CFG['facts_cap']}")
+    key = cfg.api_key[:6] + "…" if len(cfg.api_key) > 6 else ("***" if cfg.api_key else "(none)")
+    print(f"settings={SETTINGS_PATH}")
+    print(f"endpoint={cfg.base_url}  key={key}")
+    print(f"model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
+    print(f"campaign='{CAMPAIGN}'  fold {cfg.ctx_budget_tok // 1000}k→{cfg.ctx_target_tok // 1000}k tok  "
+          f"ledger={'on' if cfg.ledger_enabled else 'off'}")
+
 
 # ---------------- storage helpers ----------------
 
@@ -155,44 +122,125 @@ def load_history():
         warn(f"history.jsonl line {n} is unreadable and is being skipped")
     return out
 
-def load_facts(strict=False):
+def _int(v):
     try:
-        facts = json.loads(FACTS.read_text(encoding="utf-8"))
-        if not isinstance(facts, list):
-            raise ValueError("expected a JSON array")
-        return [f for f in facts if isinstance(f, str)]
-    except (ValueError, OSError) as e:
-        if strict:
-            raise                                       # the fold must abort, never overwrite a hand edit
-        warn(f"facts.json unreadable ({e}); ignoring it until it is fixed")
-        return []
-
-def save_facts(facts):
-    atomic_write(FACTS, json.dumps(facts[-CFG["facts_cap"]:], ensure_ascii=False, indent=1))
-
-def folded():
-    try:
-        return max(0, int(json.loads(STATE.read_text(encoding="utf-8"))["folded"]))
-    except (ValueError, KeyError, TypeError, OSError):
+        return max(0, int(v))
+    except (TypeError, ValueError):
         return 0
 
+def get_state():
+    try:
+        s = json.loads(STATE.read_text(encoding="utf-8"))
+        return s if isinstance(s, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+def set_state(**kw):
+    with STATE_LOCK:
+        s = get_state()
+        s.update(kw)
+        atomic_write(STATE, json.dumps(s))
+
+def folded():
+    return _int(get_state().get("folded"))
+
+def ledgered():
+    return _int(get_state().get("ledgered"))
+
+def load_ledger(strict=False):
+    try:
+        d = json.loads(LEDGER.read_text(encoding="utf-8"))
+        if not isinstance(d, list):
+            raise ValueError("expected a JSON array")
+        return [e for e in d if isinstance(e, dict) and e.get("id")]
+    except (ValueError, OSError) as e:
+        if strict:
+            raise                                       # never overwrite a hand edit
+        warn(f"ledger.json unreadable ({e}); ignoring it until it is fixed")
+        return []
+
 def init_files():
-    ARCHIVE.mkdir(parents=True, exist_ok=True)          # also creates ROOT
+    ROOT.mkdir(parents=True, exist_ok=True)
     for p in (HISTORY, UNDONE, SUMMARY):
         if not p.exists():
             p.write_text("", encoding="utf-8")
-    if not FACTS.exists():
-        FACTS.write_text("[]", encoding="utf-8")
-    history = load_history()                            # warns once about unreadable lines
-    if not STATE.exists():                              # new campaign, or one that predates the fold design
-        n = max(0, len(history) - 2 * CFG["hist_n"]) if read(SUMMARY) else 0
-        atomic_write(STATE, json.dumps({"folded": n - n % 2}))
+    if not LEDGER.exists():
+        LEDGER.write_text("[]", encoding="utf-8")
+    history = load_history()
+    if not STATE.exists():                              # new campaign, or a pre-state one
+        n = max(0, len(history) - 2 * cfg.keep_min_turns) if read(SUMMARY) else 0
+        atomic_write(STATE, json.dumps({"folded": n - n % 2, "ledgered": 0}))
     if history and not read(PREMISE):
         first = next((m["content"] for m in history if m["role"] == "user"), "")
         if first:
             atomic_write(PREMISE, first)
 
-# ---------------- context builder ----------------
+
+# ---------------- tokens, ledger, context ----------------
+
+def tok(n_chars):
+    return int(n_chars / max(0.5, cfg.chars_per_tok))
+
+def est_tokens(msgs):
+    return tok(sum(len(m["content"]) for m in msgs))
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:48]
+
+def _lst(x):
+    return x if isinstance(x, list) else []
+
+def apply_ledger_ops(ledger, ops):
+    by = {e["id"]: e for e in ledger}
+    for u in _lst(ops.get("upsert")):
+        if not isinstance(u, dict):
+            continue
+        eid = slug(u.get("id") or u.get("name") or "")
+        if not eid or not str(u.get("state", "")).strip():
+            continue
+        e = by.get(eid) or {"id": eid}
+        kind = str(u.get("kind", "")).strip().lower()
+        e["kind"] = kind if kind in KINDS else e.get("kind", "thread")
+        e["name"] = str(u.get("name") or e.get("name") or eid).strip()
+        e["state"] = str(u["state"]).strip()
+        src = str(u.get("src", "")).strip().lower()
+        e["src"] = src if src in ("player", "dm", "note") else e.get("src", "dm")
+        try:
+            e["msg"] = int(u.get("msg"))
+        except (TypeError, ValueError):
+            e.setdefault("msg", None)
+        e["status"] = "active"                          # an upsert reopens a closed entry
+        by[eid] = e
+    for i in _lst(ops.get("close")):
+        if slug(i) in by:
+            by[slug(i)]["status"] = "closed"
+    for i in _lst(ops.get("delete")):
+        by.pop(slug(i), None)
+    out = list(by.values())
+    if len(out) > cfg.ledger_max:                       # over the cap: oldest CLOSED entries go first
+        closed = sorted((e for e in out if e.get("status") == "closed"), key=lambda e: e.get("msg") or 0)
+        drop = {e["id"] for e in closed[: len(out) - cfg.ledger_max]}
+        out = [e for e in out if e["id"] not in drop]
+    return out
+
+def render_ledger(ledger):
+    if not ledger:
+        return ""
+    order = {k: i for i, k in enumerate(KINDS)}
+    act = sorted((e for e in ledger if e.get("status") != "closed"),
+                 key=lambda e: (order.get(e.get("kind"), 99), str(e.get("name", ""))))
+    closed = sorted((e for e in ledger if e.get("status") == "closed"),
+                    key=lambda e: e.get("msg") or 0)[-cfg.ledger_closed_max:] if cfg.ledger_closed_max else []
+    lines, cur = [], None
+    for e in act:
+        if e.get("kind") != cur:
+            cur = e.get("kind")
+            lines.append(f"[{str(cur).upper()}]")
+        lines.append(f"- {e.get('name')}: {e.get('state')}")
+    if closed:
+        lines.append("[PAST / RESOLVED — do not revive]")
+        lines += [f"- {e.get('name')}: {e.get('state')}" for e in closed]
+    return "\n".join(lines)
 
 def merge_same_role(msgs):
     out = []
@@ -205,23 +253,35 @@ def merge_same_role(msgs):
 
 def build_context(history):
     """history must end with the pending player action."""
-    parts = [SYSTEM]
-    if p := read(PREMISE): parts.append("PREMISE (fixed canon):\n" + p)
-    if s := read(SUMMARY): parts.append("STORY SO FAR:\n" + s)
-    if f := load_facts():  parts.append("CURRENT FACTS:\n- " + "\n- ".join(f))
-    tail = history[min(folded(), len(history) - 1):]
+    k = folded()
+    parts = [cfg.system_prompt]
+    if p := read(PREMISE):
+        parts.append("PREMISE (fixed canon):\n" + p)
+    if k and (s := read(SUMMARY)):
+        parts.append("STORY SO FAR (older play, already summarized; everything after it is verbatim below):\n" + s)
+    tail = history[min(k, len(history) - 1):]
     if tail and tail[0]["role"] == "assistant":         # only if history parity was ever disturbed
         tail = tail[1:]
-    return [{"role": "system", "content": "\n\n".join(parts)}] + merge_same_role(tail)
-
-def est_tokens(msgs):
-    return sum(len(m["content"]) for m in msgs) // 4
+    msgs = merge_same_role(tail)
+    canon = render_ledger(load_ledger()) if cfg.ledger_enabled else ""
+    if canon and msgs and msgs[-1]["role"] == "user":   # volatile part goes LAST to keep the prefix cacheable
+        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                    "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
+                    "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon +
+                    "\n--- end of ledger: now narrate the outcome of the player's action above."}
+    return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
 
 def ctx_label():
     est, real = LAST["est"], LAST["prompt_tokens"]
     if not est:
         return ""
-    return f"context ≈{est / 1000:.1f}k tok" + (f" (provider: {real / 1000:.1f}k)" if real else "")
+    s = f"context ≈{est / 1000:.1f}k tok"
+    if real:
+        s += f" (provider {real / 1000:.1f}k"
+        if LAST["cached"]:
+            s += f", {100 * LAST['cached'] // real}% cached"
+        s += ")"
+    return s
 
 def show_context():
     h = load_history()
@@ -230,60 +290,107 @@ def show_context():
         print(f"--- {m['role']} ---\n{m['content']}\n")
     print(f"[≈{est_tokens(ctx)} tokens · {len(h) - min(folded(), len(h))} of {len(h)} messages verbatim]")
 
+
 # ---------------- model calls ----------------
 
 class ApiError(RuntimeError):
-    def __init__(self, msg, retry=False):
+    def __init__(self, msg, retry=False, wait=None):
         super().__init__(msg)
-        self.retry = retry
+        self.retry, self.wait = retry, wait
 
-def _post(payload, stream=False):
-    url = f"{CFG['base_url'].rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {CFG['api_key']}"}
-    timeout = (10, 300) if stream else 180
-    last = None
-    for attempt in range(3):
+TRANSIENT = (requests.ConnectionError, requests.Timeout, ApiError)
+
+def _raw_post(payload, stream=False):
+    url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    r = requests.post(url, headers={"Authorization": f"Bearer {cfg.api_key}"}, json=payload,
+                      timeout=(10, cfg.timeout_sec), stream=stream)
+    if r.status_code >= 400:
+        wait = None
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
-            if r.status_code >= 400:                    # 4xx other than 429 will never succeed on retry
-                raise ApiError(f"HTTP {r.status_code}: {r.text[:300]}",
-                               retry=r.status_code in (429, 500, 502, 503, 504))
-            return r
-        except (requests.ConnectionError, requests.Timeout, ApiError) as e:
-            last = e
-            if attempt == 2 or (isinstance(e, ApiError) and not e.retry):
-                break
-            wait = 2 ** attempt
-            print(f"[api error ({e}); retry {attempt + 1}/2 in {wait}s]")
+            wait = min(120.0, float(r.headers.get("Retry-After")))
+        except (TypeError, ValueError):
+            pass
+        raise ApiError(f"HTTP {r.status_code}: {r.text[:300]}", retry=r.status_code in RETRY_CODES, wait=wait)
+    return r
+
+def _with_retries(fn, retries=None):
+    n = (cfg.retries if retries is None else retries) + 1
+    for attempt in range(n):
+        try:
+            return fn()
+        except TRANSIENT as e:
+            if attempt == n - 1 or (isinstance(e, ApiError) and not e.retry):
+                raise
+            wait = (e.wait if isinstance(e, ApiError) and e.wait else None) or min(90.0, cfg.retry_base_sec * 2 ** attempt)
+            print(f"[api error ({str(e)[:120]}); retry {attempt + 1}/{n - 1} in {wait:.0f}s]")
             time.sleep(wait)
-    raise last
+
+def _with_fallback(call, primary, fallback=True):
+    try:
+        return call(primary)
+    except TRANSIENT as e:
+        fb = cfg.fallback_model
+        if fallback and fb and fb != primary:
+            print(f"[{primary} failed ({str(e)[:100]}); trying fallback {fb}]")
+            return call(fb)
+        raise
 
 def note_usage(u):
     if isinstance(u, dict) and u.get("prompt_tokens"):
         LAST["prompt_tokens"] = u["prompt_tokens"]
+        d = u.get("prompt_tokens_details")
+        LAST["cached"] = d.get("cached_tokens") if isinstance(d, dict) else None
 
 def clean_reply(text):
-    """Strip reasoning blocks that some local models emit inline."""
+    """Strip reasoning blocks that some models emit inline."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
-    if "</think>" in text:                              # the opening tag lived in the prompt template
+    if "</think>" in text:
         text = text.split("</think>", 1)[1]
-    return text.split("<think>", 1)[0].strip()          # unterminated block: drop it
+    return text.split("<think>", 1)[0].strip()
 
-def chat_complete(messages, model=None, *, track=True, **extra):
-    data = _post({"model": model or CFG["model"], "messages": messages, "stream": False, **extra}).json()
-    if data.get("error"):
-        raise RuntimeError(f"API error: {str(data['error'])[:300]}")
-    if track:
-        note_usage(data.get("usage"))
-    msg = ((data.get("choices") or [{}])[0].get("message")) or {}
-    content = msg.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("model returned an empty reply")
-    return content
+def narrator_extra():
+    x = {}
+    if cfg.narrator_temp.strip():
+        x["temperature"] = float(cfg.narrator_temp)
+    if cfg.narrator_max_tokens > 0:
+        x["max_tokens"] = cfg.narrator_max_tokens
+    return x
+
+def scribe_extra():
+    return {"temperature": float(cfg.scribe_temp)} if cfg.scribe_temp.strip() else {}
+
+def scribe_model():
+    return cfg.scribe_model or cfg.model
+
+def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+    def call(m):
+        def go():
+            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra})
+            try:
+                data = r.json()
+            except ValueError:
+                raise ApiError("non-JSON response", retry=True)
+            if data.get("error"):
+                err = data["error"]
+                code = err.get("code") if isinstance(err, dict) else None
+                raise ApiError(f"API error: {str(err)[:300]}", retry=code in RETRY_CODES)
+            if track:
+                note_usage(data.get("usage"))
+            msg = ((data.get("choices") or [{}])[0].get("message")) or {}
+            content = msg.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ApiError("model returned an empty reply", retry=True)
+            return content
+        return _with_retries(go, retries)
+    return _with_fallback(call, model or cfg.model, fallback)
 
 def chat_stream(messages):
     """Stream the narrator's reply to the terminal; returns the full text."""
-    r = _post({"model": CFG["model"], "messages": messages, "stream": True}, stream=True)
+    def open_(m):
+        payload = {"model": m, "messages": messages, "stream": True,
+                   "stream_options": {"include_usage": True}, **narrator_extra()}
+        return _with_retries(lambda: _raw_post(payload, stream=True))
+    r = _with_fallback(open_, cfg.model)
     text = ""
     try:
         for line in r.iter_lines():
@@ -309,66 +416,211 @@ def chat_stream(messages):
         raise RuntimeError("model returned an empty reply")
     return text
 
-# ---------------- fold (background summarizer + fact keeper) ----------------
+
+# ---------------- maintenance: ledger, fold, audit ----------------
+
+def fmt_play(h, a, b):
+    return "\n".join(f"[{i}] {'PLAYER' if h[i]['role'] == 'user' else 'DM'}: {h[i]['content']}" for i in range(a, b))
+
+def split_ranges(h, a, end):
+    """Cut h[a:end] into whole-exchange ranges of at most ~scribe_chunk_tok tokens."""
+    out = []
+    while a < end:
+        b, total = a, 0
+        while b < end and total < cfg.scribe_chunk_tok:
+            total += tok(len(h[b]["content"]))
+            b += 1
+        if (b - a) % 2:
+            b += 1
+        b = max(min(b, end), a + 1)
+        out.append((a, b))
+        a = b
+    return out
+
+def parse_json_obj(raw):
+    return json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+
+LEDGER_PROMPT = (
+    "Update the canon ledger from the new play. Return ONLY JSON: "
+    '{"upsert": [entry...], "close": [ids], "delete": [ids]}.\n'
+    'entry = {"id": stable-lowercase-slug, "kind": "player|person|place|item|promise|clock|rule|thread", '
+    '"name": "...", "state": "one line: the CURRENT truth", "src": "player|dm|note", '
+    '"msg": index of the message where it last changed}\n'
+    "Rules:\n"
+    "- One entry per entity/thing. Reuse the existing id to update it; never create a second entry for the same thing.\n"
+    "- Durable canon only: who/where/what-state, exact counts, days, deadlines, ownership, promises, debts, injuries, "
+    "decisions the player declared. Skip moment-to-moment action and atmosphere.\n"
+    "- Be specific: keep numbers, names, locations. Characters who matter must keep an entry with their last known "
+    "location and open business, even if they have been offscreen for a long time.\n"
+    "- Player messages starting with 'note to dm', 'ooc' or in parentheses are out-of-character corrections: apply "
+    "them and set src to 'note'.\n"
+    "- If the DM contradicts an established value without the story changing it, keep the established value and add "
+    "'(DM said X at [n])' to the state.\n"
+    "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
+
+def record_pass(upto=None):
+    """Advance the ledger over history[ledgered:upto]. Caller holds MAINT_LOCK."""
+    h = load_history()
+    ptr = ledgered()
+    if upto is None:                                    # scheduled pass: trail the newest exchanges
+        upto = len(h) - 2 * cfg.ledger_lag_turns
+        if upto - ptr < 2 * cfg.ledger_every_turns:
+            return
+    upto = min(upto, len(h))
+    upto -= upto % 2
+    if upto <= ptr:
+        return
+    ledger = load_ledger(strict=True)
+    for a, b in split_ranges(h, ptr, upto):
+        raw = clean_reply(chat_complete([
+            {"role": "system", "content": "You maintain the canon ledger of a text RPG. Output only JSON."},
+            {"role": "user", "content": "CURRENT LEDGER:\n" + json.dumps(ledger, ensure_ascii=False) +
+             "\n\nNEW PLAY (message index in brackets):\n" + fmt_play(h, a, b) + "\n\n" + LEDGER_PROMPT}],
+            model=scribe_model(), track=False, **scribe_extra()))
+        ledger = apply_ledger_ops(ledger, parse_json_obj(raw))
+        atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
+        set_state(ledgered=b)                           # pointer LAST, per range
+        print(f"[ledger: messages {a}–{b - 1} recorded; {len(ledger)} entries]")
 
 def fold_if_needed():
-    """Absorb the oldest exchanges into summary + facts once the verbatim tail has grown too long."""
-    if not FOLD_LOCK.acquire(blocking=False):           # single-flight
+    """Once the verbatim tail passes the budget, fold its oldest part into chapters. Caller holds MAINT_LOCK."""
+    h, k = load_history(), folded()
+    tail = h[k:]
+    total = est_tokens(tail)
+    if total < cfg.ctx_budget_tok:
+        return
+    keep, n = 2 * cfg.keep_min_turns, 0
+    while total > cfg.ctx_target_tok and n < len(tail) - keep:
+        total -= tok(len(tail[n]["content"]))
+        n += 1
+    n -= n % 2
+    if n < 2:
+        return
+    end = k + n
+    if cfg.ledger_enabled:
+        record_pass(upto=end)                           # never fold what the ledger has not seen
+    ref = render_ledger(load_ledger())
+    summary = read(SUMMARY)
+    for a, b in split_ranges(h, k, end):
+        header = f"## Messages {a}–{b - 1}"
+        if header in summary:                           # crash recovery: chapter already written
+            continue
+        words = sum(len(m["content"].split()) for m in h[a:b])
+        target = max(250, min(2500, words // cfg.summary_ratio))
+        chapter = clean_reply(chat_complete([
+            {"role": "system", "content": "You write the chronicle of a text RPG campaign."},
+            {"role": "user", "content":
+             "REFERENCE (current canon ledger, for names and spellings):\n" + ref +
+             "\n\nNEW PLAY (message index in brackets):\n" + fmt_play(h, a, b) +
+             f"\n\nWrite the next chapter of the chronicle covering ONLY this play, about {target} words. "
+             "Chronological and concrete: who did what, where, exact numbers, names, decisions the player made, promises, "
+             "debts, what changed state. Keep long-running characters visible. End with threads still open at the end "
+             "of this play. Out-of-character 'note to dm' lines are corrections: write the corrected version."}],
+            model=scribe_model(), track=False, **scribe_extra()))
+        if len(chapter) < 50:
+            raise ValueError("scribe returned an empty or too-short chapter")
+        summary = (summary + "\n\n" if summary else "") + header + "\n" + chapter
+        atomic_write(SUMMARY, summary)
+    set_state(folded=end)                               # pointer LAST: a crash can duplicate, never lose
+    print(f"[fold: messages {k}–{end - 1} folded into chapters]")
+
+def _audit():
+    h = load_history()
+    start, total = len(h), 0
+    while start > 0 and total + tok(len(h[start - 1]["content"])) <= cfg.audit_max_tok:
+        start -= 1
+        total += tok(len(h[start]["content"]))
+    start += start % 2
+    if start >= len(h):
+        raise RuntimeError("nothing to audit")
+    report = clean_reply(chat_complete([
+        {"role": "system", "content": "You are the continuity editor of a long-running text RPG."},
+        {"role": "user", "content":
+         "PREMISE:\n" + read(PREMISE) + "\n\nCANON LEDGER:\n" + (render_ledger(load_ledger()) or "(empty)") +
+         "\n\nPLAY (message index in brackets):\n" + fmt_play(h, start, len(h)) +
+         "\n\nWrite a markdown report with message indices, in these sections:\n"
+         "1. CONTRADICTIONS — numbers, counts, names, locations, ownership, timeline/day counts. Give both sides with "
+         "indices and say which is likely correct.\n"
+         "2. LEDGER ERRORS — entries that are wrong or stale versus the play, with corrected text.\n"
+         "3. DROPPED THREADS — characters, promises, clocks, objects introduced but not seen again (last index seen).\n"
+         "4. NARRATOR HABITS — repeated phrases, imagery, structures; the DM acting or deciding for the player.\n"
+         "5. TOP 10 FIXES, ranked. Be specific; no filler."}],
+        model=scribe_model(), track=False, **scribe_extra()))
+    atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
+                        f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
+    set_state(audited=len(h))
+    print(f"[audit written to {AUDIT}]")
+
+def run_audit():
+    with MAINT_LOCK:
+        _audit()
+
+def rebuild_ledger():
+    with MAINT_LOCK:
+        h = load_history()
+        if LEDGER.exists() and read(LEDGER) not in ("", "[]"):
+            shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
+        atomic_write(LEDGER, "[]")
+        set_state(ledgered=0)
+        upto = max(0, len(h) - 2 * cfg.ledger_lag_turns)
+        record_pass(upto=upto - upto % 2)
+
+def reset_fold():
+    """Migrate a v2 campaign: archive summary/facts, show the full history again."""
+    legacy = ROOT / "legacy"
+    legacy.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if read(SUMMARY):
+        shutil.copy(SUMMARY, legacy / f"summary.{stamp}.md")
+    facts = ROOT / "facts.json"
+    if facts.exists():
+        shutil.move(str(facts), str(legacy / f"facts.{stamp}.json"))
+    atomic_write(SUMMARY, "")
+    set_state(folded=0, ledgered=0)
+    print(f"[v2 summary/facts archived in {legacy}; folded=0]")
+
+def maintain():
+    if not MAINT_LOCK.acquire(blocking=False):          # single-flight
         return
     try:
-        h, k = load_history(), folded()
-        if len(h) - k < 2 * (CFG["hist_n"] + CFG["fold_n"]):
-            return
-        chunk = h[k : k + 2 * CFG["fold_n"]]            # oldest exchanges: player AND DM text
-        play = "\n".join(f'{m["role"].upper()}: {m["content"]}' for m in chunk)
-        facts = load_facts(strict=True)
-        old_summary = read(SUMMARY)
-
-        summary = clean_reply(chat_complete([
-            {"role": "system", "content": "You maintain a campaign summary for a text RPG."},
-            {"role": "user", "content": f"SUMMARY:\n{old_summary}\n\nNEW PLAY:\n{play}\n\n"
-             "Rewrite the summary to include the new play. Max 500 words. Compress the oldest "
-             "material first; keep names, open threads, and where things stand."}],
-            model=CFG["scribe"], track=False, **SCRIBE_EXTRA))
-        raw = clean_reply(chat_complete([
-            {"role": "system", "content": "Output only JSON."},
-            {"role": "user", "content": f"CURRENT FACTS: {json.dumps(facts)}\n\nNEW PLAY:\n{play}\n\n"
-             'Return {"add": [...], "remove": [...]}. Facts are durable things: people, places, items, '
-             "debts, promises, injuries, quests, and what the PLAYER declared or did. 'remove' = exact "
-             "strings from CURRENT FACTS that are now false, resolved, or superseded."}],
-            model=CFG["scribe"], track=False, **SCRIBE_EXTRA))
-        if len(summary) < 50:
-            raise ValueError("summarizer returned an empty or too-short summary")
-        ops = json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
-
-        gone = {x.strip() for x in ops.get("remove", []) if isinstance(x, str)}
-        facts = [f for f in facts if f.strip() not in gone]
-        facts += [x for x in ops.get("add", []) if isinstance(x, str) and x.strip() and x not in facts]
-
-        # Write order matters: summary, facts, then the pointer LAST. A crash in between can
-        # only duplicate work on the next try, never lose it.
-        dest = ARCHIVE / f"{k:06d}.md"
-        if old_summary and not dest.exists():
-            shutil.copy(SUMMARY, dest)                  # keep the summary this fold replaces
-        atomic_write(SUMMARY, summary)
-        save_facts(facts)
-        atomic_write(STATE, json.dumps({"folded": k + len(chunk)}))
-        print(f"[fold: messages {k}–{k + len(chunk) - 1} absorbed; {len(facts)} facts]")
+        if cfg.ledger_enabled:
+            record_pass()
+        fold_if_needed()
+        if cfg.audit_every_turns:
+            n = len(load_history())
+            if n - _int(get_state().get("audited")) >= 2 * cfg.audit_every_turns:
+                _audit()
     except Exception as e:
-        print(f"[fold failed, will retry next turn: {e}]")
+        print(f"[maintenance failed, will retry next turn: {e}]")
     finally:
-        FOLD_LOCK.release()
+        MAINT_LOCK.release()
 
-def start_fold():
-    global FOLD_THREAD
-    FOLD_THREAD = threading.Thread(target=fold_if_needed, daemon=True)
-    FOLD_THREAD.start()
+def start_maintain():
+    global MAINT_THREAD
+    MAINT_THREAD = threading.Thread(target=maintain, daemon=True)
+    MAINT_THREAD.start()
+
+def start_job(name, fn):
+    with JOB_LOCK:
+        if JOB["running"]:
+            raise RuntimeError(f"'{JOB['name']}' is still running")
+        JOB.update(name=name, running=True, msg="started")
+    def run():
+        try:
+            fn()
+            msg = "done"
+        except Exception as e:
+            msg = f"failed: {e}"
+        JOB.update(running=False, msg=msg)
+    threading.Thread(target=run, daemon=True).start()
+
 
 # ---------------- game actions (shared by CLI and web) ----------------
 
 def _generate(ctx, stream):
-    LAST["est"], LAST["prompt_tokens"] = est_tokens(ctx), None
-    dm = clean_reply(chat_stream(ctx) if stream else chat_complete(ctx))
+    ensure_configured()
+    LAST.update(est=est_tokens(ctx), prompt_tokens=None, cached=None)
+    dm = clean_reply(chat_stream(ctx) if stream else chat_complete(ctx, **narrator_extra()))
     if not dm:
         raise RuntimeError("model returned an empty reply")
     return dm
@@ -381,7 +633,7 @@ def player_turn(text, stream=False):
         append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
         if not history and not read(PREMISE):
             atomic_write(PREMISE, text)                                       # first message = pinned premise
-    start_fold()
+    start_maintain()
     return dm
 
 def _last_exchange(lines, h):
@@ -389,8 +641,8 @@ def _last_exchange(lines, h):
         raise RuntimeError("history.jsonl has unreadable lines; fix it by hand first")
     if len(h) < 2 or h[-1]["role"] != "assistant" or h[-2]["role"] != "user":
         raise RuntimeError("nothing to undo")
-    if len(h) - 2 < folded():
-        raise RuntimeError("that exchange is already folded into the summary; can't rewind past it")
+    if len(h) - 2 < max(folded(), ledgered()):
+        raise RuntimeError("that exchange is already folded into the summary or ledger; can't rewind past it")
 
 def undo_turn():
     """Remove the last exchange (kept in undone.jsonl). Returns the player's text."""
@@ -417,23 +669,40 @@ def retry_turn(stream=False):
 
 def game_state():
     history = load_history()
+    label = ctx_label()
+    if not label:
+        est = est_tokens(build_context(history + [{"role": "user", "content": "x"}]))
+        label = f"next prompt ≈{est / 1000:.1f}k tok"
     return {
         "campaign": CAMPAIGN,
+        "configured": bool(cfg.api_key and cfg.model),
         "turns": sum(1 for m in history if m["role"] == "user"),
         "history": history[-60:],
         "premise": read(PREMISE),
         "summary": read(SUMMARY),
-        "facts": load_facts(),
-        "ctx": ctx_label(),
+        "ledger": load_ledger(),
+        "audit": read(AUDIT),
+        "job": dict(JOB),
+        "ctx": label,
     }
+
 
 # ---------------- web UI ----------------
 
 app = Flask(__name__)
 
+CSS = r"""
+body{font-family:system-ui,sans-serif;margin:0;background:#141220;color:#e8e5f5}
+a{color:#b3a6ff}
+button{padding:10px 16px;border-radius:8px;border:none;background:#6d4aff;color:#fff;cursor:pointer;font-size:.95em}
+button.ghost{background:transparent;border:1px solid #3d3670;color:#c9c3ee}
+button:disabled{opacity:.5;cursor:default}
+input,textarea{padding:10px;border-radius:8px;border:1px solid #3d3670;background:#1c1930;color:#e8e5f5;font-size:1em;font-family:inherit}
+"""
+
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DM — __CAMP__</title><style>
-body{font-family:system-ui,sans-serif;margin:0;background:#141220;color:#e8e5f5;display:flex;height:100vh}
+<title>DM — __CAMP__</title><style>__CSS__
+body{display:flex;height:100vh}
 #chat{flex:1;display:flex;flex-direction:column;max-width:820px;margin:0 auto;width:100%}
 #log{flex:1;overflow-y:auto;padding:16px}
 .msg{margin:10px 0;padding:10px 14px;border-radius:10px;white-space:pre-wrap;line-height:1.5}
@@ -441,18 +710,18 @@ body{font-family:system-ui,sans-serif;margin:0;background:#141220;color:#e8e5f5;
 .dm{background:#1c1930;border:1px solid #2e2950;max-width:95%}
 .meta{color:#8b84b8;font-size:.8em;padding:10px 16px 0}
 #bar{display:flex;gap:8px;padding:12px;border-top:1px solid #2e2950}
-input#in{flex:1;padding:12px;border-radius:8px;border:1px solid #3d3670;background:#1c1930;color:#e8e5f5;font-size:1em}
-button{padding:10px 16px;border-radius:8px;border:none;background:#6d4aff;color:#fff;cursor:pointer;font-size:.95em}
-button.ghost{background:transparent;border:1px solid #3d3670;color:#c9c3ee}
-#side{width:340px;border-left:1px solid #2e2950;display:flex;flex-direction:column}
+input#in{flex:1}
+#side{width:360px;border-left:1px solid #2e2950;display:flex;flex-direction:column}
 #tabs{display:flex}#tabs button{flex:1;border-radius:0;background:#1c1930;color:#c9c3ee;padding:10px}
 #tabs button.on{background:#2b2450;color:#fff}
+#acts{display:flex;gap:6px;padding:8px}#acts button{flex:1;padding:6px;font-size:.8em}
 #file{flex:1;overflow-y:auto;padding:14px;font-size:.9em;line-height:1.5}
 #file h1,#file h2,#file h3{color:#b3a6ff}#file ul{padding-left:18px}
 @media(max-width:900px){#side{display:none}}
 </style></head><body>
 <div id="chat">
-  <div class="meta">__CAMP__ — <span id="tn"></span> turns — <span id="ctx"></span> — files in campaigns/__CAMP__/</div>
+  <div class="meta">__CAMP__ — <span id="tn"></span> turns — <span id="ctx"></span> — <span id="job"></span>
+    <span id="warn" style="color:#ffb86b"></span> — <a href="/config">⚙ config</a></div>
   <div id="log"></div>
   <div id="bar">
     <button class="ghost" onclick="undo()">↶ undo</button>
@@ -464,17 +733,21 @@ button.ghost{background:transparent;border:1px solid #3d3670;color:#c9c3ee}
 <div id="side">
   <div id="tabs">
     <button id="t-prem" onclick="setTab('prem')">Premise</button>
-    <button id="t-sum" class="on" onclick="setTab('sum')">Summary</button>
-    <button id="t-facts" onclick="setTab('facts')">Facts</button>
+    <button id="t-sum" onclick="setTab('sum')">Summary</button>
+    <button id="t-led" class="on" onclick="setTab('led')">Ledger</button>
+    <button id="t-aud" onclick="setTab('aud')">Audit</button>
+  </div>
+  <div id="acts">
+    <button class="ghost" onclick="act('/api/rebuild')">rebuild ledger</button>
+    <button class="ghost" onclick="act('/api/audit')">run audit</button>
   </div>
   <div id="file"></div>
 </div>
 <script>
-const FIRST_FOLD=__FIRST_FOLD__;
 const $=id=>document.getElementById(id);
-let busy=false,current='sum',state=null;
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function md(t){ // tiny markdown: headings, bold, italics, hr, lists, paragraphs
+let busy=false,current='led',state=null;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function md(t){
   t=esc(t);
   const lines=t.split('\n');let out='',inList=false;
   for(let l of lines){
@@ -488,6 +761,20 @@ function md(t){ // tiny markdown: headings, bold, italics, hr, lists, paragraphs
   if(inList)out+='</ul>';
   return out.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\*(.+?)\*/g,'<i>$1</i>');
 }
+function ledgerHtml(){
+  const L=state.ledger||[];
+  if(!L.length)return '<p>(empty — it builds automatically as the story grows, or press “rebuild ledger”)</p>';
+  const by={};
+  for(const e of L)(by[e.kind||'other']=by[e.kind||'other']||[]).push(e);
+  let out='';
+  for(const k of Object.keys(by).sort()){
+    out+='<h3>'+esc(k)+'</h3><ul>';
+    for(const e of by[k])out+='<li'+(e.status==='closed'?' style="opacity:.55"':'')+'><b>'+esc(e.name||e.id)+'</b>: '+esc(e.state||'')+
+      ' <small>['+esc(e.src||'?')+(e.msg!=null?' #'+e.msg:'')+(e.status==='closed'?' · closed':'')+']</small></li>';
+    out+='</ul>';
+  }
+  return out;
+}
 function addMsg(cls,text){const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;$('log').appendChild(d);return d}
 function toBottom(){const l=$('log');l.scrollTop=l.scrollHeight}
 function renderLog(s){
@@ -500,13 +787,16 @@ function renderSide(){
   if(!state)return;
   const f=$('file');
   if(current==='prem')f.innerHTML=md(state.premise||'(empty — your first message is pinned here; you can also edit premise.md by hand)');
-  else if(current==='sum')f.innerHTML=md(state.summary||'(empty — first fold after '+FIRST_FOLD+' turns)');
-  else f.innerHTML='<ul>'+state.facts.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  else if(current==='sum')f.innerHTML=md(state.summary||'(empty — the narrator sees the full history; chapters start when it passes the fold budget)');
+  else if(current==='led')f.innerHTML=ledgerHtml();
+  else f.innerHTML=md(state.audit||'(none yet — press “run audit”)');
 }
-function setTab(t){current=t;['prem','sum','facts'].forEach(x=>$('t-'+x).classList.toggle('on',x===t));renderSide()}
+function setTab(t){current=t;['prem','sum','led','aud'].forEach(x=>$('t-'+x).classList.toggle('on',x===t));renderSide()}
 function refresh(full=true){
   return fetch('/api/state').then(r=>r.json()).then(s=>{
     state=s;$('tn').textContent=s.turns;$('ctx').textContent=s.ctx||'';
+    $('warn').textContent=s.configured?'':'⚠ not configured — open ⚙ config';
+    const j=s.job;$('job').textContent=j.running?('⏳ '+j.name+'…'):(j.name?(j.name+': '+j.msg):'');
     if(full)renderLog(s);
     renderSide();
   });
@@ -538,15 +828,103 @@ function retry(){
     if(d.error){w.textContent='[error: '+d.error+']'}else return refresh();
   }).catch(()=>{w.textContent='[network error]'}).finally(()=>{busy=false});
 }
+function act(path){
+  fetch(path,{method:'POST'}).then(r=>r.json()).then(d=>{if(d.error)alert(d.error);return refresh(false)});
+}
 $('in').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
-setTab('sum');refresh();setInterval(()=>{if(!busy)refresh(false)},15000);
+setTab('led');refresh();setInterval(()=>{if(!busy)refresh(false)},5000);
+</script></body></html>"""
+
+CONFIG_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DM — settings</title><style>__CSS__
+body{padding:20px}
+#wrap{max-width:820px;margin:0 auto}
+fieldset{border:1px solid #2e2950;border-radius:10px;margin:18px 0;padding:8px 16px 16px}
+legend{color:#b3a6ff;padding:0 8px}
+.row{margin:14px 0;display:flex;flex-direction:column;gap:4px}
+.row label{font-weight:600}
+.row input[type=checkbox]{width:20px;height:20px}
+.help{color:#8b84b8;font-size:.85em}
+.err{color:#ff7b7b;font-size:.85em}
+.badge{background:#3d3670;border-radius:6px;padding:1px 6px;font-size:.7em;font-weight:400}
+#bar{position:sticky;bottom:0;background:#141220;padding:12px 0;display:flex;gap:8px;align-items:center;border-top:1px solid #2e2950}
+#status{color:#8b84b8;font-size:.9em;white-space:pre-wrap}
+</style></head><body><div id="wrap">
+<h2>⚙ Settings <small style="font-weight:400"><a href="/">← back to the game</a></small></h2>
+<div class="help" id="path"></div>
+<div id="form"></div>
+<div id="bar">
+  <button onclick="save()">Save</button>
+  <button class="ghost" onclick="saveTest()">Save &amp; test connection</button>
+  <button class="ghost" onclick="resetAll()">Reset to defaults</button>
+  <span id="status"></span>
+</div></div>
+<script>
+const $=id=>document.getElementById(id);
+let meta=null;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+async function load(){meta=await (await fetch('/api/config')).json();$('path').textContent='Stored in '+meta.path+' — values apply live except those marked “restart”.';render()}
+function render(){
+  const groups={};
+  for(const f of meta.fields)(groups[f.group]=groups[f.group]||[]).push(f);
+  let h='';
+  for(const g in groups){
+    h+=`<fieldset><legend>${esc(g)}</legend>`;
+    for(const f of groups[g]){
+      const v=meta.values[f.key],id='f_'+f.key;
+      let input;
+      if(f.type==='bool')input=`<input type="checkbox" id="${id}" ${v?'checked':''}>`;
+      else if(f.type==='text')input=`<textarea id="${id}" rows="10">${esc(v)}</textarea>`;
+      else if(f.type==='secret')input=`<input id="${id}" type="password" autocomplete="off" placeholder="${meta.secret_set[f.key]?'(set — leave blank to keep)':'(not set)'}">`;
+      else if(f.type==='int'||f.type==='float')input=`<input id="${id}" type="number" step="${f.type==='int'?1:'any'}" value="${esc(v)}">`;
+      else input=`<input id="${id}" type="text" value="${esc(v)}">`;
+      const dflt=f.type==='secret'?'':` <i>default: ${esc(f.default===''?'(empty)':String(f.default).slice(0,60))}</i>`;
+      h+=`<div class="row"><label for="${id}">${esc(f.label)}${f.restart?' <span class="badge">restart</span>':''}</label>${input}<div class="help">${esc(f.help||'')}${dflt}</div><div class="err" id="e_${f.key}"></div></div>`;
+    }
+    h+='</fieldset>';
+  }
+  $('form').innerHTML=h;
+}
+function collect(){
+  const ch={};
+  for(const f of meta.fields){
+    const el=$('f_'+f.key);
+    if(f.type==='bool')ch[f.key]=el.checked;
+    else if(f.type==='secret'){if(el.value)ch[f.key]=el.value}
+    else ch[f.key]=el.value;
+  }
+  return ch;
+}
+async function save(){
+  document.querySelectorAll('.err').forEach(e=>e.textContent='');
+  $('status').textContent='saving…';
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({changes:collect()})});
+  const d=await r.json();
+  if(!d.ok){for(const k in d.errors){const e=$('e_'+k);if(e)e.textContent=d.errors[k]}$('status').textContent='not saved — fix the errors above';return false}
+  meta=d;render();$('status').textContent='saved ✓ '+new Date().toLocaleTimeString();return true;
+}
+async function saveTest(){
+  if(!await save())return;
+  $('status').textContent='testing…';
+  const d=await (await fetch('/api/config/test',{method:'POST'})).json();
+  $('status').textContent=d.results.map(x=>x.ok?`✓ ${x.role} ${x.model} (${x.sec}s)`:`✗ ${x.role} ${x.model}: ${x.error}`).join('\n');
+}
+async function resetAll(){
+  if(!confirm('Reset every setting to its default? (the API key is kept)'))return;
+  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});
+  meta=await r.json();render();$('status').textContent='reset ✓';
+}
+load();
 </script></body></html>"""
 
 @app.route("/")
 def index():
-    page = (PAGE.replace("__CAMP__", html.escape(CAMPAIGN))
-                .replace("__FIRST_FOLD__", str(CFG["hist_n"] + CFG["fold_n"])))
+    page = PAGE.replace("__CSS__", CSS).replace("__CAMP__", html.escape(CAMPAIGN))
     return Response(page, mimetype="text/html")
+
+@app.route("/config")
+def config_page():
+    return Response(CONFIG_PAGE.replace("__CSS__", CSS), mimetype="text/html")
 
 @app.route("/api/state")
 def api_state():
@@ -576,12 +954,62 @@ def api_retry():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
+@app.route("/api/rebuild", methods=["POST"])
+def api_rebuild():
+    try:
+        ensure_configured()
+        start_job("rebuild ledger", rebuild_ledger)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 409
+
+@app.route("/api/audit", methods=["POST"])
+def api_audit():
+    try:
+        ensure_configured()
+        start_job("audit", run_audit)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 409
+
+@app.route("/api/config", methods=["GET"])
+def api_config_get():
+    return jsonify(cfg.public())
+
+@app.route("/api/config", methods=["POST"])
+def api_config_set():
+    body = request.get_json(silent=True) or {}
+    if body.get("reset"):
+        cfg.reset()
+        return jsonify({"ok": True, "errors": {}, **cfg.public()})
+    errors = cfg.update(body.get("changes") or {})
+    return jsonify({"ok": not errors, "errors": errors, **cfg.public()}), (400 if errors else 200)
+
+@app.route("/api/config/test", methods=["POST"])
+def api_config_test():
+    results = []
+    models = [("narrator", cfg.model)]
+    if cfg.scribe_model and cfg.scribe_model != cfg.model:
+        models.append(("scribe", cfg.scribe_model))
+    for role, model in models:
+        t = time.time()
+        try:
+            if not (cfg.api_key and model):
+                raise RuntimeError("model or API key not set")
+            r = chat_complete([{"role": "user", "content": "Reply with the single word: ok"}],
+                              model=model, track=False, retries=0, fallback=False)
+            results.append({"role": role, "model": model, "ok": True, "sec": round(time.time() - t, 1), "reply": r[:80]})
+        except Exception as e:
+            results.append({"role": role, "model": model or "(none)", "ok": False, "error": str(e)[:300]})
+    return jsonify({"results": results})
+
+
 # ---------------- terminal mode ----------------
 
 def cli():
     history = load_history()
     print(f"=== Campaign '{CAMPAIGN}' — {sum(m['role'] == 'user' for m in history)} turns — "
-          f"/undo /retry /context /quit ===\n")
+          f"/undo /retry /context /ledger /rebuild /audit /quit ===\n")
     if not history:
         print("(new campaign — open with your character concept and the opening scene; "
               "this first message is pinned as the premise)\n")
@@ -601,6 +1029,13 @@ def cli():
         try:
             if player == "/context":
                 show_context()
+            elif player == "/ledger":
+                print(render_ledger(load_ledger()) or "(ledger is empty)", "\n")
+            elif player == "/rebuild":
+                rebuild_ledger()
+            elif player == "/audit":
+                run_audit()
+                print(read(AUDIT), "\n")
             elif player == "/undo":
                 print(f"[removed; your move was: {undo_turn()}]\n")
             elif player == "/retry":
@@ -608,7 +1043,7 @@ def cli():
                 retry_turn(stream=True)
                 print(f"\n\n[{ctx_label()}]\n")
             elif player.startswith("/"):
-                print("[commands: /undo /retry /context /quit]\n")
+                print("[commands: /undo /retry /context /ledger /rebuild /audit /quit]\n")
             else:
                 print()
                 player_turn(player, stream=True)
@@ -618,22 +1053,36 @@ def cli():
         except Exception as e:
             hint = "" if player.startswith("/") else " — nothing was saved; retype your move"
             print(f"\n[error{hint}: {e}]\n")
-    if FOLD_THREAD and FOLD_THREAD.is_alive():
-        print("[finishing background fold…]")
-        FOLD_THREAD.join(timeout=90)
+    if MAINT_THREAD and MAINT_THREAD.is_alive():
+        print("[finishing background maintenance…]")
+        MAINT_THREAD.join(timeout=120)
     print("[campaign saved]")
 
 if __name__ == "__main__":
-    show = "--show-context" in sys.argv
-    if not show:
-        validate_config()
+    argv = sys.argv
+    maint_cmd = any(a in argv for a in ("--reset-fold", "--rebuild-ledger", "--audit"))
     init_files()
-    if show:
+    if "--show-context" in argv:
         show_context()
         sys.exit()
+    if "--web" not in argv or maint_cmd:
+        validate_config()                               # the web UI may start unconfigured; fix it on /config
     print_config()
-    if "--web" in sys.argv:
-        print(f"web UI → http://localhost:{CFG['port']}\n")
-        app.run(host="127.0.0.1", port=CFG["port"], debug=False)
+    if "--reset-fold" in argv:
+        reset_fold()
+        rebuild_ledger()
+        sys.exit()
+    if "--rebuild-ledger" in argv:
+        rebuild_ledger()
+        sys.exit()
+    if "--audit" in argv:
+        run_audit()
+        print(read(AUDIT))
+        sys.exit()
+    if "--web" in argv:
+        if not (cfg.api_key and cfg.model):
+            print("[not configured yet — open /config to set the model and API key]")
+        print(f"web UI → http://{'localhost' if cfg.host == '127.0.0.1' else cfg.host}:{cfg.port}\n")
+        app.run(host=cfg.host, port=cfg.port, debug=False)
     else:
         cli()
