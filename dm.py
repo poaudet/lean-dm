@@ -33,6 +33,7 @@ import json, os, sys, pathlib, threading, time, html, re, shutil
 import requests
 from flask import Flask, request, jsonify, Response
 from config import cfg, SETTINGS_PATH
+import analyst
 
 # ---------------- paths ----------------
 
@@ -280,7 +281,7 @@ def compute_style_guard(history):
             combined.append(tri)
     return combined[:8]
 
-def build_context(history):
+def build_context(history, brief=None):
     """history must end with the pending player action."""
     k = folded()
     parts = [cfg.system_prompt]
@@ -326,6 +327,10 @@ def build_context(history):
         if guard:
             msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                         "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
+    if brief and msgs and msgs[-1]["role"] == "user":
+        brief_text = json.dumps(brief, ensure_ascii=False, indent=1)
+        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                    "\n\n---\nDIRECTOR'S BRIEF (never mention it to the player):\n" + brief_text}
     return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
 
 def ctx_label():
@@ -685,8 +690,24 @@ def _generate(ctx, stream):
 def player_turn(text, stream=False):
     with TURN_LOCK:
         history = load_history()
+        if cfg.notes_routing and analyst.is_ooc_note(text):
+            entry = analyst.handle_ooc_note(
+                ROOT, text, history, read(PREMISE), read(SUMMARY),
+                render_ledger(load_ledger()), chat_complete
+            )
+            return entry["a"]
+
+        brief = None
+        if cfg.analyst_enabled:
+            allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+            guard_items = compute_style_guard(history) if cfg.style_guard else []
+            brief, source, model_used, ms = analyst.run_analyst(
+                ROOT, history, text, allowed, guard_items, chat_complete
+            )
+            analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+
         user = {"role": "user", "content": text}
-        dm = _generate(build_context(history + [user]), stream)
+        dm = _generate(build_context(history + [user], brief=brief), stream)
         append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
@@ -709,6 +730,7 @@ def undo_turn():
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
+        analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
         atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-2]))
         text = h[-2]["content"]
@@ -716,12 +738,32 @@ def undo_turn():
             PREMISE.unlink()                            # undoing the opening un-pins it too
         return text
 
-def retry_turn(stream=False):
+def retry_turn(stream=False, rerun_analyst=False):
     """Regenerate the DM's last reply for the same player action."""
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
-        dm = _generate(build_context(h[:-1]), stream)
+        brief = None
+        if cfg.analyst_enabled:
+            player_idx = len(h) - 2
+            if rerun_analyst:
+                allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+                guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
+                brief, source, model_used, ms = analyst.run_analyst(
+                    ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
+                )
+                analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
+            else:
+                brief = analyst.load_brief_for_msg(ROOT, player_idx)
+                if not brief:
+                    allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+                    guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
+                    brief, source, model_used, ms = analyst.run_analyst(
+                        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
+                    )
+                    analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
+
+        dm = _generate(build_context(h[:-1], brief=brief), stream)
         new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
         append_jsonl(UNDONE, lines[-1:])
         atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-1]) + new + "\n")
@@ -1052,6 +1094,28 @@ def api_config_set():
     errors = cfg.update(body.get("changes") or {}, scope=scope)
     return jsonify({"ok": not errors, "errors": errors, **cfg.public()}), (400 if errors else 200)
 
+@app.route("/api/notes", methods=["GET"])
+def api_notes_get():
+    return jsonify({"notes": analyst.load_notes(ROOT)})
+
+@app.route("/api/notes/<note_id>/canon", methods=["POST"])
+def api_notes_canon(note_id):
+    notes = analyst.load_notes(ROOT)
+    note = next((n for n in notes if n.get("id") == note_id), None)
+    if not note:
+        return jsonify({"error": "note not found"}), 404
+    if note.get("proposal") and isinstance(note["proposal"], dict):
+        ledger = load_ledger(strict=True)
+        ledger = apply_ledger_ops(ledger, {"upsert": [note["proposal"]]})
+        atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
+    else:
+        prem = read(PREMISE)
+        clean_q = analyst.strip_ooc_prefix(note.get("q", ""))
+        addition = f"\n\n## Canon notes\n- {clean_q}: {note.get('a', '')}"
+        atomic_write(PREMISE, (prem + addition).strip())
+    analyst.update_note_canon(ROOT, note_id, True)
+    return jsonify({"ok": True})
+
 @app.route("/api/config/test", methods=["POST"])
 def api_config_test():
     results = []
@@ -1105,12 +1169,31 @@ def cli():
                 print(read(AUDIT), "\n")
             elif player == "/undo":
                 print(f"[removed; your move was: {undo_turn()}]\n")
-            elif player == "/retry":
+            elif player == "/notes":
+                notes = analyst.load_notes(ROOT)
+                if not notes:
+                    print("(no notes recorded yet)\n")
+                else:
+                    for n in notes:
+                        c = " [canon]" if n.get("canon") else ""
+                        print(f"[{n.get('id')}{c}] Q: {n.get('q')}\nA: {n.get('a')}\n")
+            elif player == "/brief":
+                print("[SPOILER WARNING: The analyst brief contains director notes for the DM]")
+                confirm = input("Show brief? [y/N]: ").strip().lower()
+                if confirm == "y":
+                    h = load_history()
+                    last_user_idx = max((i for i, m in enumerate(h) if m["role"] == "user"), default=None)
+                    if last_user_idx is not None:
+                        b = analyst.load_brief_for_msg(ROOT, last_user_idx)
+                        print(json.dumps(b, indent=2, ensure_ascii=False) if b else "(no brief for last turn)\n")
+                    else:
+                        print("(no player turns yet)\n")
+            elif player in ("/retry", "retry!"):
                 print()
-                retry_turn(stream=True)
+                retry_turn(stream=True, rerun_analyst=(player == "retry!"))
                 print(f"\n\n[{ctx_label()}]\n")
             elif player.startswith("/"):
-                print("[commands: /undo /retry /context /ledger /rebuild /audit /quit]\n")
+                print("[commands: /undo /retry retry! /brief /notes /context /ledger /rebuild /audit /quit]\n")
             else:
                 print()
                 player_turn(player, stream=True)
