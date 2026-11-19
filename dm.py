@@ -162,6 +162,7 @@ def load_ledger(strict=False):
 
 def init_files():
     ROOT.mkdir(parents=True, exist_ok=True)
+    cfg.set_campaign_path(ROOT / "campaign.json")
     for p in (HISTORY, UNDONE, SUMMARY):
         if not p.exists():
             p.write_text("", encoding="utf-8")
@@ -252,12 +253,62 @@ def merge_same_role(msgs):
             out.append(m)
     return out
 
+def compute_style_guard(history):
+    dm_msgs = [m["content"] for m in history if m.get("role") == "assistant"]
+    if not dm_msgs:
+        return []
+    openers = []
+    for msg in dm_msgs[-8:]:
+        words = msg.strip().split()
+        if words:
+            opener = " ".join(words[:5])
+            if opener and opener not in openers:
+                openers.append(opener)
+    from collections import Counter
+    counts = Counter()
+    for msg in dm_msgs[-12:]:
+        words = re.findall(r"\b[A-Za-z0-9'-]+\b", msg.lower())
+        for i in range(len(words) - 2):
+            counts[f"{words[i]} {words[i+1]} {words[i+2]}"] += 1
+    trigrams = [tri for tri, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])) if cnt >= 3]
+    combined = []
+    for op in openers:
+        if op not in combined:
+            combined.append(op)
+    for tri in trigrams:
+        if tri not in combined:
+            combined.append(tri)
+    return combined[:8]
+
 def build_context(history):
     """history must end with the pending player action."""
     k = folded()
     parts = [cfg.system_prompt]
     if p := read(PREMISE):
         parts.append("PREMISE (fixed canon):\n" + p)
+    if cfg.style_enabled:
+        style_parts = []
+        preset = cfg.style_preset
+        if preset and preset != "none":
+            preset_file = pathlib.Path(__file__).parent / "styles" / f"{preset}.md"
+            if preset_file.exists():
+                style_parts.append(preset_file.read_text(encoding="utf-8").strip())
+        if cfg.style_words_min > 0 or cfg.style_words_max > 0:
+            if cfg.style_words_min > 0 and cfg.style_words_max > 0:
+                style_parts.append(f"Target length: {cfg.style_words_min}–{cfg.style_words_max} words per reply.")
+            elif cfg.style_words_max > 0:
+                style_parts.append(f"Target length: at most {cfg.style_words_max} words per reply.")
+            else:
+                style_parts.append(f"Target length: at least {cfg.style_words_min} words per reply.")
+        if cfg.style_push:
+            style_parts.append(f"Style push: {cfg.style_push}/100.")
+        if cfg.style_notes and cfg.style_notes.strip():
+            style_parts.append("Style notes:\n" + cfg.style_notes.strip())
+        style_parts.append(
+            "Rules: Every reply must end on a concrete new development or decision point, "
+            "avoid recapping the player's action, and keep atmosphere to the minority of sentences."
+        )
+        parts.append("STYLE:\n" + "\n\n".join(style_parts))
     if k and (s := read(SUMMARY)):
         parts.append("STORY SO FAR (older play, already summarized; everything after it is verbatim below):\n" + s)
     tail = history[min(k, len(history) - 1):]
@@ -270,6 +321,11 @@ def build_context(history):
                     "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
                     "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon +
                     "\n--- end of ledger: now narrate the outcome of the player's action above."}
+    if cfg.style_guard and msgs and msgs[-1]["role"] == "user":
+        guard = compute_style_guard(history)
+        if guard:
+            msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                        "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
     return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
 
 def ctx_label():
@@ -632,6 +688,9 @@ def player_turn(text, stream=False):
         user = {"role": "user", "content": text}
         dm = _generate(build_context(history + [user]), stream)
         append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
+        words = len(dm.split())
+        overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
+        set_state(last_words=words, overlong=overlong)
         if not history and not read(PREMISE):
             atomic_write(PREMISE, text)                                       # first message = pinned premise
     start_maintain()
@@ -666,6 +725,9 @@ def retry_turn(stream=False):
         new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
         append_jsonl(UNDONE, lines[-1:])
         atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-1]) + new + "\n")
+        words = len(dm.split())
+        overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
+        set_state(last_words=words, overlong=overlong)
     return dm
 
 def game_state():
@@ -674,6 +736,7 @@ def game_state():
     if not label:
         est = est_tokens(build_context(history + [{"role": "user", "content": "x"}]))
         label = f"next prompt ≈{est / 1000:.1f}k tok"
+    st = get_state()
     return {
         "campaign": CAMPAIGN,
         "configured": bool(cfg.api_key and cfg.model),
@@ -685,6 +748,8 @@ def game_state():
         "audit": read(AUDIT),
         "job": dict(JOB),
         "ctx": label,
+        "overlong": bool(st.get("overlong", False)),
+        "last_words": _int(st.get("last_words", 0)),
     }
 
 
@@ -980,10 +1045,11 @@ def api_config_get():
 @app.route("/api/config", methods=["POST"])
 def api_config_set():
     body = request.get_json(silent=True) or {}
+    scope = request.args.get("scope") or body.get("scope") or "global"
     if body.get("reset"):
-        cfg.reset()
+        cfg.reset(scope=scope)
         return jsonify({"ok": True, "errors": {}, **cfg.public()})
-    errors = cfg.update(body.get("changes") or {})
+    errors = cfg.update(body.get("changes") or {}, scope=scope)
     return jsonify({"ok": not errors, "errors": errors, **cfg.public()}), (400 if errors else 200)
 
 @app.route("/api/config/test", methods=["POST"])

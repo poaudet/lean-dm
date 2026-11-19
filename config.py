@@ -20,47 +20,69 @@ Rules:
 - Vary your openings and imagery; never echo phrasing from earlier turns."""
 
 
-def F(key, label, type, default, group, help, **kw):
-    return {"key": key, "label": label, "type": type, "default": default, "group": group, "help": help, **kw}
+def F(key, label, type, default, group, help, scope="global", **kw):
+    return {"key": key, "label": label, "type": type, "default": default, "group": group, "help": help, "scope": scope, **kw}
 
 
 FIELDS = [
     # ---- connection
-    F("base_url", "Endpoint", "str", "https://openrouter.ai/api/v1", "Connection", "OpenAI-compatible base URL."),
-    F("api_key", "API key", "secret", "", "Connection", "Stored in settings.json (chmod 600). Never sent back to the browser."),
-    F("model", "Narrator model", "str", "", "Connection", "e.g. baidu/ernie-5.5-flash-preview:free"),
-    F("fallback_model", "Fallback model", "str", "", "Connection", "Tried once when the main model still fails after all retries. Empty = none."),
-    F("scribe_model", "Scribe model", "str", "", "Connection", "Ledger / chapters / audit. Empty = same as narrator."),
-    F("scribe_temp", "Scribe temperature", "optfloat", "0", "Connection", "Empty = omit (for models that reject it)."),
-    F("narrator_temp", "Narrator temperature", "optfloat", "", "Connection", "Empty = provider default."),
-    F("narrator_max_tokens", "Narrator max output tokens", "int", 0, "Connection", "0 = omit. Raise it for reasoning models that spend output on thinking.", min=0),
+    F("base_url", "Endpoint", "str", "https://openrouter.ai/api/v1", "Connection", "OpenAI-compatible base URL.", scope="global"),
+    F("api_key", "API key", "secret", "", "Connection", "Stored in settings.json (chmod 600). Never sent back to the browser.", scope="global"),
+    F("model", "Narrator model", "str", "", "Connection", "e.g. baidu/ernie-5.5-flash-preview:free", scope="global"),
+    F("fallback_model", "Fallback model", "str", "", "Connection", "Tried once when the main model still fails after all retries. Empty = none.", scope="global"),
+    F("scribe_model", "Scribe model", "str", "", "Connection", "Ledger / chapters / audit. Empty = same as narrator.", scope="global"),
+    F("scribe_temp", "Scribe temperature", "optfloat", "0", "Connection", "Empty = omit (for models that reject it).", scope="global"),
+    F("narrator_temp", "Narrator temperature", "optfloat", "", "Connection", "Empty = provider default.", scope="global"),
+    F("narrator_max_tokens", "Narrator max output tokens", "int", 0, "Connection", "0 = omit. Raise it for reasoning models that spend output on thinking.", scope="global", min=0),
+    F("analyst_model", "Analyst model", "str", "", "Connection", "Empty = scribe_model, then model.", scope="global"),
+    F("planner_model", "Planner model", "str", "", "Connection", "Empty = scribe_model, then model.", scope="global"),
     # ---- context
     F("ctx_budget_tok", "Fold above (tokens)", "int", 350000, "Context & memory",
-      "When the verbatim history passes this, the oldest part is folded into a chapter. Keep well under the model's window.", min=2000),
+      "When the verbatim history passes this, the oldest part is folded into a chapter. Keep well under the model's window.", scope="global", min=2000),
     F("ctx_target_tok", "Fold down to (tokens)", "int", 200000, "Context & memory",
-      "Verbatim history size after a fold. Big gap = rare folds = stable cacheable prefix.", min=1000),
+      "Verbatim history size after a fold. Big gap = rare folds = stable cacheable prefix.", scope="global", min=1000),
     F("chars_per_tok", "Characters per token", "float", 4.0, "Context & memory",
-      "Estimator calibration. Compare 'context ≈' with the provider figure and adjust.", min=1.0, max=10.0),
-    F("keep_min_turns", "Always-verbatim exchanges", "int", 8, "Context & memory", "A fold never touches the latest N exchanges.", min=1),
-    F("summary_ratio", "Chapter compression ratio", "int", 25, "Context & memory", "Chapter length ≈ folded words / ratio (250–2500 words).", min=2),
-    F("ledger_enabled", "Canon ledger", "bool", True, "Context & memory", "Keyed canon state appended as the last message of every prompt."),
-    F("ledger_lag_turns", "Ledger lag (exchanges)", "int", 6, "Context & memory", "The ledger trails the latest N exchanges so /undo and /retry stay safe.", min=1),
-    F("ledger_every_turns", "Ledger update every (exchanges)", "int", 6, "Context & memory", "", min=1),
-    F("ledger_max", "Ledger max entries", "int", 500, "Context & memory", "Over the cap, the oldest closed entries go first.", min=20),
-    F("ledger_closed_max", "Closed entries shown", "int", 80, "Context & memory", "How many resolved entries the narrator sees.", min=0),
-    F("scribe_chunk_tok", "Scribe chunk (tokens)", "int", 60000, "Context & memory", "Max play text per scribe call. Lower it for small-context scribe models.", min=1000),
-    F("audit_max_tok", "Audit window (tokens)", "int", 500000, "Context & memory", "Newest history the continuity audit reads.", min=2000),
-    F("audit_every_turns", "Auto audit every (exchanges)", "int", 0, "Context & memory", "0 = manual only (button or --audit).", min=0),
+      "Estimator calibration. Compare 'context ≈' with the provider figure and adjust.", scope="global", min=1.0, max=10.0),
+    F("keep_min_turns", "Always-verbatim exchanges", "int", 8, "Context & memory", "A fold never touches the latest N exchanges.", scope="global", min=1),
+    F("summary_ratio", "Chapter compression ratio", "int", 25, "Context & memory", "Chapter length ≈ folded words / ratio (250–2500 words).", scope="global", min=2),
+    F("ledger_enabled", "Canon ledger", "bool", True, "Context & memory", "Keyed canon state appended as the last message of every prompt.", scope="global"),
+    F("ledger_lag_turns", "Ledger lag (exchanges)", "int", 6, "Context & memory", "The ledger trails the latest N exchanges so /undo and /retry stay safe.", scope="global", min=1),
+    F("ledger_every_turns", "Ledger update every (exchanges)", "int", 6, "Context & memory", "", scope="global", min=1),
+    F("ledger_max", "Ledger max entries", "int", 500, "Context & memory", "Over the cap, the oldest closed entries go first.", scope="global", min=20),
+    F("ledger_closed_max", "Closed entries shown", "int", 80, "Context & memory", "How many resolved entries the narrator sees.", scope="global", min=0),
+    F("scribe_chunk_tok", "Scribe chunk (tokens)", "int", 60000, "Context & memory", "Max play text per scribe call. Lower it for small-context scribe models.", scope="global", min=1000),
+    F("audit_max_tok", "Audit window (tokens)", "int", 500000, "Context & memory", "Newest history the continuity audit reads.", scope="global", min=2000),
+    F("audit_every_turns", "Auto audit every (exchanges)", "int", 0, "Context & memory", "0 = manual only (button or --audit).", scope="global", min=0),
+    # ---- gameplay
+    F("difficulty", "Difficulty", "select", "standard", "Gameplay", "Game difficulty (story/standard/hard).",
+      scope="campaign", options=["story", "standard", "hard"]),
+    F("arc_enabled", "Hidden arc", "bool", False, "Gameplay", "Enable hidden arc, clock, and pacing manager.", scope="campaign"),
+    # ---- style
+    F("style_enabled", "Writing style enforcement", "bool", False, "Style", "Enable writing style enforcement.", scope="campaign"),
+    F("style_preset", "Style preset", "select", "none", "Style", "Preset style to apply.",
+      scope="campaign", options=["none", "subtle", "pulp", "noir", "terse"]),
+    F("style_words_min", "Min words per reply", "int", 0, "Style", "Minimum words per reply (0 = off).", scope="campaign", min=0),
+    F("style_words_max", "Max words per reply", "int", 0, "Style", "Maximum words per reply (0 = off).", scope="campaign", min=0),
+    F("style_push", "Style push (0–100)", "int", 60, "Style", "Style adherence push level.", scope="campaign", min=0, max=100),
+    F("style_notes", "Style notes", "text", "", "Style", "Custom notes or instructions for writing style.", scope="campaign"),
+    F("style_guard", "Style guard", "bool", False, "Style", "Prevent repetitive openers and overused phrases.", scope="campaign"),
+    # ---- analyst & notes
+    F("analyst_enabled", "Analyst brief", "bool", False, "Analyst", "Produce director's brief before narrator.", scope="campaign"),
+    F("notes_routing", "Notes routing", "bool", False, "Notes", "Route OOC notes outside of history into notes.jsonl.", scope="campaign"),
     # ---- reliability
-    F("retries", "Retries", "int", 6, "Reliability", "On 429/5xx/timeouts/empty replies.", min=0, max=20),
-    F("retry_base_sec", "Retry base delay (s)", "float", 5.0, "Reliability", "Exponential; Retry-After is honored. Capped at 90 s.", min=0.5),
-    F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", min=10),
+    F("retries", "Retries", "int", 6, "Reliability", "On 429/5xx/timeouts/empty replies.", scope="global", min=0, max=20),
+    F("retry_base_sec", "Retry base delay (s)", "float", 5.0, "Reliability", "Exponential; Retry-After is honored. Capped at 90 s.", scope="global", min=0.5),
+    F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", scope="global", min=10),
+    F("analyst_timeout_sec", "Analyst timeout (s)", "int", 25, "Reliability", "Timeout for analyst call in seconds.", scope="global", min=1),
+    F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
+    F("record_wait_sec", "Record wait (s)", "int", 3, "Reliability", "Max seconds analyst waits for record pass.", scope="global", min=0),
     # ---- prompt
-    F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", required=True),
+    F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
-    F("host", "Web host", "str", "0.0.0.0", "App", "Use 0.0.0.0 in Docker, and put auth in front of it.", restart=True),
-    F("port", "Web port", "int", 7860, "App", "", restart=True, min=1, max=65535),
-    F("campaign", "Default campaign", "str", "default", "App", "Folder under campaigns/. Switching needs a restart.", restart=True),
+    F("host", "Web host", "str", "0.0.0.0", "App", "Use 0.0.0.0 in Docker, and put auth in front of it.", scope="global", restart=True),
+    F("port", "Web port", "int", 7860, "App", "", scope="global", restart=True, min=1, max=65535),
+    F("campaign", "Default campaign", "str", "default", "App", "Folder under campaigns/. Switching needs a restart.", scope="global", restart=True),
+    F("web_password", "Web password", "secret", "", "App", "Optional password for HTTP Basic auth. Empty = no auth.", scope="global"),
 ]
 
 ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "model", "SCRIBE_MODEL": "scribe_model",
@@ -70,6 +92,8 @@ ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "mode
 class Config:
     def __init__(self, path):
         self._path = path
+        self._campaign_path = None
+        self._campaign_vals = {}
         self._lock = threading.RLock()
         self._by = {f["key"]: f for f in FIELDS}
         self._vals = {f["key"]: f["default"] for f in FIELDS}
@@ -80,15 +104,42 @@ class Config:
         if key.startswith("_"):
             raise AttributeError(key)
         try:
+            f = self._by[key]
+            if f.get("scope") == "campaign" and key in self._campaign_vals:
+                return self._campaign_vals[key]
             return self._vals[key]
         except KeyError:
             raise AttributeError(key)
+
+    def set_campaign_path(self, path):
+        with self._lock:
+            self._campaign_path = pathlib.Path(path) if path else None
+            self._campaign_vals = {}
+            if self._campaign_path and self._campaign_path.exists():
+                try:
+                    data = json.loads(self._campaign_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            f = self._by.get(k)
+                            if f and f.get("scope") == "campaign":
+                                try:
+                                    self._campaign_vals[k] = self._coerce(f, v)
+                                except ValueError:
+                                    pass
+                except (ValueError, OSError) as e:
+                    print(f"[config] {self._campaign_path} unreadable ({e}); ignoring campaign overrides")
 
     @staticmethod
     def _coerce(f, v):
         t = f["type"]
         if t == "bool":
             return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
+        if t == "select":
+            s = "" if v is None else str(v).strip()
+            opts = f.get("options") or []
+            if opts and s not in opts:
+                raise ValueError(f"must be one of: {', '.join(opts)}")
+            return s
         if t in ("int", "float"):
             try:
                 n = float(v) if t == "float" else int(float(v))
@@ -165,7 +216,16 @@ class Config:
                 pass
             tmp.replace(self._path)
 
-    def update(self, changes):
+    def save_campaign(self):
+        with self._lock:
+            if not self._campaign_path:
+                return
+            self._campaign_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._campaign_path.with_name(self._campaign_path.name + ".tmp")
+            tmp.write_text(json.dumps(self._campaign_vals, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._campaign_path)
+
+    def update(self, changes, scope="global"):
         """All-or-nothing. Returns {} on success, else {key: error}."""
         errors, new = {}, {}
         for k, v in (changes or {}).items():
@@ -173,11 +233,20 @@ class Config:
             if not f:
                 errors[k] = "unknown setting"
                 continue
+            if scope == "campaign" and f.get("scope") != "campaign":
+                errors[k] = "not a campaign-scoped setting"
+                continue
             try:
                 new[k] = self._coerce(f, v)
             except ValueError as e:
                 errors[k] = str(e)
         with self._lock:
+            if scope == "campaign":
+                if errors:
+                    return errors
+                self._campaign_vals.update(new)
+                self.save_campaign()
+                return {}
             merged = {**self._vals, **new}
             if merged["ctx_target_tok"] >= merged["ctx_budget_tok"]:
                 errors["ctx_target_tok"] = "must be smaller than 'Fold above'"
@@ -187,8 +256,13 @@ class Config:
             self.save()
         return {}
 
-    def reset(self):
+    def reset(self, scope="global"):
         with self._lock:
+            if scope == "campaign":
+                self._campaign_vals = {}
+                if self._campaign_path and self._campaign_path.exists():
+                    self._campaign_path.write_text("{}", encoding="utf-8")
+                return
             key = self._vals["api_key"]
             self._vals = {f["key"]: f["default"] for f in FIELDS}
             self._vals["api_key"] = key          # keep the secret
@@ -196,11 +270,22 @@ class Config:
 
     def public(self):
         with self._lock:
+            resolved = {}
+            for k, f in self._by.items():
+                if f["type"] == "secret":
+                    resolved[k] = ""
+                elif f.get("scope") == "campaign" and k in self._campaign_vals:
+                    resolved[k] = self._campaign_vals[k]
+                else:
+                    resolved[k] = self._vals.get(k, f["default"])
             return {
                 "fields": FIELDS,
-                "values": {k: ("" if self._by[k]["type"] == "secret" else v) for k, v in self._vals.items()},
-                "secret_set": {k: bool(self._vals[k]) for k, f in self._by.items() if f["type"] == "secret"},
+                "values": resolved,
+                "global_values": {k: ("" if self._by[k]["type"] == "secret" else v) for k, v in self._vals.items()},
+                "campaign_values": {k: ("" if self._by[k]["type"] == "secret" else v) for k, v in self._campaign_vals.items()},
+                "secret_set": {k: bool(self._vals.get(k) or self._campaign_vals.get(k)) for k, f in self._by.items() if f["type"] == "secret"},
                 "path": str(self._path),
+                "campaign_path": str(self._campaign_path) if self._campaign_path else None,
             }
 
 
