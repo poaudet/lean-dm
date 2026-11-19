@@ -34,6 +34,7 @@ import requests
 from flask import Flask, request, jsonify, Response
 from config import cfg, SETTINGS_PATH
 import analyst
+import arc
 
 # ---------------- paths ----------------
 
@@ -687,6 +688,16 @@ def _generate(ctx, stream):
         raise RuntimeError("model returned an empty reply")
     return dm
 
+def get_allowed_moves():
+    if not cfg.arc_enabled:
+        return []
+    arc_state = arc.load_arc(ROOT)
+    if not arc_state:
+        return []
+    h = load_history()
+    turn = len(h) // 2 + 1
+    return arc.allowed_moves(arc_state, cfg.difficulty, turn)
+
 def player_turn(text, stream=False):
     with TURN_LOCK:
         history = load_history()
@@ -699,7 +710,7 @@ def player_turn(text, stream=False):
 
         brief = None
         if cfg.analyst_enabled:
-            allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+            allowed = get_allowed_moves()
             guard_items = compute_style_guard(history) if cfg.style_guard else []
             brief, source, model_used, ms = analyst.run_analyst(
                 ROOT, history, text, allowed, guard_items, chat_complete
@@ -714,6 +725,23 @@ def player_turn(text, stream=False):
         set_state(last_words=words, overlong=overlong)
         if not history and not read(PREMISE):
             atomic_write(PREMISE, text)                                       # first message = pinned premise
+
+        if cfg.arc_enabled:
+            # Auto plan if arc does not exist yet (D-13)
+            if not arc.load_arc(ROOT):
+                try:
+                    new_arc = arc.plan_initial_arc(
+                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()), history + [user, {"role": "assistant", "content": dm}], chat_complete
+                    )
+                    arc.save_arc(ROOT, new_arc)
+                except Exception as e:
+                    print(f"[arc: auto-planning failed: {e}]")
+            # Run record pass
+            try:
+                arc.run_record_pass(ROOT, text, dm, len(history) + 1, chat_complete)
+            except Exception as e:
+                print(f"[arc: record pass failed: {e}]")
+
     start_maintain()
     return dm
 
@@ -730,6 +758,10 @@ def undo_turn():
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
+        if cfg.arc_enabled:
+            arc.restore_arc_snapshot(ROOT, len(h) - 1)
+            arc.truncate_records(ROOT, len(h) - 2)
+            arc.truncate_arc_log(ROOT, len(h) - 2)
         analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
         atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-2]))
@@ -743,11 +775,14 @@ def retry_turn(stream=False, rerun_analyst=False):
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
+        if cfg.arc_enabled:
+            arc.restore_arc_snapshot(ROOT, len(h) - 1)
+            arc.truncate_records(ROOT, len(h) - 1)
         brief = None
         if cfg.analyst_enabled:
             player_idx = len(h) - 2
             if rerun_analyst:
-                allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+                allowed = get_allowed_moves()
                 guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
                 brief, source, model_used, ms = analyst.run_analyst(
                     ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
@@ -756,7 +791,7 @@ def retry_turn(stream=False, rerun_analyst=False):
             else:
                 brief = analyst.load_brief_for_msg(ROOT, player_idx)
                 if not brief:
-                    allowed = get_allowed_moves() if 'get_allowed_moves' in globals() else []
+                    allowed = get_allowed_moves()
                     guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
                     brief, source, model_used, ms = analyst.run_analyst(
                         ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
@@ -770,6 +805,11 @@ def retry_turn(stream=False, rerun_analyst=False):
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
         set_state(last_words=words, overlong=overlong)
+        if cfg.arc_enabled:
+            try:
+                arc.run_record_pass(ROOT, h[-2]["content"], dm, len(h) - 1, chat_complete)
+            except Exception as e:
+                print(f"[arc: record pass failed on retry: {e}]")
     return dm
 
 def game_state():
@@ -779,6 +819,7 @@ def game_state():
         est = est_tokens(build_context(history + [{"role": "user", "content": "x"}]))
         label = f"next prompt ≈{est / 1000:.1f}k tok"
     st = get_state()
+    arc_chip = arc.get_arc_chip(arc.load_arc(ROOT)) if cfg.arc_enabled else None
     return {
         "campaign": CAMPAIGN,
         "configured": bool(cfg.api_key and cfg.model),
@@ -792,6 +833,7 @@ def game_state():
         "ctx": label,
         "overlong": bool(st.get("overlong", False)),
         "last_words": _int(st.get("last_words", 0)),
+        "arc_chip": arc_chip,
     }
 
 
@@ -1228,6 +1270,19 @@ if __name__ == "__main__":
     if "--audit" in argv:
         run_audit()
         print(read(AUDIT))
+        sys.exit()
+    if "--plan-arc" in argv:
+        ensure_configured()
+        print(f"[planning arc for campaign '{CAMPAIGN}'...]")
+        existing_arc = arc.load_arc(ROOT)
+        if existing_arc:
+            bak = ROOT / "arc.json.bak"
+            shutil.copy(arc.arc_path(ROOT), bak)
+            print(f"[backed up existing arc to {bak}]")
+        h = load_history()
+        new_arc = arc.plan_initial_arc(read(PREMISE), read(SUMMARY), render_ledger(load_ledger()), h, chat_complete)
+        arc.save_arc(ROOT, new_arc)
+        print(f"[arc planned successfully: central question='{new_arc.get('central_question')}']")
         sys.exit()
     if "--web" in argv:
         if not (cfg.api_key and cfg.model):
