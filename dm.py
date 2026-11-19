@@ -40,7 +40,8 @@ CAMPAIGN = cfg.campaign
 if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
-ROOT = pathlib.Path(__file__).parent / "campaigns" / CAMPAIGN
+CAMPAIGNS_DIR = pathlib.Path(os.environ.get("DM_CAMPAIGNS_DIR") or pathlib.Path(__file__).parent / "campaigns")
+ROOT = CAMPAIGNS_DIR / CAMPAIGN
 HISTORY, UNDONE = ROOT / "history.jsonl", ROOT / "undone.jsonl"
 PREMISE, SUMMARY = ROOT / "premise.md", ROOT / "summary.md"
 LEDGER, AUDIT, STATE = ROOT / "ledger.json", ROOT / "audit.md", ROOT / "state.json"

@@ -1,2 +1,5 @@
 .env
 campaigns/
+__pycache__/
+*.pyc
+.pytest_cache/
