@@ -29,9 +29,9 @@ Everything before the last message is append-only, so provider prefix caching ca
 Dependencies: pip install flask requests
 """
 
-import json, os, sys, pathlib, threading, time, html, re, shutil
+import json, os, sys, pathlib, threading, time, html, re, shutil, hmac, zipfile, io
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 from config import cfg, SETTINGS_PATH
 import analyst
 import arc
@@ -203,6 +203,8 @@ def apply_ledger_ops(ledger, ops):
         if not eid or not str(u.get("state", "")).strip():
             continue
         e = by.get(eid) or {"id": eid}
+        if e.get("pinned"):                             # D-12: skip pinned entries
+            continue
         kind = str(u.get("kind", "")).strip().lower()
         e["kind"] = kind if kind in KINDS else e.get("kind", "thread")
         e["name"] = str(u.get("name") or e.get("name") or eid).strip()
@@ -216,13 +218,16 @@ def apply_ledger_ops(ledger, ops):
         e["status"] = "active"                          # an upsert reopens a closed entry
         by[eid] = e
     for i in _lst(ops.get("close")):
-        if slug(i) in by:
-            by[slug(i)]["status"] = "closed"
+        s_id = slug(i)
+        if s_id in by and not by[s_id].get("pinned"):
+            by[s_id]["status"] = "closed"
     for i in _lst(ops.get("delete")):
-        by.pop(slug(i), None)
+        s_id = slug(i)
+        if s_id in by and not by[s_id].get("pinned"):
+            by.pop(s_id, None)
     out = list(by.values())
     if len(out) > cfg.ledger_max:                       # over the cap: oldest CLOSED entries go first
-        closed = sorted((e for e in out if e.get("status") == "closed"), key=lambda e: e.get("msg") or 0)
+        closed = sorted((e for e in out if e.get("status") == "closed" and not e.get("pinned")), key=lambda e: e.get("msg") or 0)
         drop = {e["id"] for e in closed[: len(out) - cfg.ledger_max]}
         out = [e for e in out if e["id"] not in drop]
     return out
@@ -820,6 +825,21 @@ def game_state():
         label = f"next prompt ≈{est / 1000:.1f}k tok"
     st = get_state()
     arc_chip = arc.get_arc_chip(arc.load_arc(ROOT)) if cfg.arc_enabled else None
+
+    # Undo / retry status
+    can_undo = True
+    undo_reason = ""
+    if len(history) < 2 or history[-1]["role"] != "assistant" or history[-2]["role"] != "user":
+        can_undo = False
+        undo_reason = "No exchange to undo"
+    elif len(history) - 2 < max(folded(), ledgered()):
+        can_undo = False
+        undo_reason = "Exchange is folded into summary or ledger"
+
+    auth_warning = None
+    if cfg.host not in ("127.0.0.1", "localhost") and not cfg.web_password:
+        auth_warning = f"Warning: Server is accessible on {cfg.host}:{cfg.port} without a web_password set."
+
     return {
         "campaign": CAMPAIGN,
         "configured": bool(cfg.api_key and cfg.model),
@@ -834,247 +854,54 @@ def game_state():
         "overlong": bool(st.get("overlong", False)),
         "last_words": _int(st.get("last_words", 0)),
         "arc_chip": arc_chip,
+        "can_undo": can_undo,
+        "can_retry": can_undo,
+        "undo_blocked_reason": undo_reason,
+        "retry_blocked_reason": undo_reason,
+        "auth_warning": auth_warning,
+        "folded": folded(),
+        "ledgered": ledgered(),
+        "ctx_budget_tok": cfg.ctx_budget_tok,
+        "est_tokens": LAST["est"] or est_tokens(history),
+        "prompt_tokens": LAST["prompt_tokens"],
+        "cached": LAST["cached"],
+        "difficulty": cfg.difficulty,
+        "style_preset": cfg.style_preset,
+        "style_notes": cfg.style_notes,
     }
 
 
 # ---------------- web UI ----------------
 
 app = Flask(__name__)
+WEB_DIR = pathlib.Path(__file__).parent / "web"
 
-CSS = r"""
-body{font-family:system-ui,sans-serif;margin:0;background:#141220;color:#e8e5f5}
-a{color:#b3a6ff}
-button{padding:10px 16px;border-radius:8px;border:none;background:#6d4aff;color:#fff;cursor:pointer;font-size:.95em}
-button.ghost{background:transparent;border:1px solid #3d3670;color:#c9c3ee}
-button:disabled{opacity:.5;cursor:default}
-input,textarea{padding:10px;border-radius:8px;border:1px solid #3d3670;background:#1c1930;color:#e8e5f5;font-size:1em;font-family:inherit}
-"""
-
-PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DM — __CAMP__</title><style>__CSS__
-body{display:flex;height:100vh}
-#chat{flex:1;display:flex;flex-direction:column;max-width:820px;margin:0 auto;width:100%}
-#log{flex:1;overflow-y:auto;padding:16px}
-.msg{margin:10px 0;padding:10px 14px;border-radius:10px;white-space:pre-wrap;line-height:1.5}
-.user{background:#2b2450;border:1px solid #3d3670;max-width:85%;margin-left:auto}
-.dm{background:#1c1930;border:1px solid #2e2950;max-width:95%}
-.meta{color:#8b84b8;font-size:.8em;padding:10px 16px 0}
-#bar{display:flex;gap:8px;padding:12px;border-top:1px solid #2e2950}
-input#in{flex:1}
-#side{width:360px;border-left:1px solid #2e2950;display:flex;flex-direction:column}
-#tabs{display:flex}#tabs button{flex:1;border-radius:0;background:#1c1930;color:#c9c3ee;padding:10px}
-#tabs button.on{background:#2b2450;color:#fff}
-#acts{display:flex;gap:6px;padding:8px}#acts button{flex:1;padding:6px;font-size:.8em}
-#file{flex:1;overflow-y:auto;padding:14px;font-size:.9em;line-height:1.5}
-#file h1,#file h2,#file h3{color:#b3a6ff}#file ul{padding-left:18px}
-@media(max-width:900px){#side{display:none}}
-</style></head><body>
-<div id="chat">
-  <div class="meta">__CAMP__ — <span id="tn"></span> turns — <span id="ctx"></span> — <span id="job"></span>
-    <span id="warn" style="color:#ffb86b"></span> — <a href="/config">⚙ config</a></div>
-  <div id="log"></div>
-  <div id="bar">
-    <button class="ghost" onclick="undo()">↶ undo</button>
-    <button class="ghost" onclick="retry()">↻ retry</button>
-    <input id="in" placeholder="Your action… (Enter to send)" autofocus>
-    <button onclick="send()">Send</button>
-  </div>
-</div>
-<div id="side">
-  <div id="tabs">
-    <button id="t-prem" onclick="setTab('prem')">Premise</button>
-    <button id="t-sum" onclick="setTab('sum')">Summary</button>
-    <button id="t-led" class="on" onclick="setTab('led')">Ledger</button>
-    <button id="t-aud" onclick="setTab('aud')">Audit</button>
-  </div>
-  <div id="acts">
-    <button class="ghost" onclick="act('/api/rebuild')">rebuild ledger</button>
-    <button class="ghost" onclick="act('/api/audit')">run audit</button>
-  </div>
-  <div id="file"></div>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-let busy=false,current='led',state=null;
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function md(t){
-  t=esc(t);
-  const lines=t.split('\n');let out='',inList=false;
-  for(let l of lines){
-    if(/^#{1,3} /.test(l)){if(inList){out+='</ul>';inList=false}
-      const n=l.match(/^#+/)[0].length;out+=`<h${n}>${l.replace(/^#+ /,'')}</h${n}>`}
-    else if(/^[-*] /.test(l)){if(!inList){out+='<ul>';inList=true}out+=`<li>${l.slice(2)}</li>`}
-    else if(/^---+$/.test(l)){if(inList){out+='</ul>';inList=false}out+='<hr>'}
-    else if(l.trim()===''){if(inList){out+='</ul>';inList=false}}
-    else{if(inList){out+='</ul>';inList=false}out+=`<p>${l}</p>`}
-  }
-  if(inList)out+='</ul>';
-  return out.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/\*(.+?)\*/g,'<i>$1</i>');
-}
-function ledgerHtml(){
-  const L=state.ledger||[];
-  if(!L.length)return '<p>(empty — it builds automatically as the story grows, or press “rebuild ledger”)</p>';
-  const by={};
-  for(const e of L)(by[e.kind||'other']=by[e.kind||'other']||[]).push(e);
-  let out='';
-  for(const k of Object.keys(by).sort()){
-    out+='<h3>'+esc(k)+'</h3><ul>';
-    for(const e of by[k])out+='<li'+(e.status==='closed'?' style="opacity:.55"':'')+'><b>'+esc(e.name||e.id)+'</b>: '+esc(e.state||'')+
-      ' <small>['+esc(e.src||'?')+(e.msg!=null?' #'+e.msg:'')+(e.status==='closed'?' · closed':'')+']</small></li>';
-    out+='</ul>';
-  }
-  return out;
-}
-function addMsg(cls,text){const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;$('log').appendChild(d);return d}
-function toBottom(){const l=$('log');l.scrollTop=l.scrollHeight}
-function renderLog(s){
-  $('log').innerHTML='';
-  if(!s.history.length)addMsg('dm','New campaign — open with your character concept and the scene you want. This first message is pinned as the premise.');
-  for(const m of s.history)addMsg(m.role==='user'?'user':'dm',m.content);
-  toBottom();
-}
-function renderSide(){
-  if(!state)return;
-  const f=$('file');
-  if(current==='prem')f.innerHTML=md(state.premise||'(empty — your first message is pinned here; you can also edit premise.md by hand)');
-  else if(current==='sum')f.innerHTML=md(state.summary||'(empty — the narrator sees the full history; chapters start when it passes the fold budget)');
-  else if(current==='led')f.innerHTML=ledgerHtml();
-  else f.innerHTML=md(state.audit||'(none yet — press “run audit”)');
-}
-function setTab(t){current=t;['prem','sum','led','aud'].forEach(x=>$('t-'+x).classList.toggle('on',x===t));renderSide()}
-function refresh(full=true){
-  return fetch('/api/state').then(r=>r.json()).then(s=>{
-    state=s;$('tn').textContent=s.turns;$('ctx').textContent=s.ctx||'';
-    $('warn').textContent=s.configured?'':'⚠ not configured — open ⚙ config';
-    const j=s.job;$('job').textContent=j.running?('⏳ '+j.name+'…'):(j.name?(j.name+': '+j.msg):'');
-    if(full)renderLog(s);
-    renderSide();
-  });
-}
-function send(){
-  const i=$('in'),t=i.value.trim();if(!t||busy)return;
-  busy=true;i.value='';
-  const u=addMsg('user',t),w=addMsg('dm','…');toBottom();
-  fetch('/api/turn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})
-    .then(r=>r.json())
-    .then(d=>{
-      if(d.error){u.remove();w.textContent='[error: '+d.error+' — nothing was saved; your move is back in the input box]';i.value=t}
-      else return refresh();
-    })
-    .catch(()=>{u.remove();w.textContent='[network error — your move is back in the input box]';i.value=t})
-    .finally(()=>{busy=false});
-}
-function undo(){
-  if(busy)return;busy=true;
-  fetch('/api/undo',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.error){alert(d.error);return}
-    $('in').value=d.text||'';return refresh();
-  }).finally(()=>{busy=false});
-}
-function retry(){
-  if(busy)return;busy=true;
-  const w=addMsg('dm','…');toBottom();
-  fetch('/api/retry',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.error){w.textContent='[error: '+d.error+']'}else return refresh();
-  }).catch(()=>{w.textContent='[network error]'}).finally(()=>{busy=false});
-}
-function act(path){
-  fetch(path,{method:'POST'}).then(r=>r.json()).then(d=>{if(d.error)alert(d.error);return refresh(false)});
-}
-$('in').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
-setTab('led');refresh();setInterval(()=>{if(!busy)refresh(false)},5000);
-</script></body></html>"""
-
-CONFIG_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DM — settings</title><style>__CSS__
-body{padding:20px}
-#wrap{max-width:820px;margin:0 auto}
-fieldset{border:1px solid #2e2950;border-radius:10px;margin:18px 0;padding:8px 16px 16px}
-legend{color:#b3a6ff;padding:0 8px}
-.row{margin:14px 0;display:flex;flex-direction:column;gap:4px}
-.row label{font-weight:600}
-.row input[type=checkbox]{width:20px;height:20px}
-.help{color:#8b84b8;font-size:.85em}
-.err{color:#ff7b7b;font-size:.85em}
-.badge{background:#3d3670;border-radius:6px;padding:1px 6px;font-size:.7em;font-weight:400}
-#bar{position:sticky;bottom:0;background:#141220;padding:12px 0;display:flex;gap:8px;align-items:center;border-top:1px solid #2e2950}
-#status{color:#8b84b8;font-size:.9em;white-space:pre-wrap}
-</style></head><body><div id="wrap">
-<h2>⚙ Settings <small style="font-weight:400"><a href="/">← back to the game</a></small></h2>
-<div class="help" id="path"></div>
-<div id="form"></div>
-<div id="bar">
-  <button onclick="save()">Save</button>
-  <button class="ghost" onclick="saveTest()">Save &amp; test connection</button>
-  <button class="ghost" onclick="resetAll()">Reset to defaults</button>
-  <span id="status"></span>
-</div></div>
-<script>
-const $=id=>document.getElementById(id);
-let meta=null;
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-async function load(){meta=await (await fetch('/api/config')).json();$('path').textContent='Stored in '+meta.path+' — values apply live except those marked “restart”.';render()}
-function render(){
-  const groups={};
-  for(const f of meta.fields)(groups[f.group]=groups[f.group]||[]).push(f);
-  let h='';
-  for(const g in groups){
-    h+=`<fieldset><legend>${esc(g)}</legend>`;
-    for(const f of groups[g]){
-      const v=meta.values[f.key],id='f_'+f.key;
-      let input;
-      if(f.type==='bool')input=`<input type="checkbox" id="${id}" ${v?'checked':''}>`;
-      else if(f.type==='text')input=`<textarea id="${id}" rows="10">${esc(v)}</textarea>`;
-      else if(f.type==='secret')input=`<input id="${id}" type="password" autocomplete="off" placeholder="${meta.secret_set[f.key]?'(set — leave blank to keep)':'(not set)'}">`;
-      else if(f.type==='int'||f.type==='float')input=`<input id="${id}" type="number" step="${f.type==='int'?1:'any'}" value="${esc(v)}">`;
-      else input=`<input id="${id}" type="text" value="${esc(v)}">`;
-      const dflt=f.type==='secret'?'':` <i>default: ${esc(f.default===''?'(empty)':String(f.default).slice(0,60))}</i>`;
-      h+=`<div class="row"><label for="${id}">${esc(f.label)}${f.restart?' <span class="badge">restart</span>':''}</label>${input}<div class="help">${esc(f.help||'')}${dflt}</div><div class="err" id="e_${f.key}"></div></div>`;
-    }
-    h+='</fieldset>';
-  }
-  $('form').innerHTML=h;
-}
-function collect(){
-  const ch={};
-  for(const f of meta.fields){
-    const el=$('f_'+f.key);
-    if(f.type==='bool')ch[f.key]=el.checked;
-    else if(f.type==='secret'){if(el.value)ch[f.key]=el.value}
-    else ch[f.key]=el.value;
-  }
-  return ch;
-}
-async function save(){
-  document.querySelectorAll('.err').forEach(e=>e.textContent='');
-  $('status').textContent='saving…';
-  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({changes:collect()})});
-  const d=await r.json();
-  if(!d.ok){for(const k in d.errors){const e=$('e_'+k);if(e)e.textContent=d.errors[k]}$('status').textContent='not saved — fix the errors above';return false}
-  meta=d;render();$('status').textContent='saved ✓ '+new Date().toLocaleTimeString();return true;
-}
-async function saveTest(){
-  if(!await save())return;
-  $('status').textContent='testing…';
-  const d=await (await fetch('/api/config/test',{method:'POST'})).json();
-  $('status').textContent=d.results.map(x=>x.ok?`✓ ${x.role} ${x.model} (${x.sec}s)`:`✗ ${x.role} ${x.model}: ${x.error}`).join('\n');
-}
-async function resetAll(){
-  if(!confirm('Reset every setting to its default? (the API key is kept)'))return;
-  const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:true})});
-  meta=await r.json();render();$('status').textContent='reset ✓';
-}
-load();
-</script></body></html>"""
+@app.before_request
+def check_auth():
+    if not cfg.web_password:
+        return None
+    auth = request.authorization
+    if not auth or not auth.password or not hmac.compare_digest(auth.password, cfg.web_password):
+        return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
 
 @app.route("/")
 def index():
-    page = PAGE.replace("__CSS__", CSS).replace("__CAMP__", html.escape(CAMPAIGN))
+    index_file = WEB_DIR / "index.html"
+    if not index_file.exists():
+        return Response("Web assets missing", 404)
+    page = index_file.read_text(encoding="utf-8").replace("__CAMP__", html.escape(CAMPAIGN))
     return Response(page, mimetype="text/html")
 
 @app.route("/config")
 def config_page():
-    return Response(CONFIG_PAGE.replace("__CSS__", CSS), mimetype="text/html")
+    cfg_file = WEB_DIR / "config.html"
+    if not cfg_file.exists():
+        return Response("Web assets missing", 404)
+    return Response(cfg_file.read_text(encoding="utf-8"), mimetype="text/html")
+
+@app.route("/web/<path:filename>")
+def serve_web(filename):
+    return send_from_directory(WEB_DIR, filename)
 
 @app.route("/api/state")
 def api_state():
@@ -1089,6 +916,93 @@ def api_turn():
         return jsonify({"dm": player_turn(text)})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+@app.route("/api/stream", methods=["POST"])
+def api_stream():
+    ensure_configured()
+    text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty"}), 400
+
+    def event_stream():
+        with TURN_LOCK:
+            history = load_history()
+            if cfg.notes_routing and analyst.is_ooc_note(text):
+                entry = analyst.handle_ooc_note(
+                    ROOT, text, history, read(PREMISE), read(SUMMARY),
+                    render_ledger(load_ledger()), chat_complete
+                )
+                yield f"data: {json.dumps({'chunk': entry['a']})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            brief = None
+            if cfg.analyst_enabled:
+                yield f"data: {json.dumps({'stage': 'analyzing'})}\n\n"
+                allowed = get_allowed_moves()
+                guard_items = compute_style_guard(history) if cfg.style_guard else []
+                brief, source, model_used, ms = analyst.run_analyst(
+                    ROOT, history, text, allowed, guard_items, chat_complete
+                )
+                analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+
+            yield f"data: {json.dumps({'stage': 'narrating'})}\n\n"
+            ctx = build_context(history + [{"role": "user", "content": text}], brief=brief)
+            payload = {"model": cfg.model, "messages": ctx, "stream": True,
+                       "stream_options": {"include_usage": True}, **narrator_extra()}
+            r = _raw_post(payload, stream=True)
+            dm_text = ""
+            try:
+                for line in r.iter_lines():
+                    if not line or not line.startswith(b"data: "):
+                        continue
+                    p = line[6:].strip()
+                    if p == b"[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(p)
+                        delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                        if delta:
+                            dm_text += delta
+                            yield f"data: {json.dumps({'chunk': delta})}\n\n"
+                    except Exception:
+                        continue
+            finally:
+                r.close()
+
+            dm_cleaned = clean_reply(dm_text)
+            if not dm_cleaned:
+                raise RuntimeError("Empty response from model")
+
+            user = {"role": "user", "content": text}
+            append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm_cleaned}])
+            words = len(dm_cleaned.split())
+            overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
+            set_state(last_words=words, overlong=overlong)
+            if not history and not read(PREMISE):
+                atomic_write(PREMISE, text)
+
+            if cfg.arc_enabled:
+                yield f"data: {json.dumps({'stage': 'recording'})}\n\n"
+                if not arc.load_arc(ROOT):
+                    try:
+                        new_arc = arc.plan_initial_arc(
+                            read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
+                            history + [user, {"role": "assistant", "content": dm_cleaned}],
+                            chat_complete
+                        )
+                        arc.save_arc(ROOT, new_arc)
+                    except Exception as e:
+                        print(f"[arc: auto-planning failed: {e}]")
+                try:
+                    arc.run_record_pass(ROOT, text, dm_cleaned, len(history) + 1, chat_complete)
+                except Exception as e:
+                    print(f"[arc: record pass failed: {e}]")
+
+        start_maintain()
+        yield "data: [DONE]\n\n"
+
+    return Response(event_stream(), mimetype="text/event-stream")
 
 @app.route("/api/undo", methods=["POST"])
 def api_undo():
@@ -1121,6 +1035,92 @@ def api_audit():
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 409
+
+@app.route("/api/premise", methods=["POST"])
+def api_premise():
+    body = request.get_json(silent=True) or {}
+    text = body.get("text", "")
+    if PREMISE.exists():
+        shutil.copy(PREMISE, ROOT / "premise.md.bak")
+    atomic_write(PREMISE, text)
+    return jsonify({"ok": True})
+
+@app.route("/api/ledger", methods=["POST"])
+def api_ledger_action():
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if LEDGER.exists():
+        shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
+    ledger = load_ledger(strict=True)
+    if action == "pin":
+        entry_id = body.get("id")
+        pinned = bool(body.get("pinned", True))
+        for e in ledger:
+            if e.get("id") == entry_id:
+                e["pinned"] = pinned
+                break
+    elif action == "delete":
+        entry_id = body.get("id")
+        ledger = [e for e in ledger if e.get("id") != entry_id]
+    elif action == "upsert":
+        entry = body.get("entry", {})
+        ledger = apply_ledger_ops(ledger, {"upsert": [entry]})
+    atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
+    return jsonify({"ok": True, "ledger": ledger})
+
+@app.route("/api/export/transcript", methods=["GET"])
+def api_export_transcript():
+    history = load_history()
+    lines = [f"# Campaign Transcript — {CAMPAIGN}\n"]
+    if p := read(PREMISE):
+        lines.append(f"## Premise\n{p}\n")
+    for i, m in enumerate(history):
+        role = "Player" if m["role"] == "user" else "DM"
+        lines.append(f"### [{i}] {role}\n{m['content']}\n")
+    return Response("\n".join(lines), mimetype="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{CAMPAIGN}-transcript.md"'})
+
+@app.route("/api/export/campaign.zip", methods=["GET"])
+def api_export_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in ROOT.rglob("*"):
+            if f.is_file():
+                if f.name in ("settings.json", "campaign.json"):
+                    continue
+                rel = f.relative_to(ROOT)
+                zf.write(f, arcname=str(rel))
+    buf.seek(0)
+    return Response(buf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{CAMPAIGN}.zip"'})
+
+@app.route("/api/campaigns", methods=["GET"])
+def api_campaigns_list():
+    camps = []
+    if CAMPAIGNS_DIR.exists():
+        for d in CAMPAIGNS_DIR.iterdir():
+            if d.is_dir() and (d / "history.jsonl").exists():
+                camps.append(d.name)
+    return jsonify({"campaigns": camps, "current": CAMPAIGN})
+
+@app.route("/api/campaigns", methods=["POST"])
+def api_campaigns_manage():
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    name = re.sub(r"[^\w.\-]", "_", body.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "invalid name"}), 400
+    target = CAMPAIGNS_DIR / name
+    if action == "create":
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "history.jsonl").write_text("", encoding="utf-8")
+        return jsonify({"ok": True, "name": name})
+    elif action == "duplicate":
+        if target.exists():
+            return jsonify({"error": "campaign exists"}), 409
+        shutil.copytree(ROOT, target)
+        return jsonify({"ok": True, "name": name})
+    return jsonify({"error": "unknown action"}), 400
 
 @app.route("/api/config", methods=["GET"])
 def api_config_get():
