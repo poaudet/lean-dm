@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DM — settings</title>
+  <link rel="stylesheet" href="/web/style.css">
+  <style>
+    body { padding: 20px; height: auto; overflow: auto; display: block; }
+    #wrap { max-width: 860px; margin: 0 auto; padding-bottom: 80px; }
+    .group-nav { display: flex; gap: 6px; flex-wrap: wrap; margin: 16px 0; }
+    .group-nav button { padding: 6px 12px; font-size: 0.85em; border-radius: 6px; }
+    fieldset { border: 1px solid var(--border); border-radius: 10px; margin: 16px 0; padding: 12px 18px; background: var(--bg-surface); }
+    legend { color: var(--accent-light); padding: 0 8px; font-weight: 600; }
+    .row { margin: 12px 0; display: flex; flex-direction: column; gap: 4px; }
+    .row-header { display: flex; justify-content: space-between; align-items: center; }
+    .row label { font-weight: 600; }
+    .row input[type=checkbox] { width: 20px; height: 20px; }
+    .help { color: var(--text-muted); font-size: 0.85em; }
+    .err { color: var(--err); font-size: 0.85em; }
+    .badge { border-radius: 4px; padding: 1px 6px; font-size: 0.7em; font-weight: 500; }
+    .badge-scope { background: #2b2450; color: #b3a6ff; border: 1px solid var(--border); }
+    .badge-restart { background: #ffb86b; color: #000; }
+    #bar-config { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); padding: 12px 20px; display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--border); z-index: 100; max-width: 900px; margin: 0 auto; }
+    .dirty-tag { color: var(--warn); font-size: 0.85em; display: none; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
+    <h2>⚙ Settings <small style="font-weight:400"><a href="/">← back to the game</a></small></h2>
+    <div style="display:flex;gap:8px">
+      <button class="ghost" onclick="exportSettings()">Export JSON</button>
+      <input type="file" id="import-file" style="display:none" onchange="importSettings(event)">
+      <button class="ghost" onclick="$('import-file').click()">Import JSON</button>
+    </div>
+  </div>
+
+  <div class="help" id="path-label"></div>
+  <input id="config-search" placeholder="Search settings…" oninput="filterFields()" style="width:100%;margin-top:12px">
+
+  <div class="group-nav" id="group-nav"></div>
+  <div id="form"></div>
+</div>
+
+<div id="bar-config">
+  <button onclick="saveAll()">Save</button>
+  <button class="ghost" onclick="saveTestAll()">Save &amp; Test</button>
+  <button class="ghost" onclick="resetDefaults()">Reset to defaults</button>
+  <span class="dirty-tag" id="dirty-tag">● Unsaved changes</span>
+  <span id="status" style="font-size:0.85em;color:var(--text-muted);white-space:pre-wrap"></span>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let meta = null, isDirty = false;
+
+window.addEventListener('beforeunload', e => {
+  if (isDirty) { e.preventDefault(); e.returnValue = ''; }
+});
+
+function esc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function load() {
+  meta = await (await fetch('/api/config')).json();
+  $('path-label').textContent = 'Global: ' + meta.path + (meta.campaign_path ? ' | Campaign: ' + meta.campaign_path : '');
+  renderGroups();
+  render();
+}
+
+function renderGroups() {
+  const groups = Array.from(new Set(meta.fields.map(f => f.group)));
+  let h = `<button class="ghost" onclick="showGroup('all')">All</button>`;
+  groups.forEach(g => {
+    h += `<button class="ghost" onclick="showGroup('${esc(g)}')">${esc(g)}</button>`;
+  });
+  $('group-nav').innerHTML = h;
+}
+
+function showGroup(g) {
+  document.querySelectorAll('fieldset').forEach(fs => {
+    if (g === 'all' || fs.getAttribute('data-group') === g) {
+      fs.style.display = 'block';
+    } else {
+      fs.style.display = 'none';
+    }
+  });
+}
+
+function filterFields() {
+  const q = $('config-search').value.toLowerCase();
+  document.querySelectorAll('.row').forEach(row => {
+    const text = row.textContent.toLowerCase();
+    row.style.display = (!q || text.includes(q)) ? 'flex' : 'none';
+  });
+}
+
+function render() {
+  const groups = {};
+  for (const f of meta.fields) (groups[f.group] = groups[f.group] || []).push(f);
+  let h = '';
+  for (const g in groups) {
+    h += `<fieldset data-group="${esc(g)}"><legend>${esc(g)}</legend>`;
+    for (const f of groups[g]) {
+      const v = meta.values[f.key];
+      const id = 'f_' + f.key;
+      let input;
+      if (f.type === 'bool') {
+        input = `<input type="checkbox" id="${id}" ${v ? 'checked' : ''} onchange="markDirty()">`;
+      } else if (f.type === 'select') {
+        const opts = (f.options || []).map(o => `<option value="${o}" ${v === o ? 'selected' : ''}>${o}</option>`).join('');
+        input = `<select id="${id}" onchange="markDirty()">${opts}</select>`;
+      } else if (f.type === 'text') {
+        input = `<textarea id="${id}" rows="6" oninput="markDirty()">${esc(v)}</textarea>`;
+      } else if (f.type === 'secret') {
+        input = `<input id="${id}" type="password" autocomplete="off" placeholder="${meta.secret_set[f.key] ? '(set — leave blank to keep)' : '(not set)'}" oninput="markDirty()">`;
+      } else if (f.type === 'int' || f.type === 'float') {
+        input = `<input id="${id}" type="number" step="${f.type === 'int' ? 1 : 'any'}" value="${esc(v)}" oninput="markDirty()">`;
+      } else {
+        input = `<input id="${id}" type="text" value="${esc(v)}" oninput="markDirty()">`;
+      }
+      const dflt = f.type === 'secret' ? '' : ` <i>default: ${esc(f.default === '' ? '(empty)' : String(f.default).slice(0, 60))}</i>`;
+      const scopeBadge = `<span class="badge badge-scope">${f.scope || 'global'}</span>`;
+      const restartBadge = f.restart ? `<span class="badge badge-restart">restart</span>` : '';
+      h += `
+        <div class="row" id="row_${f.key}">
+          <div class="row-header">
+            <label for="${id}">${esc(f.label)} ${scopeBadge} ${restartBadge}</label>
+            <button class="ghost" style="padding:1px 6px;font-size:0.7em" onclick="resetField('${f.key}')" title="Reset field to default">reset</button>
+          </div>
+          ${input}
+          <div class="help">${esc(f.help || '')}${dflt}</div>
+          <div class="err" id="e_${f.key}"></div>
+        </div>
+      `;
+    }
+    h += `</fieldset>`;
+  }
+  $('form').innerHTML = h;
+}
+
+function markDirty() {
+  isDirty = true;
+  $('dirty-tag').style.display = 'inline';
+}
+
+function resetField(k) {
+  const f = meta.fields.find(x => x.key === k);
+  if (!f) return;
+  const el = $('f_' + k);
+  if (f.type === 'bool') el.checked = !!f.default;
+  else if (f.type === 'secret') el.value = '';
+  else el.value = f.default;
+  markDirty();
+}
+
+function collect() {
+  const ch = {};
+  for (const f of meta.fields) {
+    const el = $('f_' + f.key);
+    if (!el) continue;
+    if (f.type === 'bool') ch[f.key] = el.checked;
+    else if (f.type === 'secret') { if (el.value) ch[f.key] = el.value; }
+    else ch[f.key] = el.value;
+  }
+  return ch;
+}
+
+async function saveAll() {
+  document.querySelectorAll('.err').forEach(e => e.textContent = '');
+  $('status').textContent = 'saving…';
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ changes: collect() })
+  });
+  const d = await r.json();
+  if (!d.ok) {
+    for (const k in d.errors) {
+      const e = $('e_' + k);
+      if (e) e.textContent = d.errors[k];
+    }
+    $('status').textContent = 'Fix errors above';
+    return false;
+  }
+  meta = d;
+  isDirty = false;
+  $('dirty-tag').style.display = 'none';
+  render();
+  $('status').textContent = 'Saved ✓ ' + new Date().toLocaleTimeString();
+  return true;
+}
+
+async function saveTestAll() {
+  if (!await saveAll()) return;
+  $('status').textContent = 'Testing connections…';
+  const d = await (await fetch('/api/config/test', { method: 'POST' })).json();
+  $('status').textContent = d.results.map(x => x.ok ? `✓ ${x.role} ${x.model} (${x.sec}s)` : `✗ ${x.role} ${x.model}: ${x.error}`).join('\n');
+}
+
+async function resetDefaults() {
+  if (!confirm('Reset every setting to default? (API key kept)')) return;
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reset: true })
+  });
+  meta = await r.json();
+  isDirty = false;
+  $('dirty-tag').style.display = 'none';
+  render();
+  $('status').textContent = 'Reset ✓';
+}
+
+function exportSettings() {
+  const exported = {};
+  for (const f of meta.fields) {
+    if (f.type !== 'secret') exported[f.key] = meta.values[f.key];
+  }
+  const blob = new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'settings-export.json';
+  a.click();
+}
+
+function importSettings(evt) {
+  const file = evt.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      for (const k in data) {
+        const el = $('f_' + k);
+        const f = meta.fields.find(x => x.key === k);
+        if (el && f && f.type !== 'secret') {
+          if (f.type === 'bool') el.checked = !!data[k];
+          else el.value = data[k];
+        }
+      }
+      markDirty();
+      alert('Settings loaded into form. Click Save to apply.');
+    } catch (err) {
+      alert('Invalid JSON file');
+    }
+  };
+  reader.readAsText(file);
+}
+
+load();
+</script>
+</body>
+</html>

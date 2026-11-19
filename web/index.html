@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>lean-dm</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<div id="drawer-overlay" class="drawer-overlay"></div>
+
+<div id="chat">
+  <div id="auth-warn-banner" class="banner-warn" style="display:none;margin:8px 16px 0"></div>
+
+  <div class="top-bar">
+    <div class="meta-left">
+      <b id="camp-label">__CAMP__</b>
+      <span>· <span id="tn">0</span> turns</span>
+      <span id="arc-chip" class="chip" style="display:none"></span>
+      <span id="ctx"></span>
+      <span id="job"></span>
+      <span id="warn" style="color:var(--warn)"></span>
+    </div>
+    <div class="meta-right">
+      <select id="qc-diff" onchange="updateQuickControl('difficulty', this.value)" title="Difficulty" style="padding:2px 6px;font-size:0.85em">
+        <option value="story">story</option>
+        <option value="standard">standard</option>
+        <option value="hard">hard</option>
+      </select>
+      <select id="qc-preset" onchange="updateQuickControl('style_preset', this.value)" title="Style Preset" style="padding:2px 6px;font-size:0.85em">
+        <option value="none">preset: none</option>
+        <option value="subtle">subtle</option>
+        <option value="pulp">pulp</option>
+        <option value="noir">noir</option>
+        <option value="terse">terse</option>
+      </select>
+      <a href="/config">⚙ config</a>
+      <button id="drawer-toggle" class="ghost" style="padding:4px 8px;font-size:0.8em">☰</button>
+    </div>
+  </div>
+
+  <div class="context-meter" style="padding:4px 16px">
+    <div class="meter-track" id="meter-track">
+      <div class="meter-fill" id="meter-fill" style="width:0%"></div>
+      <div class="meter-cached" id="meter-cached" style="width:0%"></div>
+    </div>
+  </div>
+
+  <div id="log" role="log" aria-live="polite"></div>
+
+  <div id="bar">
+    <div class="bar-controls">
+      <button id="btn-undo" class="ghost" onclick="undo()" title="Undo last turn">↶ undo</button>
+      <button id="btn-retry" class="ghost" onclick="retry()" title="Retry DM reply">↻ retry</button>
+      <textarea id="in" placeholder="Your action… (Enter to send, Shift+Enter for newline)" autofocus rows="1"></textarea>
+      <button id="btn-send" onclick="send()">Send</button>
+      <button id="btn-stop" class="ghost" onclick="stopTurn()" style="display:none;color:var(--err)">Stop</button>
+      <span id="timer-label" style="font-size:0.8em;color:var(--text-muted)"></span>
+    </div>
+  </div>
+</div>
+
+<div id="side">
+  <div id="tabs">
+    <button id="t-prem" onclick="setTab('prem')">Premise</button>
+    <button id="t-sum" onclick="setTab('sum')">Summary</button>
+    <button id="t-led" class="on" onclick="setTab('led')">Ledger</button>
+    <button id="t-notes" onclick="setTab('notes')">Notes</button>
+    <button id="t-aud" onclick="setTab('aud')">Audit</button>
+  </div>
+  <div class="side-content" id="side-content"></div>
+</div>
+
+<script src="/web/app.js"></script>
+</body>
+</html>
