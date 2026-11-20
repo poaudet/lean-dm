@@ -40,6 +40,21 @@
   <input id="config-search" placeholder="Search settings…" oninput="filterFields()" style="width:100%;margin-top:12px">
 
   <div class="group-nav" id="group-nav"></div>
+  <fieldset>
+    <legend>Campaign</legend>
+    <div class="row">
+      <label for="campaign-select">Campaign <span class="badge badge-scope">global</span> <span class="badge badge-restart">restart</span></label>
+      <select id="campaign-select"></select>
+    </div>
+    <div class="row">
+      <label for="campaign-new">New campaign</label>
+      <input id="campaign-new" type="text">
+      <button class="ghost" onclick="createCampaign()">Create campaign</button>
+    </div>
+    <div class="err" id="e_campaign"></div>
+    <button onclick="switchCampaign()">Switch &amp; restart</button>
+    <button class="ghost" onclick="restartServer()">Restart server</button>
+  </fieldset>
   <div id="form"></div>
 </div>
 
@@ -60,7 +75,7 @@ window.addEventListener('beforeunload', e => {
 });
 
 function esc(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 async function load() {
@@ -68,6 +83,88 @@ async function load() {
   $('path-label').textContent = 'Global: ' + meta.path + (meta.campaign_path ? ' | Campaign: ' + meta.campaign_path : '');
   renderGroups();
   render();
+  await loadCampaigns();
+}
+
+async function loadCampaigns(selected) {
+  try {
+    const r = await fetch('/api/campaigns');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Could not load campaigns');
+    $('campaign-select').innerHTML = d.campaigns.map(name =>
+      `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+    $('campaign-select').value = selected ?? d.current;
+    return true;
+  } catch (err) {
+    $('e_campaign').textContent = err.message;
+    return false;
+  }
+}
+
+async function createCampaign() {
+  $('e_campaign').textContent = '';
+  $('status').textContent = 'Creating campaign…';
+  try {
+    const r = await fetch('/api/campaigns', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'create', name: $('campaign-new').value })
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || 'Could not create campaign');
+    if (!await loadCampaigns(d.name)) {
+      $('status').textContent = 'Could not load campaigns';
+      return;
+    }
+    $('status').textContent = 'Campaign created';
+  } catch (err) {
+    $('e_campaign').textContent = err.message;
+    $('status').textContent = 'Could not create campaign';
+  }
+}
+
+async function switchCampaign() {
+  $('e_campaign').textContent = '';
+  const campaign = $('campaign-select').value;
+  if (!campaign) {
+    $('e_campaign').textContent = 'Select a campaign';
+    return;
+  }
+  if (isDirty && !confirm('Unsaved settings will be lost. Switch campaigns?')) return;
+  $('status').textContent = 'Switching campaign…';
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ changes: { campaign } })
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error((d.errors && d.errors.campaign) || d.error || 'Could not switch campaign');
+    const restart = await fetch('/api/restart', { method: 'POST' });
+    const result = await restart.json();
+    if (!restart.ok || !result.ok) throw new Error(result.error || 'Could not restart server');
+    isDirty = false;
+    $('status').textContent = 'Restarting server…';
+    setTimeout(() => { window.location.href = '/'; }, 1500);
+  } catch (err) {
+    $('e_campaign').textContent = err.message;
+    $('status').textContent = 'Could not switch campaign';
+  }
+}
+
+async function restartServer() {
+  if (!confirm('Restart the server?')) return;
+  $('e_campaign').textContent = '';
+  $('status').textContent = 'Restarting server…';
+  try {
+    const r = await fetch('/api/restart', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || 'Could not restart server');
+    setTimeout(() => { window.location.reload(); }, 1500);
+  } catch (err) {
+    $('e_campaign').textContent = err.message;
+    $('status').textContent = 'Could not restart server';
+  }
 }
 
 function renderGroups() {
@@ -80,7 +177,7 @@ function renderGroups() {
 }
 
 function showGroup(g) {
-  document.querySelectorAll('fieldset').forEach(fs => {
+  document.querySelectorAll('#form fieldset').forEach(fs => {
     if (g === 'all' || fs.getAttribute('data-group') === g) {
       fs.style.display = 'block';
     } else {
@@ -91,7 +188,7 @@ function showGroup(g) {
 
 function filterFields() {
   const q = $('config-search').value.toLowerCase();
-  document.querySelectorAll('.row').forEach(row => {
+  document.querySelectorAll('#form .row').forEach(row => {
     const text = row.textContent.toLowerCase();
     row.style.display = (!q || text.includes(q)) ? 'flex' : 'none';
   });
@@ -132,7 +229,7 @@ function render() {
           </div>
           ${input}
           <div class="help">${esc(f.help || '')}${dflt}</div>
-          <div class="err" id="e_${f.key}"></div>
+          <div class="err" id="${f.key === 'campaign' ? 'e_field_campaign' : 'e_' + f.key}"></div>
         </div>
       `;
     }
@@ -163,6 +260,7 @@ function collect() {
     if (!el) continue;
     if (f.type === 'bool') ch[f.key] = el.checked;
     else if (f.type === 'secret') { if (el.value) ch[f.key] = el.value; }
+    else if (f.type === 'int' && el.value === '' && f.default === 0) ch[f.key] = 0;
     else ch[f.key] = el.value;
   }
   return ch;
@@ -179,7 +277,7 @@ async function saveAll() {
   const d = await r.json();
   if (!d.ok) {
     for (const k in d.errors) {
-      const e = $('e_' + k);
+      const e = $(k === 'campaign' ? 'e_field_campaign' : 'e_' + k);
       if (e) e.textContent = d.errors[k];
     }
     $('status').textContent = 'Fix errors above';
