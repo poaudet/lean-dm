@@ -1143,6 +1143,11 @@ def api_config_set():
 def api_restart():
     def restart():
         time.sleep(0.5)
+        # Werkzeug keeps its listening socket inheritable for its reloader.
+        try:
+            os.set_inheritable(int(os.environ["WERKZEUG_SERVER_FD"]), False)
+        except (KeyError, ValueError, OSError):
+            pass
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=restart, daemon=True).start()
     return jsonify({"ok": True})

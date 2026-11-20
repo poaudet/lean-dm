@@ -230,6 +230,8 @@ def test_api_restart(monkeypatch):
 
     monkeypatch.setattr(dm.threading, "Thread", FakeThread)
     monkeypatch.setattr(dm.time, "sleep", lambda delay: calls.append(("sleep", delay)))
+    monkeypatch.setenv("WERKZEUG_SERVER_FD", "42")
+    monkeypatch.setattr(dm.os, "set_inheritable", lambda fd, value: calls.append(("inheritable", fd, value)))
     monkeypatch.setattr(dm.os, "execv", lambda exe, args: calls.append(("execv", exe, args)))
 
     with dm.app.test_client() as client:
@@ -237,6 +239,7 @@ def test_api_restart(monkeypatch):
     assert res.status_code == 200
     assert res.get_json() == {"ok": True}
     assert calls == ["started", ("sleep", 0.5),
+                     ("inheritable", 42, False),
                      ("execv", dm.sys.executable, [dm.sys.executable] + dm.sys.argv)]
 
 
