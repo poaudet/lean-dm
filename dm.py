@@ -1108,7 +1108,7 @@ def api_campaigns_manage():
     body = request.get_json(silent=True) or {}
     action = body.get("action")
     name = re.sub(r"[^\w.\-]", "_", body.get("name", "")).strip()
-    if not name:
+    if not name or name in (".", ".."):
         return jsonify({"error": "invalid name"}), 400
     target = CAMPAIGNS_DIR / name
     if action == "create":

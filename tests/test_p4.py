@@ -215,6 +215,11 @@ def test_campaigns_api_list_and_create(tmp_path):
         assert res_duplicate.get_json()["error"] == "campaign exists"
         assert history.read_text(encoding="utf-8") == "existing history"
 
+        for name in (".", ".."):
+            res_invalid = client.post("/api/campaigns", json={"action": "create", "name": name})
+            assert res_invalid.status_code == 400
+            assert res_invalid.get_json()["error"] == "invalid name"
+
 
 def test_api_restart(monkeypatch):
     calls = []
