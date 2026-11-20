@@ -208,6 +208,37 @@ def test_campaigns_api_list_and_create(tmp_path):
         assert res_create.status_code == 200
         assert res_create.get_json()["ok"] is True
 
+        history = dm.CAMPAIGNS_DIR / "new_quest" / "history.jsonl"
+        history.write_text("existing history", encoding="utf-8")
+        res_duplicate = client.post("/api/campaigns", json={"action": "create", "name": "new_quest"})
+        assert res_duplicate.status_code == 409
+        assert res_duplicate.get_json()["error"] == "campaign exists"
+        assert history.read_text(encoding="utf-8") == "existing history"
+
+
+def test_api_restart(monkeypatch):
+    calls = []
+
+    class FakeThread:
+        def __init__(self, target, daemon):
+            self.target = target
+            assert daemon is True
+
+        def start(self):
+            calls.append("started")
+            self.target()
+
+    monkeypatch.setattr(dm.threading, "Thread", FakeThread)
+    monkeypatch.setattr(dm.time, "sleep", lambda delay: calls.append(("sleep", delay)))
+    monkeypatch.setattr(dm.os, "execv", lambda exe, args: calls.append(("execv", exe, args)))
+
+    with dm.app.test_client() as client:
+        res = client.post("/api/restart")
+    assert res.status_code == 200
+    assert res.get_json() == {"ok": True}
+    assert calls == ["started", ("sleep", 0.5),
+                     ("execv", dm.sys.executable, [dm.sys.executable] + dm.sys.argv)]
+
 
 # ---------------------------------------------------------------------------
 # 8. Streaming endpoint (/api/stream)

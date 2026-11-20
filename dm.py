@@ -1113,7 +1113,10 @@ def api_campaigns_manage():
     target = CAMPAIGNS_DIR / name
     if action == "create":
         target.mkdir(parents=True, exist_ok=True)
-        (target / "history.jsonl").write_text("", encoding="utf-8")
+        try:
+            (target / "history.jsonl").open("x", encoding="utf-8").close()
+        except FileExistsError:
+            return jsonify({"error": "campaign exists"}), 409
         return jsonify({"ok": True, "name": name})
     elif action == "duplicate":
         if target.exists():
@@ -1135,6 +1138,14 @@ def api_config_set():
         return jsonify({"ok": True, "errors": {}, **cfg.public()})
     errors = cfg.update(body.get("changes") or {}, scope=scope)
     return jsonify({"ok": not errors, "errors": errors, **cfg.public()}), (400 if errors else 200)
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    def restart():
+        time.sleep(0.5)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=restart, daemon=True).start()
+    return jsonify({"ok": True})
 
 @app.route("/api/notes", methods=["GET"])
 def api_notes_get():
