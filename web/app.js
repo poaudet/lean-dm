@@ -351,6 +351,7 @@ function send() {
 
   abortCtrl = new AbortController();
   let fullText = '';
+  let committed = false;   // set once the server reports the exchange is saved
   let stageEl = document.createElement('span');
   stageEl.style.fontSize = '0.85em';
   stageEl.style.color = 'var(--text-muted)';
@@ -394,6 +395,10 @@ function send() {
             const data = JSON.parse(dataStr);
             if (data.stage) {
               stageEl.textContent = '⏳ ' + data.stage + '…';
+              if (data.stage === 'recording') {
+                committed = true;                       // exchange is already on disk
+                $('btn-stop').style.display = 'none';   // stopping now cannot undo it
+              }
             } else if (data.chunk) {
               if (stageEl.parentNode) stageEl.remove();
               fullText += data.chunk;
@@ -404,6 +409,12 @@ function send() {
         }
         readChunk();
       }).catch(err => {
+        if (committed) {              // saved server-side: trust the server, not the optimistic UI
+          toast('Connection dropped after the turn was saved - reloading', 'err');
+          cleanup();
+          refresh();
+          return;
+        }
         if (err.name === 'AbortError') {
           u.remove();
           w.textContent = '[stopped — nothing was saved]';

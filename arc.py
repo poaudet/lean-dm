@@ -63,6 +63,11 @@ def load_arc(root):
     return None
 
 
+def arc_is_corrupt(root):
+    """True when arc.json exists but is unusable. Callers must not overwrite it."""
+    return arc_path(root).exists() and load_arc(root) is None
+
+
 def save_arc(root, arc):
     p = arc_path(root)
     tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
@@ -89,6 +94,29 @@ def restore_arc_snapshot(root, msg_idx):
         except Exception:
             pass
     return False
+
+
+# Files that make up the mutable arc runtime state (used to roll back a failed retry).
+_RUNTIME_FILES = ("arc.json", "records.jsonl", "arc_log.jsonl")
+
+
+def backup_state(root):
+    """Raw text of each runtime file (None if absent)."""
+    out = {}
+    for name in _RUNTIME_FILES:
+        p = root / name
+        out[name] = p.read_text(encoding="utf-8") if p.exists() else None
+    return out
+
+
+def restore_state(root, backup):
+    """Put the files captured by backup_state() back exactly as they were."""
+    for name, text in backup.items():
+        p = root / name
+        if text is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_text(text, encoding="utf-8")
 
 
 def load_records(root):
@@ -395,6 +423,15 @@ RECORD_PROMPT = (
 )
 
 
+def _clamp_elapsed(value, default=5, lo=1, hi=120):
+    """Coerce the recorder's elapsed_minutes to an int in [lo, hi]; junk -> default."""
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(lo, min(hi, n))
+
+
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
     """Execute record pass over the newest turn, updating clock, beats, pressures."""
     arc = load_arc(root)
@@ -439,11 +476,12 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
         }
 
     # Update clock
-    elapsed = max(0, int(res.get("elapsed_minutes", 0)))
-    arc["clock"]["minutes"] = arc.get("clock", {}).get("minutes", 0) + elapsed
+    elapsed = _clamp_elapsed(res.get("elapsed_minutes"))
+    arc.setdefault("clock", {})["minutes"] = arc["clock"].get("minutes", 0) + elapsed
 
     # Update beats
-    beats_done = [str(x) for x in res.get("beats_done", [])]
+    beats_raw = res.get("beats_done")
+    beats_done = [str(x) for x in beats_raw] if isinstance(beats_raw, list) else []
     for b in active_act.get("beats", []):
         if b.get("id") in beats_done and b.get("status") == "pending":
             b["status"] = "done"
@@ -499,11 +537,15 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
 
     # If act complete, trigger act transition
     if act_complete and active_act.get("status") == "active":
-        transition_act(root, act_n, chat_fn)
+        transition_act(root, act_n, chat_fn, msg_idx=msg_idx)
 
 
-def transition_act(root, act_n, chat_fn):
-    """Handle act boundary transition and revision logging."""
+def transition_act(root, act_n, chat_fn, msg_idx=None):
+    """Handle act boundary transition and revision logging.
+
+    msg_idx is the history index of the turn that closed the act. arc_log entries are
+    keyed by it so undo/retry truncate the log in the same unit as records.
+    """
     arc = load_arc(root)
     if not arc:
         return
@@ -555,7 +597,7 @@ def transition_act(root, act_n, chat_fn):
     append_arc_log(
         root,
         rev=arc["revision"],
-        at_msg=len(records),
+        at_msg=int(msg_idx) if msg_idx is not None else len(records),
         act=act_n,
         kind="act_boundary",
         diff={"resolved_act": act_n, "new_act": arc.get("act")},

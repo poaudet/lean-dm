@@ -311,10 +311,12 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
     t0 = time.time()
     timeout = max(0.1, float(cfg.analyst_timeout_sec))
 
+    # No `with` block: its exit calls shutdown(wait=True) and would sit there until the
+    # model call finishes, which defeats the timeout (D-14).
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
-            raw = future.result(timeout=timeout)
+        future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
+        raw = future.result(timeout=timeout)
         parsed = parse_json_tolerantly(raw)
         if not parsed:
             raise ValueError("Unparseable JSON from analyst")
@@ -322,9 +324,11 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
     except Exception as e:
-        brief = make_fallback_brief(reason=str(e)[:50])
+        brief = make_fallback_brief(reason=(str(e) or type(e).__name__)[:50])
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------

@@ -733,7 +733,9 @@ def player_turn(text, stream=False):
 
         if cfg.arc_enabled:
             # Auto plan if arc does not exist yet (D-13)
-            if not arc.load_arc(ROOT):
+            if arc.arc_is_corrupt(ROOT):
+                warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
+            elif not arc.load_arc(ROOT):
                 try:
                     new_arc = arc.plan_initial_arc(
                         read(PREMISE), read(SUMMARY), render_ledger(load_ledger()), history + [user, {"role": "assistant", "content": dm}], chat_complete
@@ -780,9 +782,11 @@ def retry_turn(stream=False, rerun_analyst=False):
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
+        arc_backup = arc.backup_state(ROOT) if cfg.arc_enabled else None
         if cfg.arc_enabled:
             arc.restore_arc_snapshot(ROOT, len(h) - 1)
             arc.truncate_records(ROOT, len(h) - 1)
+            arc.truncate_arc_log(ROOT, len(h) - 1)
         brief = None
         if cfg.analyst_enabled:
             player_idx = len(h) - 2
@@ -803,7 +807,14 @@ def retry_turn(stream=False, rerun_analyst=False):
                     )
                     analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
 
-        dm = _generate(build_context(h[:-1], brief=brief), stream)
+        try:
+            dm = _generate(build_context(h[:-1], brief=brief), stream)
+        except BaseException:
+            # Generation failed, so the old reply stays in history: the arc must stay
+            # consistent with it, not with the rollback done above.
+            if arc_backup is not None:
+                arc.restore_state(ROOT, arc_backup)
+            raise
         new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
         append_jsonl(UNDONE, lines[-1:])
         atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-1]) + new + "\n")
@@ -984,7 +995,9 @@ def api_stream():
 
             if cfg.arc_enabled:
                 yield f"data: {json.dumps({'stage': 'recording'})}\n\n"
-                if not arc.load_arc(ROOT):
+                if arc.arc_is_corrupt(ROOT):
+                    warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
+                elif not arc.load_arc(ROOT):
                     try:
                         new_arc = arc.plan_initial_arc(
                             read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
@@ -1290,8 +1303,7 @@ if __name__ == "__main__":
     if "--plan-arc" in argv:
         ensure_configured()
         print(f"[planning arc for campaign '{CAMPAIGN}'...]")
-        existing_arc = arc.load_arc(ROOT)
-        if existing_arc:
+        if arc.arc_path(ROOT).exists():         # back up even an unreadable arc.json
             bak = ROOT / "arc.json.bak"
             shutil.copy(arc.arc_path(ROOT), bak)
             print(f"[backed up existing arc to {bak}]")
