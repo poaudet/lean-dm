@@ -1,6 +1,6 @@
 services:
   dm:
-    build: .
+    image: ghcr.io/poaudet/lean-dm:latest
     container_name: lean-dm
     restart: unless-stopped
     ports:
