@@ -1,0 +1,266 @@
+diff --git a/arc.py b/arc.py
+--- a/arc.py
++++ b/arc.py
+@@ -26,6 +26,20 @@ DEADLINE_SLIP_RATIO = {
+     "hard": 0.0,
+ }
++
++# Counter-slips can never stretch a deadline past original * this factor.
++DEADLINE_MAX_STRETCH = {
++    "story": 2.0,
++    "standard": 1.5,
++    "hard": 1.0,
++}
++
++# In-game minutes a "delayed" effect pushes back the pressure's pending steps.
++DELAY_MINUTES = {
++    "story": 45,
++    "standard": 30,
++    "hard": 0,
++}
+ 
+ 
+ def arc_path(root):
+@@ -238,9 +252,17 @@ def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stalled_turns=0):
+                         "effect": s.get("effect", ""),
+                         "can_overt": can_overt,
+                     })
++        eff_dl = p.get("effective_deadline_minutes", p.get("deadline_minutes"))
++        if isinstance(eff_dl, (int, float)) and eff_dl > 0 and clock_minutes >= eff_dl:
++            due_moves.append({
++                "id": f"{pid}.deadline", "pressure_id": pid, "at_minutes": eff_dl, "deadline": True,
++                "effect": (f"Deadline reached: {p.get('antagonist', 'the antagonist')} succeeds, "
++                           f"or nearly does ({p.get('goal', '')})."),
++                "can_overt": True,
++            })
+ 
+-    # Sort due moves by at_minutes ascending (earliest scheduled first)
+-    due_moves.sort(key=lambda m: m["at_minutes"])
++    # Deadlines first, then earliest scheduled first
++    due_moves.sort(key=lambda m: (not m.get("deadline"), m["at_minutes"]))
+@@ -299,6 +321,52 @@ def calculate_deadline_slip(difficulty, current_minutes, deadline_minutes):
+     remaining = max(0, deadline_minutes - current_minutes)
+     return int(remaining * ratio)
++
++
++def _norm_diff(difficulty):
++    return difficulty if difficulty in ("story", "standard", "hard") else "standard"
++
++
++def apply_counter_slip(p, difficulty, current_minutes):
++    """Slip the effective deadline after a counter, capped at original * DEADLINE_MAX_STRETCH."""
++    diff = _norm_diff(difficulty)
++    orig = p.get("deadline_minutes", 0)
++    cur = p.get("effective_deadline_minutes", orig)
++    slip = calculate_deadline_slip(diff, current_minutes, cur)
++    cap = max(cur, int(orig * DEADLINE_MAX_STRETCH.get(diff, 1.5)))
++    p["effective_deadline_minutes"] = min(cur + slip, cap)
++
++
++def apply_delay(p, difficulty):
++    """Push the pressure's pending steps later (no-op on hard)."""
++    delay = DELAY_MINUTES.get(_norm_diff(difficulty), 30)
++    if not delay:
++        return
++    for s in p.get("steps", []):
++        if s.get("status") == "pending":
++            s["at_minutes"] = int(s.get("at_minutes", 0)) + delay
++
++
++def apply_played_moves(arc, played_moves, turn):
++    """Apply the moves the brief played this turn to runtime state.
++
++    Marks played steps done, expires a pressure whose deadline move was played, and records
++    last_overt_turn. Returns (played {id: how}, touched pressure ids).
++    """
++    rt = arc.setdefault("runtime", {})
++    played = {}
++    for m in played_moves or []:
++        if isinstance(m, dict) and m.get("id"):
++            played[str(m["id"])] = str(m.get("how", "subtle"))
++    touched = set()
++    for p in arc.get("pressures", []):
++        pid = p.get("id")
++        for s in p.get("steps", []):
++            if s.get("id") in played and s.get("status") == "pending":
++                s["status"] = "done"
++                touched.add(pid)
++        if f"{pid}.deadline" in played:
++            p["status"] = "expired"
++            touched.add(pid)
++    if "overt" in played.values():
++        rt["last_overt_turn"] = int(turn)
++    return played, touched
+@@ -428,8 +496,12 @@ def _clamp_elapsed(value, default=5, lo=1, hi=120):
+-def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
+-    """Execute record pass over the newest turn, updating clock, beats, pressures."""
++def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None, intent="act"):
++    """Execute record pass over the newest turn, updating clock, beats, pressures.
++
++    played_moves / intent come from the analyst brief (empty / "act" when it is off).
++    """
+     arc = load_arc(root)
+     if not arc:
+         return
+ 
+     # Snapshot BEFORE updating (I4)
+     snapshot_arc(root, msg_idx)
+ 
++    if intent == "ask":
++        # A question costs no in-game time (analyst rule): nothing to evaluate.
++        append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
++                             "pressures": [], "act_complete": False,
++                             "words": len(dm_reply.split())})
++        return
++
+     model = cfg.scribe_model or cfg.model
+@@ -470,6 +542,15 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
+         if b.get("id") in beats_done and b.get("status") == "pending":
+             b["status"] = "done"
+ 
++    # Moves the brief played this turn + stall counter (runtime state; arc_snap restores it on undo)
++    turn = (int(msg_idx) - 1) // 2 + 1
++    played, touched = apply_played_moves(arc, played_moves, turn)
++    rt = arc.setdefault("runtime", {})
++    if beats_done or played:
++        rt["stalled_turns"] = 0
++    elif intent in ("act", "steer"):
++        rt["stalled_turns"] = int(rt.get("stalled_turns", 0)) + 1
++
+     # Update pressures & deadline bending (D-09)
+     diff = cfg.difficulty
+@@ -485,17 +566,18 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn):
+             if effect == "countered":
+-                cur_min = arc["clock"]["minutes"]
+-                cur_dl = p.get("effective_deadline_minutes", p.get("deadline_minutes", 0))
+-                slip = calculate_deadline_slip(diff, cur_min, cur_dl)
+-                p["effective_deadline_minutes"] = cur_dl + slip
++                apply_counter_slip(p, diff, arc["clock"]["minutes"])
++            elif effect == "delayed":
++                apply_delay(p, diff)
+             elif effect == "advanced":
+-                # Advance first pending step
+-                for s in p.get("steps", []):
+-                    if s.get("status") == "pending":
+-                        s["status"] = "done"
+-                        break
++                # A step played this turn already is the advance; don't skip a second one.
++                if pid not in touched:
++                    for s in p.get("steps", []):
++                        if s.get("status") == "pending":
++                            s["status"] = "done"
++                            break
+             elif effect == "cancelled":
+                 p["status"] = "cancelled"
+diff --git a/tests/test_s2_arc_scheduling.py b/tests/test_s2_arc_scheduling.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_s2_arc_scheduling.py
+@@ -0,0 +1,104 @@
++"""Sprint 2 / 10 - runtime scheduling state, played moves, deadlines, delays, ask turns."""
++import copy
++import json
++
++import arc
++
++BASE = {
++    "version": 1, "revision": 0, "central_question": "Q?", "act": 1,
++    "clock": {"minutes": 100},
++    "acts": [{"n": 1, "status": "active", "goal": "g",
++              "beats": [{"id": "a1b1", "text": "x", "status": "pending"}], "outcomes": []}],
++    "pressures": [{
++        "id": "p1", "antagonist": "Cult", "goal": "Kill the witness", "status": "active",
++        "steps": [
++            {"id": "p1.s1", "at_minutes": 60, "effect": "Scout seen", "status": "pending"},
++            {"id": "p1.s2", "at_minutes": 90, "effect": "Poisoner arrives", "status": "pending"},
++            {"id": "p1.s3", "at_minutes": 150, "effect": "Strike", "status": "pending"},
++        ],
++        "deadline_minutes": 300, "effective_deadline_minutes": 300,
++    }],
++}
++
++
++def _rec(**kw):
++    base = {"elapsed_minutes": 5, "beats_done": [], "pressures": [], "act_complete": False}
++    base.update(kw)
++    return json.dumps(base)
++
++
++def _statuses(root):
++    return [s["status"] for s in arc.load_arc(root)["pressures"][0]["steps"]]
++
++
++def test_overt_cooldown_respected_by_allowed_moves():
++    moves = arc.allowed_moves(BASE, "standard", turn=2, last_overt_turn=1)   # cooldown 2
++    assert [m["how"] for m in moves] == ["subtle", "subtle"]
++    assert arc.allowed_moves(BASE, "standard", turn=3, last_overt_turn=1)[0]["how"] == "overt"
++
++
++def test_apply_played_moves_marks_done_and_sets_last_overt():
++    a = copy.deepcopy(BASE)
++    played, touched = arc.apply_played_moves(a, [{"id": "p1.s1", "how": "overt"}], 4)
++    assert a["pressures"][0]["steps"][0]["status"] == "done"
++    assert a["runtime"]["last_overt_turn"] == 4
++    assert touched == {"p1"}
++    b = copy.deepcopy(BASE)
++    arc.apply_played_moves(b, [{"id": "p1.s1", "how": "subtle"}], 4)
++    assert "last_overt_turn" not in b["runtime"]
++
++
++def test_deadline_move_is_first_overt_then_pressure_expires():
++    a = copy.deepcopy(BASE)
++    a["clock"]["minutes"] = 300
++    moves = arc.allowed_moves(a, "standard", turn=1)
++    assert moves[0]["id"] == "p1.deadline" and moves[0]["how"] == "overt"
++    arc.apply_played_moves(a, [moves[0]], 1)
++    assert a["pressures"][0]["status"] == "expired"
++    assert arc.allowed_moves(a, "standard", turn=2) == []
++
++
++def test_counter_slip_is_capped():
++    for diff, cap in (("story", 600), ("standard", 450), ("hard", 300)):
++        p = {"deadline_minutes": 300, "effective_deadline_minutes": 300}
++        for _ in range(10):
++            arc.apply_counter_slip(p, diff, 100)
++        assert p["effective_deadline_minutes"] == cap
++
++
++def test_delayed_effect_pushes_pending_steps(monkeypatch, tmp_path):
++    monkeypatch.setattr(arc.cfg, "_vals", {**arc.cfg._vals, "difficulty": "standard"})
++    arc.save_arc(tmp_path, copy.deepcopy(BASE))
++    rec = _rec(pressures=[{"id": "p1", "effect": "delayed"}])
++    arc.run_record_pass(tmp_path, "x", "y", 1, lambda m, **k: rec)
++    steps = arc.load_arc(tmp_path)["pressures"][0]["steps"]
++    assert [s["at_minutes"] for s in steps] == [90, 120, 180]
++
++
++def test_played_step_not_double_advanced(tmp_path):
++    arc.save_arc(tmp_path, copy.deepcopy(BASE))
++    rec = _rec(pressures=[{"id": "p1", "effect": "advanced"}])
++    arc.run_record_pass(tmp_path, "x", "y", 1, lambda m, **k: rec,
++                        played_moves=[{"id": "p1.s2", "how": "subtle"}])
++    assert _statuses(tmp_path) == ["pending", "done", "pending"]   # s2 was the advance
++
++
++def test_ask_turn_costs_no_time_and_skips_recorder(tmp_path):
++    arc.save_arc(tmp_path, copy.deepcopy(BASE))
++    called = []
++
++    def boom(messages, **kw):
++        called.append(1)
++        return _rec()
++
++    arc.run_record_pass(tmp_path, "what is his name?", "Bob.", 1, boom, intent="ask")
++    assert called == []
++    assert arc.load_arc(tmp_path)["clock"]["minutes"] == 100
++    assert arc.load_records(tmp_path)[0]["elapsed_minutes"] == 0
++
++
++def test_stalled_turns_count_and_reset(tmp_path):
++    arc.save_arc(tmp_path, copy.deepcopy(BASE))
++    for i in range(3):
++        arc.run_record_pass(tmp_path, "x", "y", 1 + 2 * i, lambda m, **k: _rec())
++    assert arc.load_arc(tmp_path)["runtime"]["stalled_turns"] == 3
++    arc.run_record_pass(tmp_path, "x", "y", 7, lambda m, **k: _rec(),
++                        played_moves=[{"id": "rescue_opening", "how": "subtle"}])
++    assert arc.load_arc(tmp_path)["runtime"]["stalled_turns"] == 0 
