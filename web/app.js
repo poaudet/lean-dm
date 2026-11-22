@@ -79,8 +79,10 @@ function renderLog(s) {
     return;
   }
   const folded = s.folded || 0;
+  const historyStart = s.history_start || 0;
   s.history.forEach((m, idx) => {
-    if (folded > 0 && idx === folded) {
+    const absoluteIdx = historyStart + idx;
+    if (folded > 0 && absoluteIdx === folded) {
       const div = document.createElement('div');
       div.className = 'fold-marker';
       div.textContent = 'folded above into chapters';
@@ -121,6 +123,7 @@ function renderSide() {
   if (!state) return;
   const f = $('side-content');
   if (!f) return;
+  if (document.activeElement && f.contains(document.activeElement)) return;
 
   if (currentTab === 'prem') {
     f.innerHTML = `
@@ -530,5 +533,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   setTab('led');
   refresh();
-  setInterval(() => { if (!busy) refresh(false); }, 5000);
+  setInterval(() => {
+    if (!busy && state && state.job && state.job.running) refresh(false);
+  }, 5000);
 });

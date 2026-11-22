@@ -148,3 +148,11 @@ Alternatives considered: Kill the container from inside (loses shell access and 
 Decision: `0` is the canonical "off/disabled" value for numeric settings. The config UI renders stored `0` values and submits `0` for cleared numeric fields whose default is `0`; empty input is never persisted for such fields. Backend validation continues to reject non-numeric values.
 
 Alternatives considered: Treat empty as "unset/default" (ambiguous with 0-as-off); store booleans for on/off instead of numeric thresholds.
+
+---
+
+## D-18  Arc runtime and outcome records
+
+Decision: Runtime scheduling state (`last_overt_turn`, `stalled_turns`), delivered plot move completion, deadline bending, and delayed/advanced/cancelled pressure effects are persisted in `arc.json`. Act outcomes are factual summaries of played exchanges and record-pass data, never the planner's planned beat text.
+
+Alternatives considered: Keep scheduling state only in memory; replay the same due moves until manually retired; use planned beat text as if it were resolved play.

@@ -23,8 +23,9 @@ def test_pinned_env_var_beats_env_file(monkeypatch, tmp_path):
     assert c.port == 7860
 
 
-def test_compose_pins_container_port_and_has_no_env_mount():
+def test_compose_uses_host_mapping_and_has_no_stale_container_port():
     text = COMPOSE.read_text(encoding="utf-8")
-    assert "DM_PORT=7860" in text
+    assert "${DM_PORT:-7860}:7860" in text
+    assert "DM_PORT=7860" not in text
     assert ":/app/.env" not in text
     assert "SUMMARY_EVERY" not in text and "FACTS_CAP" not in text

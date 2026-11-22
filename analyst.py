@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 import concurrent.futures
+import copy
 from config import cfg
 
 BRIEF_SCHEMA = {
@@ -55,7 +56,7 @@ def clamp_brief(d, allowed_move_ids=None):
     """
     if not isinstance(d, dict):
         d = {}
-    out = dict(BRIEF_SCHEMA)
+    out = copy.deepcopy(BRIEF_SCHEMA)
 
     # intent
     intent = str(d.get("intent", "")).strip().lower()
@@ -118,7 +119,7 @@ def clamp_brief(d, allowed_move_ids=None):
         push_val = float(push)
         push_val = max(0.0, min(1.0, push_val))
     except (TypeError, ValueError):
-        push_val = (cfg.style_push / 100.0) if cfg.style_push else 0.6
+        push_val = (cfg.style_push / 100.0) if cfg.style_push is not None else 0.6
 
     end = str(narr.get("end", "")).strip().lower()
     if end not in VALID_ENDS:
@@ -136,13 +137,13 @@ def clamp_brief(d, allowed_move_ids=None):
 
 
 def make_fallback_brief(reason="fallback"):
-    brief = dict(BRIEF_SCHEMA)
+    brief = copy.deepcopy(BRIEF_SCHEMA)
     brief["narration"] = {
         "words": cfg.style_words_max if cfg.style_words_max > 0 else 140,
-        "push": round((cfg.style_push / 100.0) if cfg.style_push else 0.6, 2),
+        "push": round((cfg.style_push / 100.0) if cfg.style_push is not None else 0.6, 2),
         "end": "decision",
     }
-    brief["assessment"] = f"Action proceeds ({reason})."
+    brief["assessment"] = "Action proceeds."
     return brief
 
 

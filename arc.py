@@ -648,8 +648,27 @@ def transition_act(root, act_n, chat_fn, msg_idx=None):
 
     # Extract 3-6 factual outcomes from records or scribe
     records = load_records(root)
-    all_beats = [b.get("text", b.get("id")) for b in active_act.get("beats", []) if b.get("status") == "done"]
-    outcomes = all_beats[:6] if all_beats else ["Act objectives resolved."]
+    done_beats = [b.get("text", b.get("id")) for b in active_act.get("beats", []) if b.get("status") == "done"]
+    recent_records = records[-12:]
+    outcomes = done_beats[:6]
+    if not outcomes:
+        outcomes = ["Act objectives resolved."]
+    try:
+        model = cfg.scribe_model or cfg.model
+        raw = chat_fn([
+            {"role": "system", "content": "Summarize factual play outcomes for the resolved act. Return only a JSON array of 3-6 short strings."},
+            {"role": "user", "content":
+                f"ACT {act_n} GOAL:\n{active_act.get('goal', '')}\n\n"
+                f"ACT RECORDS:\n{json.dumps(recent_records, ensure_ascii=False)}\n\n"
+                f"DONE BEATS:\n{json.dumps(done_beats, ensure_ascii=False)}"},
+        ], model=model, track=False, retries=1, fallback=True)
+        parsed = json.loads(raw[raw.index("["):raw.rindex("]") + 1])
+        if isinstance(parsed, list):
+            factual = [str(x).strip()[:300] for x in parsed if str(x).strip()]
+            if factual:
+                outcomes = factual[:6]
+    except Exception:
+        pass
     active_act["outcomes"] = outcomes
 
     next_n = act_n + 1
@@ -680,6 +699,9 @@ def transition_act(root, act_n, chat_fn, msg_idx=None):
                     next_act["beats"] = beats
             except Exception:
                 next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications", "status": "pending"}]
+    else:
+        arc["terminal"] = True
+        arc["central_question_resolved"] = True
 
     arc["revision"] = arc.get("revision", 0) + 1
     save_arc(root, arc)

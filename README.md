@@ -35,7 +35,7 @@ lean-dm/
 │   ├── config.html
 │   ├── app.js
 │   └── style.css
-├── decisions.md              # Architecture decision records (D-01 through D-15)
+├── decisions.md              # Architecture decision records (D-01 through D-18)
 ├── Dockerfile                # Container definition
 ├── docker-compose.yaml
 └── campaigns/
@@ -143,7 +143,7 @@ python dm.py --show-context
 - `GET /api/notes`: Returns OOC notes list.
 - `POST /api/notes/<id>/canon`: Promotes an OOC note or proposal to canon.
 - `GET /api/export/transcript`: Downloads campaign transcript as Markdown.
-- `GET /api/export/campaign.zip`: Downloads campaign archive zip (secrets excluded).
+- `GET /api/export/campaign.zip`: Downloads campaign archive zip (arc internals excluded by default; add `?include_arc=1` to include them).
 - `GET /api/campaigns` & `POST /api/campaigns`: List, create, or duplicate campaigns.
 
 ---

@@ -31,6 +31,8 @@ Dependencies: pip install flask requests
 
 import json, os, sys, pathlib, threading, time, html, re, shutil, hmac, zipfile, io
 import requests
+from collections import defaultdict, deque
+from time import monotonic
 from urllib.parse import urlsplit
 from flask import Flask, request, jsonify, Response, send_from_directory
 from config import cfg, SETTINGS_PATH
@@ -56,6 +58,7 @@ JOB_LOCK = threading.Lock()
 MAINT_THREAD = None
 JOB = {"name": "", "running": False, "msg": ""}
 LAST = {"est": 0, "prompt_tokens": None, "cached": None}
+POST_COUNTS = defaultdict(lambda: deque())
 
 KINDS = ("player", "person", "place", "item", "promise", "clock", "rule", "thread")
 RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
@@ -308,7 +311,7 @@ def build_context(history, brief=None):
                 style_parts.append(f"Target length: at most {cfg.style_words_max} words per reply.")
             else:
                 style_parts.append(f"Target length: at least {cfg.style_words_min} words per reply.")
-        if cfg.style_push:
+        if cfg.style_push >= 0:
             style_parts.append(f"Style push: {cfg.style_push}/100.")
         if cfg.style_notes and cfg.style_notes.strip():
             style_parts.append("Style notes:\n" + cfg.style_notes.strip())
@@ -327,8 +330,7 @@ def build_context(history, brief=None):
     if canon and msgs and msgs[-1]["role"] == "user":   # volatile part goes LAST to keep the prefix cacheable
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
-                    "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon +
-                    "\n--- end of ledger: now narrate the outcome of the player's action above."}
+                    "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon}
     if cfg.style_guard and msgs and msgs[-1]["role"] == "user":
         guard = compute_style_guard(history)
         if guard:
@@ -338,6 +340,9 @@ def build_context(history, brief=None):
         brief_text = json.dumps(brief, ensure_ascii=False, indent=1)
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nDIRECTOR'S BRIEF (never mention it to the player):\n" + brief_text}
+    if canon and msgs and msgs[-1]["role"] == "user":
+        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                    "\n\n--- end of ledger: now narrate the outcome of the player's action above."}
     return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
 
 def ctx_label():
@@ -870,6 +875,7 @@ def game_state():
         "configured": bool(cfg.api_key and cfg.model),
         "turns": sum(1 for m in history if m["role"] == "user"),
         "history": history[-60:],
+        "history_start": max(0, len(history) - 60),
         "premise": read(PREMISE),
         "summary": read(SUMMARY),
         "ledger": load_ledger(),
@@ -938,6 +944,18 @@ def guard_admin():
         msg = ("Global settings and restart are disabled while the server is reachable without a "
                "web_password. Set one (DM_WEB_PASSWORD or settings.json) or bind to 127.0.0.1.")
         return jsonify({"ok": False, "error": msg, "errors": {}}), 403
+
+@app.before_request
+def throttle_mutating_posts():
+    if request.method != "POST":
+        return None
+    now = monotonic()
+    window = POST_COUNTS[request.remote_addr]
+    while window and now - window[0] > 10:
+        window.popleft()
+    window.append(now)
+    if len(window) > 20:
+        return jsonify({"ok": False, "error": "too many requests"}), 429
 
 @app.route("/")
 def index():
@@ -1107,8 +1125,13 @@ def api_premise():
 def api_ledger_action():
     body = request.get_json(silent=True) or {}
     action = body.get("action")
+    if action not in ("pin", "delete", "upsert"):
+        return jsonify({"ok": False, "error": "unknown action"}), 400
     if LEDGER.exists():
         shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
+        backups = sorted(ROOT.glob("ledger.*.bak.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[10:]:
+            old.unlink(missing_ok=True)
     ledger = load_ledger(strict=True)
     if action == "pin":
         entry_id = body.get("id")
@@ -1141,12 +1164,16 @@ def api_export_transcript():
 @app.route("/api/export/campaign.zip", methods=["GET"])
 def api_export_zip():
     buf = io.BytesIO()
+    include_arc = request.args.get("include_arc") == "1"
+    arc_names = {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl", "arc_snap"}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in ROOT.rglob("*"):
             if f.is_file():
                 if f.name in ("settings.json", "campaign.json"):
                     continue
                 rel = f.relative_to(ROOT)
+                if not include_arc and (rel.name in arc_names or "arc_snap" in rel.parts):
+                    continue
                 zf.write(f, arcname=str(rel))
     buf.seek(0)
     return Response(buf.getvalue(), mimetype="application/zip",
@@ -1220,6 +1247,8 @@ def api_notes_canon(note_id):
     note = next((n for n in notes if n.get("id") == note_id), None)
     if not note:
         return jsonify({"error": "note not found"}), 404
+    if note.get("canon"):
+        return jsonify({"ok": True})
     if note.get("proposal") and isinstance(note["proposal"], dict):
         ledger = load_ledger(strict=True)
         ledger = apply_ledger_ops(ledger, {"upsert": [note["proposal"]]})
@@ -1361,6 +1390,10 @@ if __name__ == "__main__":
         if not (cfg.api_key and cfg.model):
             print("[not configured yet — open /config to set the model and API key]")
         print(f"web UI → http://{'localhost' if cfg.host == '127.0.0.1' else cfg.host}:{cfg.port}\n")
-        app.run(host=cfg.host, port=cfg.port, debug=False)
+        if os.environ.get("DM_USE_WAITERSS", "").strip() == "1":
+            from waitress import serve
+            serve(app, host=cfg.host, port=cfg.port, threads=1)
+        else:
+            app.run(host=cfg.host, port=cfg.port, debug=False)
     else:
         cli()
