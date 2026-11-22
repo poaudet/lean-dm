@@ -13,5 +13,6 @@ services:
       - SCRIBE_MODEL=${SCRIBE_MODEL:-}
       - HISTORY_TURNS=${HISTORY_TURNS:-8}
       - CAMPAIGN=${CAMPAIGN:-default}
+      - DM_TRUST_PROXY=${DM_TRUST_PROXY:-}
     volumes:
       - ./campaigns:/app/campaigns    # source of truth stays on the host

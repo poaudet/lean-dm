@@ -102,11 +102,14 @@ Arc recording runs synchronously to keep undo and retry ordered. The unused
 
 ## CLI Usage & Commands
 
-The web server refuses to start on a non-loopback address unless `web_password` is
-configured. For local-only use, set `host` to `127.0.0.1`; for Docker or other
-network access, configure `DM_WEB_PASSWORD` before starting the container.
+The web server defaults to `127.0.0.1` (the Docker image sets `DM_HOST=0.0.0.0`) and
+refuses to start on a non-loopback address unless `web_password` is configured.
+`DM_WEB_PASSWORD` and `DM_HOST` are runtime overrides: they win over `settings.json`
+on every start and are never written to it. Other `DM_*` variables only seed the first run.
 When using the Compose bind mount, ensure the host `campaigns/` directory is
-writable by the image's non-root `dm` user.
+writable by the image's non-root `dm` user (uid 1000), or set `user:` in the compose file.
+Behind a TLS-terminating reverse proxy set `DM_TRUST_PROXY=1` so the scheme, host and client
+address come from the `X-Forwarded-*` headers (trust only a proxy you control).
 After ten failed authentication attempts, further attempts from that address
 are temporarily throttled; the healthcheck remains available.
 

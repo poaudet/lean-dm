@@ -407,6 +407,7 @@ function send() {
 
   abortCtrl = new AbortController();
   let fullText = '';
+  let oocTurn = false;     // OOC answers are not in history; keep them on screen
   let committed = false;   // set once the server reports the exchange is saved
   let stageEl = document.createElement('span');
   stageEl.style.fontSize = '0.85em';
@@ -434,7 +435,7 @@ function send() {
     function readChunk() {
       reader.read().then(({ done, value }) => {
         if (done) {
-          finishTurn();
+          finishTurn(oocTurn);
           return;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -444,7 +445,7 @@ function send() {
           if (!part.startsWith('data: ')) continue;
           const dataStr = part.slice(6).trim();
           if (dataStr === '[DONE]') {
-            finishTurn();
+            finishTurn(oocTurn);
             return;
           }
           try {
@@ -455,7 +456,15 @@ function send() {
                 committed = true;                       // exchange is already on disk
                 $('btn-stop').style.display = 'none';   // stopping now cannot undo it
               }
+            } else if (data.error) {
+              u.remove();
+              w.textContent = '[error: ' + data.error + (committed ? '' : ' — nothing saved; move restored]');
+              if (!committed) i.value = t;
+              cleanup();
+              if (committed) refresh();
+              return;
             } else if (data.chunk) {
+              if (data.ooc) oocTurn = true;
               if (stageEl.parentNode) stageEl.remove();
               fullText += data.chunk;
               w.innerHTML = md(fullText);
@@ -492,9 +501,9 @@ function send() {
   });
 }
 
-function finishTurn() {
+function finishTurn(keepLog) {
   cleanup();
-  refresh();
+  refresh(!keepLog);
 }
 
 function cleanup() {
@@ -588,7 +597,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const inp = $('in');
   if (inp) {
     inp.addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
         send();
       } else if (e.key === 'ArrowUp' && inp.value === '' && lastSent) {
