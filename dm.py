@@ -50,33 +50,16 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 import analyst
 import arc
+from campaign import Campaign
 from config import SETTINGS_PATH, cfg
 from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
+from style_guard import compute_style_guard
 
 # ---------------- paths ----------------
 
 CAMPAIGN = cfg.campaign
 if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
-
-class Campaign:
-    """Campaign-owned filesystem paths and synchronization primitives."""
-    def __init__(self, campaigns_dir, name):
-        self.name = name
-        self.campaigns_dir = pathlib.Path(campaigns_dir)
-        self.root = self.campaigns_dir / name
-        self.history = self.root / "history.jsonl"
-        self.undone = self.root / "undone.jsonl"
-        self.premise = self.root / "premise.md"
-        self.summary = self.root / "summary.md"
-        self.ledger = self.root / "ledger.json"
-        self.audit = self.root / "audit.md"
-        self.state = self.root / "state.json"
-        self.turn_lock = threading.Lock()
-        self.maintenance_lock = threading.Lock()
-        self.state_lock = threading.Lock()
-        self.job_lock = threading.Lock()
-
 
 def bind_campaign(campaigns_dir=None, name=None):
     """Set the active campaign and refresh compatibility aliases used by commands/tests."""
@@ -301,33 +284,6 @@ def merge_same_role(msgs):
         else:
             out.append(m)
     return out
-
-def compute_style_guard(history):
-    dm_msgs = [m["content"] for m in history if m.get("role") == "assistant"]
-    if not dm_msgs:
-        return []
-    openers = []
-    for msg in dm_msgs[-8:]:
-        words = msg.strip().split()
-        if words:
-            opener = " ".join(words[:5])
-            if opener and opener not in openers:
-                openers.append(opener)
-    from collections import Counter
-    counts = Counter()
-    for msg in dm_msgs[-12:]:
-        words = re.findall(r"\b[A-Za-z0-9'-]+\b", msg.lower())
-        for i in range(len(words) - 2):
-            counts[f"{words[i]} {words[i+1]} {words[i+2]}"] += 1
-    trigrams = [tri for tri, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])) if cnt >= 3]
-    combined = []
-    for op in openers:
-        if op not in combined:
-            combined.append(op)
-    for tri in trigrams:
-        if tri not in combined:
-            combined.append(tri)
-    return combined[:8]
 
 def build_context(history, brief=None):
     """history must end with the pending player action."""

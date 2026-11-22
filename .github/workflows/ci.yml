@@ -39,7 +39,7 @@ jobs:
 
       - name: Run Ruff
         run: |
-          ruff check dm.py analyst.py arc.py config.py storage.py
+          ruff check dm.py analyst.py arc.py campaign.py config.py storage.py style_guard.py
 
   docker-build:
     name: Verify Docker Build

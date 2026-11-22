@@ -25,7 +25,9 @@ lean-dm/
 ├── config.py                 # Configuration schema, coercion & dual-scope persistence
 ├── analyst.py                # Pre-turn director's brief & OOC notes routing
 ├── arc.py                    # Hidden arc planning, difficulty scheduling & record pass
+├── campaign.py               # Campaign filesystem paths and locks
 ├── storage.py                # Atomic writes, JSONL append, and model JSON parsing
+├── style_guard.py            # Deterministic style repetition guard
 ├── styles/                   # Markdown writing style presets
 │   ├── subtle.md
 │   ├── pulp.md
