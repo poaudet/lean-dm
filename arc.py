@@ -7,14 +7,10 @@ Doctrine:
 - D-10: UI never shows arc or plot moves; only a non-spoiler chip ("Act 1 · active").
 - Pure scheduling function allowed_moves() is unit-tested without LLM calls.
 """
-import copy
 import json
-import os
-import pathlib
-import re
-import shutil
-import time
+
 from config import cfg
+from storage import append_jsonl, atomic_write, parse_json_response, replace_lines
 
 # Difficulty parameters
 # Min turns between overt moves
@@ -84,9 +80,7 @@ def arc_is_corrupt(root):
 
 def save_arc(root, arc):
     p = arc_path(root)
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(arc, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
+    atomic_write(p, json.dumps(arc, indent=2, ensure_ascii=False))
 
 
 def snapshot_arc(root, msg_idx):
@@ -94,7 +88,7 @@ def snapshot_arc(root, msg_idx):
     if not arc:
         return
     snap_p = arc_snap_dir(root) / f"{int(msg_idx)}.json"
-    snap_p.write_text(json.dumps(arc, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write(snap_p, json.dumps(arc, indent=2, ensure_ascii=False))
 
 
 def restore_arc_snapshot(root, msg_idx):
@@ -130,7 +124,7 @@ def restore_state(root, backup):
         if text is None:
             p.unlink(missing_ok=True)
         else:
-            p.write_text(text, encoding="utf-8")
+            atomic_write(p, text)
 
 
 def load_records(root):
@@ -150,9 +144,7 @@ def load_records(root):
 
 def append_record(root, record):
     p = records_path(root)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    append_jsonl(p, [record])
 
 
 def truncate_records(root, upto_msg_idx):
@@ -169,7 +161,7 @@ def truncate_records(root, upto_msg_idx):
                 kept.append(line)
         except Exception:
             pass
-    p.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+    replace_lines(p, kept)
 
 
 def truncate_arc_log(root, upto_msg_idx):
@@ -186,7 +178,7 @@ def truncate_arc_log(root, upto_msg_idx):
                 kept.append(line)
         except Exception:
             pass
-    p.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+    replace_lines(p, kept)
 
 
 def append_arc_log(root, rev, at_msg, act, kind, diff, reason):
@@ -199,9 +191,7 @@ def append_arc_log(root, rev, at_msg, act, kind, diff, reason):
         "diff": diff,
         "reason": reason,
     }
-    line = json.dumps(entry, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    append_jsonl(p, [entry])
 
 
 def get_arc_chip(arc):
@@ -355,55 +345,6 @@ def apply_played_moves(arc, played_moves, turn):
 
 
 # ---------------------------------------------------------------------------
-# Planner Validation & Act Boundary
-# ---------------------------------------------------------------------------
-
-def validate_planner_revision(old_arc, new_arc):
-    """Validate planner output diff against invariants (A6).
-
-    Reject any change to done beats, recorded outcomes, or central_question
-    unless explicitly resolved.
-    """
-    if not isinstance(new_arc, dict):
-        return False, "Planner output is not a JSON object"
-
-    # Central question check
-    if old_arc.get("central_question") != new_arc.get("central_question"):
-        if not new_arc.get("central_question_resolved"):
-            return False, "central_question altered without central_question_resolved: true"
-
-    # Verify done beats in old acts were not altered or dropped
-    old_acts_by_n = {a["n"]: a for a in old_arc.get("acts", [])}
-    new_acts_by_n = {a["n"]: a for a in new_arc.get("acts", [])}
-
-    for n, old_act in old_acts_by_n.items():
-        if n not in new_acts_by_n:
-            return False, f"Act {n} was removed in new plan"
-        new_act = new_acts_by_n[n]
-
-        # Outcomes check: existing outcomes cannot be changed
-        old_outcomes = old_act.get("outcomes", [])
-        new_outcomes = new_act.get("outcomes", [])
-        if len(new_outcomes) < len(old_outcomes):
-            return False, f"Outcomes for Act {n} were deleted"
-        for i, o in enumerate(old_outcomes):
-            if new_outcomes[i] != o:
-                return False, f"Outcome {i} for Act {n} was modified"
-
-        # Done beats check: done beats must remain done and untouched
-        old_done_beats = {b["id"]: b for b in old_act.get("beats", []) if b.get("status") == "done"}
-        new_beats_by_id = {b["id"]: b for b in new_act.get("beats", [])}
-        for bid, ob in old_done_beats.items():
-            if bid not in new_beats_by_id:
-                return False, f"Done beat {bid} was deleted in Act {n}"
-            nb = new_beats_by_id[bid]
-            if nb.get("status") != "done":
-                return False, f"Done beat {bid} changed status to {nb.get('status')}"
-
-    return True, "Valid"
-
-
-# ---------------------------------------------------------------------------
 # Planning: Initial Arc & Act Planning Prompts
 # ---------------------------------------------------------------------------
 
@@ -464,9 +405,9 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
 
     raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
     # Parse tolerantly
-    start = raw.index("{")
-    end = raw.rindex("}") + 1
-    arc = json.loads(raw[start:end])
+    arc = parse_json_response(raw)
+    if not isinstance(arc, dict):
+        raise ValueError("planner response did not contain a JSON object")
     # Validate minimal fields
     if not arc.get("central_question") or not arc.get("acts"):
         raise ValueError("Invalid arc structure generated by planner")
@@ -490,7 +431,8 @@ RECORD_PROMPT = (
     '  "pressures": [\n'
     '    {"id": "<pressure_id>", "effect": "advanced|delayed|countered|cancelled|none"}\n'
     '  ],\n'
-    '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>\n'
+    '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>,\n'
+    '  "central_question_resolved": <bool: whether play resolved the campaign central question>\n'
     "}"
 )
 
@@ -504,7 +446,8 @@ def _clamp_elapsed(value, default=5, lo=1, hi=120):
     return max(lo, min(hi, n))
 
 
-def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None, intent="act"):
+def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
+                    intent="act", history=None, analyst_act_complete=False):
     """Execute record pass over the newest turn, updating clock, beats, pressures.
 
     played_moves / intent come from the analyst brief (empty / "act" when it is off).
@@ -529,6 +472,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     prompt = (
         f"CURRENT ARC STATUS:\n"
         f"Act {act_n}: {active_act.get('goal', '')}\n"
+        f"Central question: {arc.get('central_question', '')}\n"
         f"Pending beats: {json.dumps([b for b in active_act.get('beats', []) if b.get('status') == 'pending'], ensure_ascii=False)}\n"
         f"Active pressures: {json.dumps(arc.get('pressures', []), ensure_ascii=False)}\n\n"
         f"LATEST EXCHANGE:\n"
@@ -544,9 +488,9 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
 
     try:
         raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        res = json.loads(raw[start:end])
+        res = parse_json_response(raw)
+        if not isinstance(res, dict):
+            raise ValueError("record response did not contain a JSON object")
     except Exception:
         # Fallback record
         res = {
@@ -603,11 +547,14 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
             elif effect == "cancelled":
                 p["status"] = "cancelled"
 
-    act_complete = bool(res.get("act_complete", False))
+    act_complete = bool(res.get("act_complete", False) or analyst_act_complete)
+    central_question_resolved = bool(res.get("central_question_resolved", False))
     # Check if all beats in active act are done
     pending_beats = [b for b in active_act.get("beats", []) if b.get("status") == "pending"]
     if not pending_beats and active_act.get("beats"):
         act_complete = True
+    if act_n == 3 and not central_question_resolved:
+        act_complete = False
 
     words = len(dm_reply.split())
 
@@ -627,10 +574,12 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
 
     # If act complete, trigger act transition
     if act_complete and active_act.get("status") == "active":
-        transition_act(root, act_n, chat_fn, msg_idx=msg_idx)
+        transition_act(root, act_n, chat_fn, msg_idx=msg_idx,
+                       history=history, central_question_resolved=central_question_resolved)
 
 
-def transition_act(root, act_n, chat_fn, msg_idx=None):
+def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
+                   central_question_resolved=False):
     """Handle act boundary transition and revision logging.
 
     msg_idx is the history index of the turn that closed the act. arc_log entries are
@@ -645,11 +594,41 @@ def transition_act(root, act_n, chat_fn, msg_idx=None):
         return
 
     active_act["status"] = "resolved"
-
-    # Extract 3-6 factual outcomes from records or scribe
     records = load_records(root)
-    all_beats = [b.get("text", b.get("id")) for b in active_act.get("beats", []) if b.get("status") == "done"]
-    outcomes = all_beats[:6] if all_beats else ["Act objectives resolved."]
+    start_msg = max(0, int(active_act.get("started_msg", 0)))
+    act_records = [r for r in records if start_msg <= int(r.get("msg", -1)) <= int(msg_idx or 0)]
+    play = history or []
+    played_range = play[start_msg:(int(msg_idx) + 1 if msg_idx is not None else len(play))]
+    play_lines = [
+        f"[{i}] {'PLAYER' if message.get('role') == 'user' else 'DM'}: {message.get('content', '')}"
+        for i, message in enumerate(played_range, start=start_msg)
+    ]
+    if len(play_lines) > 30:
+        play_lines = play_lines[-30:]
+    outcomes = [
+        f"{record.get('elapsed_minutes', 0)} in-game minutes elapsed; "
+        f"beats completed: {', '.join(record.get('beats_done', [])) or 'none'}; "
+        f"pressure effects: {json.dumps(record.get('pressures', []), ensure_ascii=False)}"
+        for record in act_records[-12:]
+    ]
+    if not outcomes:
+        outcomes = ["The act objective was resolved in play; no detailed record was available."]
+    try:
+        model = cfg.scribe_model or cfg.model
+        raw = chat_fn([
+            {"role": "system", "content": "Summarize factual play outcomes for the resolved act. Return only a JSON array of 3-6 short strings."},
+            {"role": "user", "content":
+                f"ACT {act_n} GOAL:\n{active_act.get('goal', '')}\n\n"
+                f"ACT PLAY HISTORY:\n{chr(10).join(play_lines)}\n\n"
+                f"ACT RECORDS:\n{json.dumps(act_records, ensure_ascii=False)}"},
+        ], model=model, track=False, retries=1, fallback=True)
+        parsed = parse_json_response(raw)
+        if isinstance(parsed, list):
+            factual = [str(x).strip()[:300] for x in parsed if str(x).strip()]
+            if factual:
+                outcomes = factual[:6]
+    except Exception:
+        pass
     active_act["outcomes"] = outcomes
 
     next_n = act_n + 1
@@ -657,6 +636,7 @@ def transition_act(root, act_n, chat_fn, msg_idx=None):
     if next_act:
         arc["act"] = next_n
         next_act["status"] = "active"
+        next_act["started_msg"] = int(msg_idx) + 1 if msg_idx is not None else 0
 
         # Generate beats for next act if empty
         if not next_act.get("beats"):
@@ -673,13 +653,14 @@ def transition_act(root, act_n, chat_fn, msg_idx=None):
                     {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
                     {"role": "user", "content": prompt},
                 ], model=model, track=False, retries=1, fallback=True)
-                start = raw.index("[")
-                end = raw.rindex("]") + 1
-                beats = json.loads(raw[start:end])
+                beats = parse_json_response(raw)
                 if isinstance(beats, list) and beats:
                     next_act["beats"] = beats
             except Exception:
                 next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications", "status": "pending"}]
+    else:
+        arc["terminal"] = act_n == 3 and central_question_resolved
+        arc["central_question_resolved"] = central_question_resolved
 
     arc["revision"] = arc.get("revision", 0) + 1
     save_arc(root, arc)

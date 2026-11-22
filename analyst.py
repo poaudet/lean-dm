@@ -8,14 +8,15 @@ doctrine:
   as volatile additions in the last user message at build time (I3).
 - Notes routing handles OOC inquiries without polluting history.jsonl.
 """
+import concurrent.futures
+import copy
 import json
-import os
-import pathlib
 import re
 import time
 import uuid
-import concurrent.futures
+
 from config import cfg
+from storage import append_jsonl, parse_json_response, replace_lines
 
 BRIEF_SCHEMA = {
     "intent": "act",
@@ -32,30 +33,34 @@ VALID_INTENTS = ("act", "ask", "steer", "wait")
 VALID_OUTCOMES = ("clean", "partial", "complication", "setback")
 VALID_ENDS = ("decision", "question", "beat")
 VALID_HOWS = ("overt", "subtle", "offscreen")
-_HOW_RANK = {"overt": 2, "subtle": 1, "offscreen": 0}
+FALLBACK_REASONS = ("timeout", "invalid_response", "analyst_error")
+
+
+class _Brief(dict):
+    """Brief carrying diagnostics outside its narrator-visible dictionary fields."""
+
+    def __init__(self, *args, diagnostics=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diagnostics = diagnostics or {}
 
 
 def parse_json_tolerantly(raw):
     """Find and parse first balanced JSON object."""
     if not raw or not isinstance(raw, str):
         return None
-    try:
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        return json.loads(raw[start:end])
-    except (ValueError, json.JSONDecodeError):
-        return None
+    parsed = parse_json_response(raw)
+    return parsed if isinstance(parsed, dict) else None
 
 
 def clamp_brief(d, allowed_move_ids=None):
     """Clamp and validate raw dictionary to strict brief schema.
 
     allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
-    `how` may only be downgraded relative to the schedule, never upgraded.
+    scheduled `how` and `note` are authoritative.
     """
     if not isinstance(d, dict):
         d = {}
-    out = dict(BRIEF_SCHEMA)
+    out = copy.deepcopy(BRIEF_SCHEMA)
 
     # intent
     intent = str(d.get("intent", "")).strip().lower()
@@ -86,11 +91,12 @@ def clamp_brief(d, allowed_move_ids=None):
             how = str(m.get("how", "subtle")).strip().lower()
             if how not in VALID_HOWS:
                 how = "subtle"
-            if sched:
-                sched_how = str(sched.get("how", "subtle"))
-                if _HOW_RANK[how] > _HOW_RANK.get(sched_how, 1):
-                    how = sched_how
-            note = (str(m.get("note", "")).strip() or str((sched or {}).get("note", "")).strip())[:200]
+            if isinstance(sched, dict):
+                sched_how = str(sched.get("how", "subtle")).strip().lower()
+                how = sched_how if sched_how in VALID_HOWS else "subtle"
+                note = str(sched.get("note", "")).strip()[:200]
+            else:
+                note = str(m.get("note", "")).strip()[:200]
             seen.add(mid)
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
@@ -118,7 +124,7 @@ def clamp_brief(d, allowed_move_ids=None):
         push_val = float(push)
         push_val = max(0.0, min(1.0, push_val))
     except (TypeError, ValueError):
-        push_val = (cfg.style_push / 100.0) if cfg.style_push else 0.6
+        push_val = (cfg.style_push / 100.0) if cfg.style_push is not None else 0.6
 
     end = str(narr.get("end", "")).strip().lower()
     if end not in VALID_ENDS:
@@ -136,26 +142,32 @@ def clamp_brief(d, allowed_move_ids=None):
 
 
 def make_fallback_brief(reason="fallback"):
-    brief = dict(BRIEF_SCHEMA)
+    reason = reason if reason in FALLBACK_REASONS else "analyst_error"
+    brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
+                   diagnostics={"fallback_reason": reason})
     brief["narration"] = {
         "words": cfg.style_words_max if cfg.style_words_max > 0 else 140,
-        "push": round((cfg.style_push / 100.0) if cfg.style_push else 0.6, 2),
+        "push": round((cfg.style_push / 100.0) if cfg.style_push is not None else 0.6, 2),
         "end": "decision",
     }
-    brief["assessment"] = f"Action proceeds ({reason})."
+    brief["assessment"] = "Action proceeds."
     return brief
 
 
 def is_ooc_note(text):
     """Check whether a player input is an OOC note."""
     t = (text or "").strip().lower()
-    return t.startswith("//") or t.startswith("ooc:") or t.startswith("note to dm:")
+    return t.startswith("//") or t == "ooc" or t.startswith("ooc ") or t.startswith("ooc:") or t.startswith("note to dm:")
 
 
 def strip_ooc_prefix(text):
     t = (text or "").strip()
     if t.lower().startswith("//"):
         return t[2:].strip()
+    if t.lower() == "ooc":
+        return ""
+    if t.lower().startswith("ooc "):
+        return t[3:].strip()
     if t.lower().startswith("ooc:"):
         return t[4:].strip()
     if t.lower().startswith("note to dm:"):
@@ -207,9 +219,10 @@ def save_brief(root, msg_idx, source, model, ms, brief):
         "ms": int(ms),
         "brief": brief,
     }
-    line = json.dumps(entry, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    diagnostics = getattr(brief, "diagnostics", None)
+    if diagnostics:
+        entry["diagnostics"] = diagnostics
+    append_jsonl(p, [entry])
 
 
 def truncate_briefs(root, upto_index):
@@ -227,8 +240,7 @@ def truncate_briefs(root, upto_index):
                 kept.append(line)
         except (ValueError, TypeError):
             pass
-    data = "".join(l + "\n" for l in kept)
-    p.write_text(data, encoding="utf-8")
+    replace_lines(p, kept)
 
 
 def load_notes(root):
@@ -248,9 +260,7 @@ def load_notes(root):
 
 def save_note(root, note):
     p = notes_path(root)
-    line = json.dumps(note, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    append_jsonl(p, [note])
 
 
 def update_note_canon(root, note_id, is_canon=True):
@@ -265,8 +275,7 @@ def update_note_canon(root, note_id, is_canon=True):
             found = True
             break
     if found:
-        data = "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in notes)
-        p.write_text(data, encoding="utf-8")
+        replace_lines(p, [json.dumps(n, ensure_ascii=False) for n in notes])
     return found
 
 
@@ -335,8 +344,16 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         brief = clamp_brief(parsed, allowed_ids)
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
-    except Exception as e:
-        brief = make_fallback_brief(reason=(str(e) or type(e).__name__)[:50])
+    except concurrent.futures.TimeoutError:
+        brief = make_fallback_brief(reason="timeout")
+        ms = int((time.time() - t0) * 1000)
+        return brief, "fallback", model, ms
+    except ValueError:
+        brief = make_fallback_brief(reason="invalid_response")
+        ms = int((time.time() - t0) * 1000)
+        return brief, "fallback", model, ms
+    except Exception:
+        brief = make_fallback_brief(reason="analyst_error")
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     finally:

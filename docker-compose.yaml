@@ -6,10 +6,10 @@ services:
     ports:
       - "${DM_PORT:-7860}:7860"
     environment:
-      - DM_PORT=7860  # container always listens on 7860; the DM_PORT in .env only picks the host port
       - DM_BASE_URL=${DM_BASE_URL:-}
       - DM_API_KEY=${DM_API_KEY:-}
       - DM_MODEL=${DM_MODEL:-}
+      - DM_WEB_PASSWORD=${DM_WEB_PASSWORD:-}
       - SCRIBE_MODEL=${SCRIBE_MODEL:-}
       - HISTORY_TURNS=${HISTORY_TURNS:-8}
       - CAMPAIGN=${CAMPAIGN:-default}

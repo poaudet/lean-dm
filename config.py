@@ -4,7 +4,16 @@ campaigns/settings.json (override with DM_SETTINGS) is the single source of trut
 or on the web UI's /config page. Values apply live, except fields marked "restart".
 On the very first run, DM_* env vars / a legacy .env are imported once; after that .env is ignored.
 """
-import json, os, pathlib, re, threading
+import json
+import logging
+import os
+import pathlib
+import re
+import threading
+
+from storage import atomic_write
+
+logger = logging.getLogger(__name__)
 
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")
@@ -75,14 +84,13 @@ FIELDS = [
     F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", scope="global", min=10),
     F("analyst_timeout_sec", "Analyst timeout (s)", "int", 25, "Reliability", "Timeout for analyst call in seconds.", scope="global", min=1),
     F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
-    F("record_wait_sec", "Record wait (s)", "int", 3, "Reliability", "Max seconds analyst waits for record pass.", scope="global", min=0),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
-    F("host", "Web host", "str", "0.0.0.0", "App", "Use 0.0.0.0 in Docker, and put auth in front of it.", scope="global", restart=True),
+    F("host", "Web host", "str", "0.0.0.0", "App", "Non-loopback binds require a web password.", scope="global", restart=True),
     F("port", "Web port", "int", 7860, "App", "", scope="global", restart=True, min=1, max=65535),
     F("campaign", "Default campaign", "str", "default", "App", "Folder under campaigns/. Switching needs a restart.", scope="global", restart=True),
-    F("web_password", "Web password", "secret", "", "App", "Optional password for HTTP Basic auth. Empty = no auth.", scope="global"),
+    F("web_password", "Web password", "secret", "", "App", "Required when binding beyond loopback.", scope="global"),
 ]
 
 ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "model", "SCRIBE_MODEL": "scribe_model",
@@ -128,7 +136,8 @@ class Config:
                                 except ValueError:
                                     pass
                 except (ValueError, OSError) as e:
-                    print(f"[config] {self._campaign_path} unreadable ({e}); ignoring campaign overrides")
+                    logger.warning("%s unreadable; ignoring campaign overrides: %s",
+                                   self._campaign_path, e)
 
     @staticmethod
     def _coerce(f, v):
@@ -172,7 +181,8 @@ class Config:
             try:
                 data = json.loads(self._path.read_text(encoding="utf-8"))
             except (ValueError, OSError) as e:
-                print(f"[config] {self._path} unreadable ({e}); using defaults, file left untouched")
+                logger.warning("%s unreadable; using defaults, file left untouched: %s",
+                               self._path, e)
                 return
             if isinstance(data, dict):
                 for k, v in data.items():
@@ -180,11 +190,12 @@ class Config:
                         try:
                             self._vals[k] = self._coerce(self._by[k], v)
                         except ValueError:
-                            print(f"[config] ignoring invalid value for {k}")
+                            logger.warning("Ignoring invalid value for %s", k)
             return
         n = self._seed_from_env()
         self.save()
-        print(f"[config] created {self._path}" + (f" (imported {n} values from env/.env)" if n else ""))
+        logger.info("Created %s%s", self._path,
+                    f" (imported {n} values from env/.env)" if n else "")
 
     def _seed_from_env(self):
         src = {}
@@ -209,22 +220,14 @@ class Config:
     def save(self):
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            tmp.write_text(json.dumps(self._vals, indent=2, ensure_ascii=False), encoding="utf-8")
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            tmp.replace(self._path)
+            atomic_write(self._path, json.dumps(self._vals, indent=2, ensure_ascii=False), mode=0o600)
 
     def save_campaign(self):
         with self._lock:
             if not self._campaign_path:
                 return
             self._campaign_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._campaign_path.with_name(self._campaign_path.name + ".tmp")
-            tmp.write_text(json.dumps(self._campaign_vals, indent=2, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(self._campaign_path)
+            atomic_write(self._campaign_path, json.dumps(self._campaign_vals, indent=2, ensure_ascii=False))
 
     def update(self, changes, scope="global"):
         """All-or-nothing. Returns {} on success, else {key: error}."""
@@ -262,7 +265,7 @@ class Config:
             if scope == "campaign":
                 self._campaign_vals = {}
                 if self._campaign_path and self._campaign_path.exists():
-                    self._campaign_path.write_text("{}", encoding="utf-8")
+                    atomic_write(self._campaign_path, "{}")
                 return
             key = self._vals["api_key"]
             self._vals = {f["key"]: f["default"] for f in FIELDS}

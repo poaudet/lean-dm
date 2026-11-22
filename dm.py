@@ -29,13 +29,40 @@ Everything before the last message is append-only, so provider prefix caching ca
 Dependencies: pip install flask requests
 """
 
-import json, os, sys, pathlib, threading, time, html, re, shutil, hmac, zipfile, io
-import requests
+import hmac
+import html
+import io
+import json
+import logging
+import os
+import pathlib
+import re
+import shutil
+import sys
+import threading
+import time
+import zipfile
+from collections import defaultdict, deque
+from time import monotonic
 from urllib.parse import urlsplit
-from flask import Flask, request, jsonify, Response, send_from_directory
-from config import cfg, SETTINGS_PATH
+
+import requests
+from flask import Flask, Response, jsonify, request, send_from_directory
+
 import analyst
 import arc
+from campaign import Campaign
+from config import SETTINGS_PATH, cfg
+from ledger import KINDS as KINDS
+from ledger import _lst as _lst
+from ledger import apply_ledger_ops, render_ledger
+from ledger import slug as slug
+from narrator_context import assemble_context
+from narrator_context import merge_same_role as merge_same_role
+from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
+from style_guard import compute_style_guard
+
+logger = logging.getLogger(__name__)
 
 # ---------------- paths ----------------
 
@@ -43,21 +70,43 @@ CAMPAIGN = cfg.campaign
 if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
-CAMPAIGNS_DIR = pathlib.Path(os.environ.get("DM_CAMPAIGNS_DIR") or pathlib.Path(__file__).parent / "campaigns")
-ROOT = CAMPAIGNS_DIR / CAMPAIGN
-HISTORY, UNDONE = ROOT / "history.jsonl", ROOT / "undone.jsonl"
-PREMISE, SUMMARY = ROOT / "premise.md", ROOT / "summary.md"
-LEDGER, AUDIT, STATE = ROOT / "ledger.json", ROOT / "audit.md", ROOT / "state.json"
+def bind_campaign(campaigns_dir=None, name=None):
+    """Set the active campaign and refresh compatibility aliases used by commands/tests."""
+    global CAMPAIGN_CONTEXT, CAMPAIGN, CAMPAIGNS_DIR, ROOT
+    global HISTORY, UNDONE, PREMISE, SUMMARY, LEDGER, AUDIT, STATE
+    global TURN_LOCK, MAINT_LOCK, STATE_LOCK, JOB_LOCK
+    if isinstance(campaigns_dir, Campaign):
+        context = campaigns_dir
+    else:
+        base = campaigns_dir or os.environ.get("DM_CAMPAIGNS_DIR")
+        if not base:
+            base = pathlib.Path(__file__).parent / "campaigns"
+        context = Campaign(base, name or CAMPAIGN)
+    previous = globals().get("CAMPAIGN_CONTEXT")
+    thread = globals().get("MAINT_THREAD")
+    if previous is not None and previous is not context and thread and thread.is_alive():
+        thread.join()
+    CAMPAIGN_CONTEXT = context
+    CAMPAIGN = context.name
+    CAMPAIGNS_DIR, ROOT = context.campaigns_dir, context.root
+    HISTORY, UNDONE = context.history, context.undone
+    PREMISE, SUMMARY = context.premise, context.summary
+    LEDGER, AUDIT, STATE = context.ledger, context.audit, context.state
+    TURN_LOCK, MAINT_LOCK = context.turn_lock, context.maintenance_lock
+    STATE_LOCK, JOB_LOCK = context.state_lock, context.job_lock
+    cfg.set_campaign_path(context.root / "campaign.json")
+    return context
 
-TURN_LOCK = threading.Lock()    # one player action (turn / undo / retry) at a time
-MAINT_LOCK = threading.Lock()   # one maintenance job (ledger / fold / audit) at a time
-STATE_LOCK = threading.Lock()
-JOB_LOCK = threading.Lock()
+
+CAMPAIGN_CONTEXT = bind_campaign()
+
 MAINT_THREAD = None
 JOB = {"name": "", "running": False, "msg": ""}
 LAST = {"est": 0, "prompt_tokens": None, "cached": None}
+POST_COUNTS = defaultdict(lambda: deque())
+AUTH_FAILURES = {}
+AUTH_FAILURE_LOCK = threading.Lock()
 
-KINDS = ("player", "person", "place", "item", "promise", "clock", "rule", "thread")
 RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
 
 
@@ -88,28 +137,13 @@ _warned = set()
 def warn(msg):
     if msg not in _warned:
         _warned.add(msg)
-        print(f"[warn: {msg}]")
-
-def atomic_write(path, text):
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-def append_jsonl(path, items):
-    data = "".join((x if isinstance(x, str) else json.dumps(x, ensure_ascii=False)) + "\n" for x in items)
-    if path.exists() and path.stat().st_size:
-        with path.open("rb") as f:                      # never glue onto an unterminated last line
-            f.seek(-1, os.SEEK_END)
-            if f.read(1) != b"\n":
-                data = "\n" + data
-    with path.open("a", encoding="utf-8") as f:
-        f.write(data)
+        logger.warning(msg)
 
 def read(path):
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 def raw_history_lines():
-    return [l for l in HISTORY.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [line for line in HISTORY.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def load_history():
     out = []
@@ -189,156 +223,14 @@ def tok(n_chars):
 def est_tokens(msgs):
     return tok(sum(len(m["content"]) for m in msgs))
 
-def slug(s):
-    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:48]
-
-def _lst(x):
-    return x if isinstance(x, list) else []
-
-def apply_ledger_ops(ledger, ops):
-    by = {e["id"]: e for e in ledger}
-    for u in _lst(ops.get("upsert")):
-        if not isinstance(u, dict):
-            continue
-        eid = slug(u.get("id") or u.get("name") or "")
-        if not eid or not str(u.get("state", "")).strip():
-            continue
-        e = by.get(eid) or {"id": eid}
-        if e.get("pinned"):                             # D-12: skip pinned entries
-            continue
-        kind = str(u.get("kind", "")).strip().lower()
-        e["kind"] = kind if kind in KINDS else e.get("kind", "thread")
-        e["name"] = str(u.get("name") or e.get("name") or eid).strip()
-        e["state"] = str(u["state"]).strip()
-        src = str(u.get("src", "")).strip().lower()
-        e["src"] = src if src in ("player", "dm", "note") else e.get("src", "dm")
-        try:
-            e["msg"] = int(u.get("msg"))
-        except (TypeError, ValueError):
-            e.setdefault("msg", None)
-        e["status"] = "active"                          # an upsert reopens a closed entry
-        by[eid] = e
-    for i in _lst(ops.get("close")):
-        s_id = slug(i)
-        if s_id in by and not by[s_id].get("pinned"):
-            by[s_id]["status"] = "closed"
-    for i in _lst(ops.get("delete")):
-        s_id = slug(i)
-        if s_id in by and not by[s_id].get("pinned"):
-            by.pop(s_id, None)
-    out = list(by.values())
-    if len(out) > cfg.ledger_max:                       # over the cap: oldest CLOSED entries go first
-        closed = sorted((e for e in out if e.get("status") == "closed" and not e.get("pinned")), key=lambda e: e.get("msg") or 0)
-        drop = {e["id"] for e in closed[: len(out) - cfg.ledger_max]}
-        out = [e for e in out if e["id"] not in drop]
-    return out
-
-def render_ledger(ledger):
-    if not ledger:
-        return ""
-    order = {k: i for i, k in enumerate(KINDS)}
-    act = sorted((e for e in ledger if e.get("status") != "closed"),
-                 key=lambda e: (order.get(e.get("kind"), 99), str(e.get("name", ""))))
-    closed = sorted((e for e in ledger if e.get("status") == "closed"),
-                    key=lambda e: e.get("msg") or 0)[-cfg.ledger_closed_max:] if cfg.ledger_closed_max else []
-    lines, cur = [], None
-    for e in act:
-        if e.get("kind") != cur:
-            cur = e.get("kind")
-            lines.append(f"[{str(cur).upper()}]")
-        lines.append(f"- {e.get('name')}: {e.get('state')}")
-    if closed:
-        lines.append("[PAST / RESOLVED — do not revive]")
-        lines += [f"- {e.get('name')}: {e.get('state')}" for e in closed]
-    return "\n".join(lines)
-
-def merge_same_role(msgs):
-    out = []
-    for m in msgs:
-        if out and out[-1]["role"] == m["role"]:
-            out[-1] = {"role": m["role"], "content": out[-1]["content"] + "\n\n" + m["content"]}
-        else:
-            out.append(m)
-    return out
-
-def compute_style_guard(history):
-    dm_msgs = [m["content"] for m in history if m.get("role") == "assistant"]
-    if not dm_msgs:
-        return []
-    openers = []
-    for msg in dm_msgs[-8:]:
-        words = msg.strip().split()
-        if words:
-            opener = " ".join(words[:5])
-            if opener and opener not in openers:
-                openers.append(opener)
-    from collections import Counter
-    counts = Counter()
-    for msg in dm_msgs[-12:]:
-        words = re.findall(r"\b[A-Za-z0-9'-]+\b", msg.lower())
-        for i in range(len(words) - 2):
-            counts[f"{words[i]} {words[i+1]} {words[i+2]}"] += 1
-    trigrams = [tri for tri, cnt in sorted(counts.items(), key=lambda x: (-x[1], x[0])) if cnt >= 3]
-    combined = []
-    for op in openers:
-        if op not in combined:
-            combined.append(op)
-    for tri in trigrams:
-        if tri not in combined:
-            combined.append(tri)
-    return combined[:8]
-
 def build_context(history, brief=None):
-    """history must end with the pending player action."""
+    """Build the narrator prompt for history ending in the pending player action."""
     k = folded()
-    parts = [cfg.system_prompt]
-    if p := read(PREMISE):
-        parts.append("PREMISE (fixed canon):\n" + p)
-    if cfg.style_enabled:
-        style_parts = []
-        preset = cfg.style_preset
-        if preset and preset != "none":
-            preset_file = pathlib.Path(__file__).parent / "styles" / f"{preset}.md"
-            if preset_file.exists():
-                style_parts.append(preset_file.read_text(encoding="utf-8").strip())
-        if cfg.style_words_min > 0 or cfg.style_words_max > 0:
-            if cfg.style_words_min > 0 and cfg.style_words_max > 0:
-                style_parts.append(f"Target length: {cfg.style_words_min}–{cfg.style_words_max} words per reply.")
-            elif cfg.style_words_max > 0:
-                style_parts.append(f"Target length: at most {cfg.style_words_max} words per reply.")
-            else:
-                style_parts.append(f"Target length: at least {cfg.style_words_min} words per reply.")
-        if cfg.style_push:
-            style_parts.append(f"Style push: {cfg.style_push}/100.")
-        if cfg.style_notes and cfg.style_notes.strip():
-            style_parts.append("Style notes:\n" + cfg.style_notes.strip())
-        style_parts.append(
-            "Rules: Every reply must end on a concrete new development or decision point, "
-            "avoid recapping the player's action, and keep atmosphere to the minority of sentences."
-        )
-        parts.append("STYLE:\n" + "\n\n".join(style_parts))
-    if k and (s := read(SUMMARY)):
-        parts.append("STORY SO FAR (older play, already summarized; everything after it is verbatim below):\n" + s)
-    tail = history[min(k, len(history) - 1):]
-    if tail and tail[0]["role"] == "assistant":         # only if history parity was ever disturbed
-        tail = tail[1:]
-    msgs = merge_same_role(tail)
-    canon = render_ledger(load_ledger()) if cfg.ledger_enabled else ""
-    if canon and msgs and msgs[-1]["role"] == "user":   # volatile part goes LAST to keep the prefix cacheable
-        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                    "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
-                    "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon +
-                    "\n--- end of ledger: now narrate the outcome of the player's action above."}
-    if cfg.style_guard and msgs and msgs[-1]["role"] == "user":
-        guard = compute_style_guard(history)
-        if guard:
-            msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                        "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
-    if brief and msgs and msgs[-1]["role"] == "user":
-        brief_text = json.dumps(brief, ensure_ascii=False, indent=1)
-        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                    "\n\n---\nDIRECTOR'S BRIEF (never mention it to the player):\n" + brief_text}
-    return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
+    return assemble_context(
+        history, brief, folded_count=k, premise=read(PREMISE),
+        summary=read(SUMMARY) if k else "",
+        canon=render_ledger(load_ledger()) if cfg.ledger_enabled else "",
+    )
 
 def ctx_label():
     est, real = LAST["est"], LAST["prompt_tokens"]
@@ -391,7 +283,8 @@ def _with_retries(fn, retries=None):
             if attempt == n - 1 or (isinstance(e, ApiError) and not e.retry):
                 raise
             wait = (e.wait if isinstance(e, ApiError) and e.wait else None) or min(90.0, cfg.retry_base_sec * 2 ** attempt)
-            print(f"[api error ({str(e)[:120]}); retry {attempt + 1}/{n - 1} in {wait:.0f}s]")
+            logger.info("API error (%s); retry %s/%s in %.0fs",
+                        str(e)[:120], attempt + 1, n - 1, wait)
             time.sleep(wait)
 
 def _with_fallback(call, primary, fallback=True):
@@ -400,7 +293,7 @@ def _with_fallback(call, primary, fallback=True):
     except TRANSIENT as e:
         fb = cfg.fallback_model
         if fallback and fb and fb != primary:
-            print(f"[{primary} failed ({str(e)[:100]}); trying fallback {fb}]")
+            logger.info("%s failed (%s); trying fallback %s", primary, str(e)[:100], fb)
             return call(fb)
         raise
 
@@ -409,13 +302,6 @@ def note_usage(u):
         LAST["prompt_tokens"] = u["prompt_tokens"]
         d = u.get("prompt_tokens_details")
         LAST["cached"] = d.get("cached_tokens") if isinstance(d, dict) else None
-
-def clean_reply(text):
-    """Strip reasoning blocks that some models emit inline."""
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1]
-    return text.split("<think>", 1)[0].strip()
 
 def narrator_extra():
     x = {}
@@ -507,7 +393,10 @@ def split_ranges(h, a, end):
     return out
 
 def parse_json_obj(raw):
-    return json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+    value = parse_json_response(raw)
+    if not isinstance(value, dict):
+        raise ValueError("model response did not contain a JSON object")
+    return value
 
 LEDGER_PROMPT = (
     "Update the canon ledger from the new play. Return ONLY JSON: "
@@ -527,7 +416,7 @@ LEDGER_PROMPT = (
     "'(DM said X at [n])' to the state.\n"
     "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
 
-def record_pass(upto=None):
+def ledger_pass(upto=None):
     """Advance the ledger over history[ledgered:upto]. Caller holds MAINT_LOCK."""
     h = load_history()
     ptr = ledgered()
@@ -549,7 +438,7 @@ def record_pass(upto=None):
         ledger = apply_ledger_ops(ledger, parse_json_obj(raw))
         atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
         set_state(ledgered=b)                           # pointer LAST, per range
-        print(f"[ledger: messages {a}–{b - 1} recorded; {len(ledger)} entries]")
+        logger.info("Ledger recorded messages %s–%s; %s entries", a, b - 1, len(ledger))
 
 def fold_if_needed():
     """Once the verbatim tail passes the budget, fold its oldest part into chapters. Caller holds MAINT_LOCK."""
@@ -567,7 +456,7 @@ def fold_if_needed():
         return
     end = k + n
     if cfg.ledger_enabled:
-        record_pass(upto=end)                           # never fold what the ledger has not seen
+        ledger_pass(upto=end)                           # never fold what the ledger has not seen
     ref = render_ledger(load_ledger())
     summary = read(SUMMARY)
     for a, b in split_ranges(h, k, end):
@@ -591,7 +480,7 @@ def fold_if_needed():
         summary = (summary + "\n\n" if summary else "") + header + "\n" + chapter
         atomic_write(SUMMARY, summary)
     set_state(folded=end)                               # pointer LAST: a crash can duplicate, never lose
-    print(f"[fold: messages {k}–{end - 1} folded into chapters]")
+    logger.info("Folded messages %s–%s into chapters", k, end - 1)
 
 def _audit():
     h = load_history()
@@ -618,7 +507,7 @@ def _audit():
     atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
                         f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
     set_state(audited=len(h))
-    print(f"[audit written to {AUDIT}]")
+    logger.info("Audit written to %s", AUDIT)
 
 def run_audit():
     with MAINT_LOCK:
@@ -632,7 +521,7 @@ def rebuild_ledger():
         atomic_write(LEDGER, "[]")
         set_state(ledgered=0)
         upto = max(0, len(h) - 2 * cfg.ledger_lag_turns)
-        record_pass(upto=upto - upto % 2)
+        ledger_pass(upto=upto - upto % 2)
 
 def reset_fold():
     """Migrate a v2 campaign: archive summary/facts, show the full history again."""
@@ -646,23 +535,24 @@ def reset_fold():
         shutil.move(str(facts), str(legacy / f"facts.{stamp}.json"))
     atomic_write(SUMMARY, "")
     set_state(folded=0, ledgered=0)
-    print(f"[v2 summary/facts archived in {legacy}; folded=0]")
+    logger.info("Archived v2 summary/facts in %s; folded=0", legacy)
 
 def maintain():
-    if not MAINT_LOCK.acquire(blocking=False):          # single-flight
+    lock = MAINT_LOCK
+    if not lock.acquire(blocking=False):                # single-flight
         return
     try:
         if cfg.ledger_enabled:
-            record_pass()
+            ledger_pass()
         fold_if_needed()
         if cfg.audit_every_turns:
             n = len(load_history())
             if n - _int(get_state().get("audited")) >= 2 * cfg.audit_every_turns:
                 _audit()
     except Exception as e:
-        print(f"[maintenance failed, will retry next turn: {e}]")
+        logger.warning("Maintenance failed; will retry next turn: %s", e)
     finally:
-        MAINT_LOCK.release()
+        lock.release()
 
 def start_maintain():
     global MAINT_THREAD
@@ -694,6 +584,44 @@ def _generate(ctx, stream):
         raise RuntimeError("model returned an empty reply")
     return dm
 
+def _generate_stream(ctx):
+    """Stream a narrator reply while preserving retries, fallback, usage, and cleaning."""
+    ensure_configured()
+    LAST.update(est=est_tokens(ctx), prompt_tokens=None, cached=None)
+
+    def open_(model):
+        payload = {"model": model, "messages": ctx, "stream": True,
+                   "stream_options": {"include_usage": True}, **narrator_extra()}
+        return _with_retries(lambda: _raw_post(payload, stream=True))
+
+    r = _with_fallback(open_, cfg.model)
+    full = ""
+    try:
+        for line in r.iter_lines():
+            if not line or not line.startswith(b"data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == b"[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("error"):
+                raise RuntimeError(f"API error mid-stream: {str(chunk['error'])[:300]}")
+            note_usage(chunk.get("usage"))
+            choices = chunk.get("choices") or []
+            piece = ((choices[0].get("delta") or {}).get("content") or "") if choices else ""
+            if piece:
+                full += piece
+                yield {"chunk": piece}
+    finally:
+        r.close()
+    dm = clean_reply(full)
+    if not dm:
+        raise RuntimeError("model returned an empty reply")
+    yield {"done": True, "dm": dm}
+
 def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
         return []
@@ -713,56 +641,130 @@ def _record_kwargs(brief):
     """Return the record-pass arguments derived from the analyst brief."""
     if not brief:
         return {}
-    return {"played_moves": brief.get("plot_moves") or [], "intent": brief.get("intent", "act")}
+    return {
+        "played_moves": brief.get("plot_moves") or [],
+        "intent": brief.get("intent", "act"),
+        "analyst_act_complete": bool(brief.get("act_complete", False)),
+    }
 
-def player_turn(text, stream=False):
-    with TURN_LOCK:
-        history = load_history()
-        if cfg.notes_routing and analyst.is_ooc_note(text):
-            entry = analyst.handle_ooc_note(
-                ROOT, text, history, read(PREMISE), read(SUMMARY),
-                render_ledger(load_ledger()), chat_complete
-            )
-            return entry["a"]
+def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
+    """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
+    if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
+        raise RuntimeError("turn already in progress")
+    elif not lock_acquired:
+        lock_acquired = True
+    arc_backup = None
+    committed = False
+    maintain_needed = False
+    try:
+        if retry:
+            lines, history = raw_history_lines(), load_history()
+            _last_exchange(lines, history)
+            text = history[-2]["content"]
+            if cfg.arc_enabled:
+                arc_backup = arc.backup_state(ROOT)
+                arc.restore_arc_snapshot(ROOT, len(history) - 1)
+                arc.truncate_records(ROOT, len(history) - 1)
+                arc.truncate_arc_log(ROOT, len(history) - 1)
+            if stream and cfg.analyst_enabled and rerun_analyst:
+                yield {"stage": "analyzing"}
+            brief = _retry_brief(history, rerun_analyst)
+            user = history[-2]
+            msg_idx = len(history) - 1
+            played_history = history[:-1]
+            ctx = build_context(history[:-1], brief=brief)
+        else:
+            history = load_history()
+            if cfg.notes_routing and analyst.is_ooc_note(text):
+                entry = analyst.handle_ooc_note(
+                    ROOT, text, history, read(PREMISE), read(SUMMARY),
+                    render_ledger(load_ledger()), chat_complete
+                )
+                yield {"chunk": entry["a"], "ooc": True}
+                yield {"done": True, "dm": entry["a"], "ooc": True}
+                return
 
-        brief = None
-        if cfg.analyst_enabled:
-            allowed = get_allowed_moves()
-            guard_items = compute_style_guard(history) if cfg.style_guard else []
-            brief, source, model_used, ms = analyst.run_analyst(
-                ROOT, history, text, allowed, guard_items, chat_complete
-            )
-            analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+            brief = None
+            if cfg.analyst_enabled:
+                if stream:
+                    yield {"stage": "analyzing"}
+                allowed = get_allowed_moves()
+                guard_items = compute_style_guard(history) if cfg.style_guard else []
+                brief, source, model_used, ms = analyst.run_analyst(
+                    ROOT, history, text, allowed, guard_items, chat_complete
+                )
+                analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
-        user = {"role": "user", "content": text}
-        dm = _generate(build_context(history + [user], brief=brief), stream)
-        append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
+            user = {"role": "user", "content": text}
+            msg_idx = len(history) + 1
+            played_history = history + [user]
+            ctx = build_context(history + [user], brief=brief)
+
+        if stream:
+            yield {"stage": "narrating"}
+            dm = None
+            for event in _generate_stream(ctx):
+                yield event
+                if event.get("done"):
+                    dm = event["dm"]
+        else:
+            dm = _generate(ctx, stream=False)
+        if not dm:
+            raise RuntimeError("model returned an empty reply")
+
+        if retry:
+            new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
+            append_jsonl(UNDONE, lines[-1:])
+            atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-1]) + new + "\n")
+        else:
+            append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])
+            if not history and not read(PREMISE):
+                atomic_write(PREMISE, text)
+        committed = True
+        maintain_needed = True
+        played_history = played_history + [{"role": "assistant", "content": dm}]
+
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
         set_state(last_words=words, overlong=overlong)
-        if not history and not read(PREMISE):
-            atomic_write(PREMISE, text)                                       # first message = pinned premise
 
         if cfg.arc_enabled:
-            # Auto plan if arc does not exist yet (D-13)
-            if arc.arc_is_corrupt(ROOT):
+            if stream:
+                yield {"stage": "recording"}
+            if not retry and arc.arc_is_corrupt(ROOT):
                 warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-            elif not arc.load_arc(ROOT):
+            elif not retry and not arc.load_arc(ROOT):
                 try:
                     new_arc = arc.plan_initial_arc(
-                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()), history + [user, {"role": "assistant", "content": dm}], chat_complete
+                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
+                        history + [user, {"role": "assistant", "content": dm}],
+                        chat_complete
                     )
                     arc.save_arc(ROOT, new_arc)
                 except Exception as e:
-                    print(f"[arc: auto-planning failed: {e}]")
-            # Run record pass
+                    logger.warning("Arc auto-planning failed: %s", e)
             try:
-                arc.run_record_pass(ROOT, text, dm, len(history) + 1, chat_complete,
-                                    **_record_kwargs(brief))
+                arc.run_record_pass(ROOT, text, dm, msg_idx, chat_complete,
+                                    history=played_history, **_record_kwargs(brief))
             except Exception as e:
-                print(f"[arc: record pass failed: {e}]")
+                logger.warning("Arc record pass failed: %s", e)
+        yield {"done": True, "dm": dm}
+    except BaseException:
+        if retry and not committed and arc_backup is not None:
+            arc.restore_state(ROOT, arc_backup)
+        raise
+    finally:
+        TURN_LOCK.release()
+        if maintain_needed:
+            start_maintain()
 
-    start_maintain()
+def player_turn(text, stream=False):
+    dm = None
+    for event in run_turn(text, stream=stream):
+        if stream and event.get("chunk"):
+            print(event["chunk"], end="", flush=True)
+        if event.get("done"):
+            dm = event["dm"]
     return dm
 
 def _last_exchange(lines, h):
@@ -775,7 +777,9 @@ def _last_exchange(lines, h):
 
 def undo_turn():
     """Remove the last exchange (kept in undone.jsonl). Returns the player's text."""
-    with TURN_LOCK:
+    if not TURN_LOCK.acquire(blocking=False):
+        raise RuntimeError("turn already in progress")
+    try:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
         if cfg.arc_enabled:
@@ -784,11 +788,13 @@ def undo_turn():
             arc.truncate_arc_log(ROOT, len(h) - 2)
         analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
-        atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-2]))
+        atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-2]))
         text = h[-2]["content"]
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
         return text
+    finally:
+        TURN_LOCK.release()
 
 def _retry_brief(h, rerun_analyst):
     """Director's brief for retrying the last exchange: reuse the stored one unless asked to re-run."""
@@ -809,36 +815,13 @@ def _retry_brief(h, rerun_analyst):
 
 def retry_turn(stream=False, rerun_analyst=False):
     """Regenerate the DM's last reply for the same player action."""
-    with TURN_LOCK:
-        lines, h = raw_history_lines(), load_history()
-        _last_exchange(lines, h)
-        arc_backup = arc.backup_state(ROOT) if cfg.arc_enabled else None
-        try:
-            if cfg.arc_enabled:
-                arc.restore_arc_snapshot(ROOT, len(h) - 1)
-                arc.truncate_records(ROOT, len(h) - 1)
-                arc.truncate_arc_log(ROOT, len(h) - 1)
-            brief = _retry_brief(h, rerun_analyst)
-            dm = _generate(build_context(h[:-1], brief=brief), stream)
-        except BaseException:
-            # Anything failing after the rewind (analyst, scheduling, generation) leaves the
-            # old reply in history, so the arc must go back to match it.
-            if arc_backup is not None:
-                arc.restore_state(ROOT, arc_backup)
-            raise
-        new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
-        append_jsonl(UNDONE, lines[-1:])
-        atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-1]) + new + "\n")
-        words = len(dm.split())
-        overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-        set_state(last_words=words, overlong=overlong)
-        if cfg.arc_enabled:
-            try:
-                arc.run_record_pass(ROOT, h[-2]["content"], dm, len(h) - 1, chat_complete,
-                                    **_record_kwargs(brief))
-            except Exception as e:
-                print(f"[arc: record pass failed on retry: {e}]")
-    return dm
+    result = None
+    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst):
+        if stream and event.get("chunk"):
+            print(event["chunk"], end="", flush=True)
+        if event.get("done"):
+            result = event["dm"]
+    return result
 
 def game_state():
     history = load_history()
@@ -870,6 +853,7 @@ def game_state():
         "configured": bool(cfg.api_key and cfg.model),
         "turns": sum(1 for m in history if m["role"] == "user"),
         "history": history[-60:],
+        "history_start": max(0, len(history) - 60),
         "premise": read(PREMISE),
         "summary": read(SUMMARY),
         "ledger": load_ledger(),
@@ -904,26 +888,59 @@ WEB_DIR = pathlib.Path(__file__).parent / "web"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 def config_locked():
-    """Reachable beyond loopback with no password: global config writes and restart are refused.
-    DM_ALLOW_OPEN_CONFIG=1 is the explicit escape hatch."""
-    if os.environ.get("DM_ALLOW_OPEN_CONFIG") == "1":
-        return False
+    """Reachable beyond loopback with no password: global config writes and restart are refused."""
     return cfg.host not in LOOPBACK_HOSTS and not cfg.web_password
 
 def _same_origin():
     origin = request.headers.get("Origin")
     if not origin:
-        return True
-    return urlsplit(origin).netloc in {request.host, request.headers.get("X-Forwarded-Host", "")}
+        return request.headers.get("Host", "").casefold() == request.host.casefold()
+    parsed = urlsplit(origin)
+    return (
+        parsed.scheme == request.scheme
+        and parsed.netloc.casefold() == request.host.casefold()
+        and request.headers.get("Host", "").casefold() == request.host.casefold()
+    )
+
+def validate_web_security():
+    if cfg.host not in LOOPBACK_HOSTS and not cfg.web_password:
+        raise RuntimeError(
+            "Refusing to bind beyond loopback without web_password; set DM_WEB_PASSWORD "
+            "or bind to 127.0.0.1."
+        )
 
 @app.before_request
 def check_auth():
+    if request.path == "/healthz":
+        return None
     if not cfg.web_password:
         return None
-    auth = request.authorization
-    if not auth or not auth.password or not hmac.compare_digest(
-            auth.password.encode("utf-8"), cfg.web_password.encode("utf-8")):
+    if not request.headers.get("Authorization"):
         return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
+
+    auth = request.authorization
+    valid = bool(auth and auth.password and hmac.compare_digest(
+        auth.password.encode("utf-8"), cfg.web_password.encode("utf-8")))
+    now = monotonic()
+    address = request.remote_addr or ""
+    with AUTH_FAILURE_LOCK:
+        failures = AUTH_FAILURES.get(address)
+        if failures:
+            while failures and now - failures[0] >= 60:
+                failures.popleft()
+            if len(failures) >= 10:
+                retry_after = str(max(1, int(60 - (now - failures[0])) + 1))
+                return Response("Too many authentication attempts", 429, {"Retry-After": retry_after})
+        if valid:
+            AUTH_FAILURES.pop(address, None)
+            return None
+        if not failures:
+            if address not in AUTH_FAILURES and len(AUTH_FAILURES) >= 1024:
+                oldest = min(AUTH_FAILURES, key=lambda key: AUTH_FAILURES[key][-1] if AUTH_FAILURES[key] else 0)
+                del AUTH_FAILURES[oldest]
+            failures = AUTH_FAILURES[address] = deque()
+        failures.append(now)
+    return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
 
 @app.before_request
 def guard_admin():
@@ -933,11 +950,24 @@ def guard_admin():
         return jsonify({"ok": False, "error": "cross-origin request refused", "errors": {}}), 403
     if not config_locked():
         return None
-    scope = request.args.get("scope") or (request.get_json(silent=True) or {}).get("scope") or "global"
+    body = request.get_json(silent=True)
+    scope = request.args.get("scope") or (body.get("scope") if isinstance(body, dict) else None) or "global"
     if request.path == "/api/restart" or (request.path == "/api/config" and scope != "campaign"):
         msg = ("Global settings and restart are disabled while the server is reachable without a "
                "web_password. Set one (DM_WEB_PASSWORD or settings.json) or bind to 127.0.0.1.")
         return jsonify({"ok": False, "error": msg, "errors": {}}), 403
+
+@app.before_request
+def throttle_mutating_posts():
+    if request.method != "POST":
+        return None
+    now = monotonic()
+    window = POST_COUNTS[request.remote_addr]
+    while window and now - window[0] > 10:
+        window.popleft()
+    window.append(now)
+    if len(window) > 20:
+        return jsonify({"ok": False, "error": "too many requests"}), 429
 
 @app.route("/")
 def index():
@@ -962,14 +992,24 @@ def serve_web(filename):
 def api_state():
     return jsonify(game_state())
 
+@app.route("/healthz")
+def healthz():
+    return Response("ok", mimetype="text/plain")
+
 @app.route("/api/turn", methods=["POST"])
 def api_turn():
     text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty"}), 400
     try:
-        return jsonify({"dm": player_turn(text)})
+        dm = None
+        for event in run_turn(text, stream=False):
+            if event.get("done"):
+                dm = event["dm"]
+        return jsonify({"dm": dm})
     except Exception as e:
+        if str(e) == "turn already in progress":
+            return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 502
 
 @app.route("/api/stream", methods=["POST"])
@@ -978,86 +1018,17 @@ def api_stream():
     text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty"}), 400
+    if not TURN_LOCK.acquire(blocking=False):
+        return jsonify({"error": "turn already in progress"}), 409
 
     def event_stream():
-        with TURN_LOCK:
-            history = load_history()
-            if cfg.notes_routing and analyst.is_ooc_note(text):
-                entry = analyst.handle_ooc_note(
-                    ROOT, text, history, read(PREMISE), read(SUMMARY),
-                    render_ledger(load_ledger()), chat_complete
-                )
-                yield f"data: {json.dumps({'chunk': entry['a']})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            brief = None
-            if cfg.analyst_enabled:
-                yield f"data: {json.dumps({'stage': 'analyzing'})}\n\n"
-                allowed = get_allowed_moves()
-                guard_items = compute_style_guard(history) if cfg.style_guard else []
-                brief, source, model_used, ms = analyst.run_analyst(
-                    ROOT, history, text, allowed, guard_items, chat_complete
-                )
-                analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
-
-            yield f"data: {json.dumps({'stage': 'narrating'})}\n\n"
-            ctx = build_context(history + [{"role": "user", "content": text}], brief=brief)
-            payload = {"model": cfg.model, "messages": ctx, "stream": True,
-                       "stream_options": {"include_usage": True}, **narrator_extra()}
-            r = _raw_post(payload, stream=True)
-            dm_text = ""
-            try:
-                for line in r.iter_lines():
-                    if not line or not line.startswith(b"data: "):
-                        continue
-                    p = line[6:].strip()
-                    if p == b"[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(p)
-                        delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
-                        if delta:
-                            dm_text += delta
-                            yield f"data: {json.dumps({'chunk': delta})}\n\n"
-                    except Exception:
-                        continue
-            finally:
-                r.close()
-
-            dm_cleaned = clean_reply(dm_text)
-            if not dm_cleaned:
-                raise RuntimeError("Empty response from model")
-
-            user = {"role": "user", "content": text}
-            append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm_cleaned}])
-            words = len(dm_cleaned.split())
-            overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-            set_state(last_words=words, overlong=overlong)
-            if not history and not read(PREMISE):
-                atomic_write(PREMISE, text)
-
-            if cfg.arc_enabled:
-                yield f"data: {json.dumps({'stage': 'recording'})}\n\n"
-                if arc.arc_is_corrupt(ROOT):
-                    warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-                elif not arc.load_arc(ROOT):
-                    try:
-                        new_arc = arc.plan_initial_arc(
-                            read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
-                            history + [user, {"role": "assistant", "content": dm_cleaned}],
-                            chat_complete
-                        )
-                        arc.save_arc(ROOT, new_arc)
-                    except Exception as e:
-                        print(f"[arc: auto-planning failed: {e}]")
-                try:
-                    arc.run_record_pass(ROOT, text, dm_cleaned, len(history) + 1, chat_complete,
-                                        **_record_kwargs(brief))
-                except Exception as e:
-                    print(f"[arc: record pass failed: {e}]")
-
-        start_maintain()
+        for event in run_turn(text, stream=True, lock_acquired=True):
+            if event.get("stage"):
+                yield f"data: {json.dumps({'stage': event['stage']})}\n\n"
+            elif event.get("chunk"):
+                yield f"data: {json.dumps({'chunk': event['chunk']})}\n\n"
+            elif event.get("done") and event.get("ooc"):
+                yield f"data: {json.dumps({'chunk': event['dm']})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(event_stream(), mimetype="text/event-stream")
@@ -1074,6 +1045,8 @@ def api_retry():
     try:
         return jsonify({"dm": retry_turn()})
     except Exception as e:
+        if str(e) == "turn already in progress":
+            return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 502
 
 @app.route("/api/rebuild", methods=["POST"])
@@ -1106,9 +1079,16 @@ def api_premise():
 @app.route("/api/ledger", methods=["POST"])
 def api_ledger_action():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "unknown action"}), 400
     action = body.get("action")
+    if action not in ("pin", "delete", "upsert"):
+        return jsonify({"ok": False, "error": "unknown action"}), 400
     if LEDGER.exists():
         shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
+        backups = sorted(ROOT.glob("ledger.*.bak.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[10:]:
+            old.unlink(missing_ok=True)
     ledger = load_ledger(strict=True)
     if action == "pin":
         entry_id = body.get("id")
@@ -1141,12 +1121,16 @@ def api_export_transcript():
 @app.route("/api/export/campaign.zip", methods=["GET"])
 def api_export_zip():
     buf = io.BytesIO()
+    include_arc = request.args.get("include_arc") == "1"
+    arc_names = {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl", "arc_snap"}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in ROOT.rglob("*"):
             if f.is_file():
                 if f.name in ("settings.json", "campaign.json"):
                     continue
                 rel = f.relative_to(ROOT)
+                if not include_arc and (rel.name in arc_names or "arc_snap" in rel.parts):
+                    continue
                 zf.write(f, arcname=str(rel))
     buf.seek(0)
     return Response(buf.getvalue(), mimetype="application/zip",
@@ -1220,6 +1204,8 @@ def api_notes_canon(note_id):
     note = next((n for n in notes if n.get("id") == note_id), None)
     if not note:
         return jsonify({"error": "note not found"}), 404
+    if note.get("canon"):
+        return jsonify({"ok": True})
     if note.get("proposal") and isinstance(note["proposal"], dict):
         ledger = load_ledger(strict=True)
         ledger = apply_ledger_ops(ledger, {"upsert": [note["proposal"]]})
@@ -1326,6 +1312,7 @@ def cli():
 
 if __name__ == "__main__":
     argv = sys.argv
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     maint_cmd = any(a in argv for a in ("--reset-fold", "--rebuild-ledger", "--audit"))
     init_files()
     if "--show-context" in argv:
@@ -1358,9 +1345,15 @@ if __name__ == "__main__":
         print(f"[arc planned successfully: central question='{new_arc.get('central_question')}']")
         sys.exit()
     if "--web" in argv:
+        validate_web_security()
+        init_files()
         if not (cfg.api_key and cfg.model):
             print("[not configured yet — open /config to set the model and API key]")
         print(f"web UI → http://{'localhost' if cfg.host == '127.0.0.1' else cfg.host}:{cfg.port}\n")
-        app.run(host=cfg.host, port=cfg.port, debug=False)
+        if os.environ.get("DM_USE_WAITERSS", "").strip() == "1":
+            from waitress import serve
+            serve(app, host=cfg.host, port=cfg.port, threads=1)
+        else:
+            app.run(host=cfg.host, port=cfg.port, debug=False)
     else:
         cli()

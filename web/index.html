@@ -22,12 +22,12 @@
       <span id="warn" style="color:var(--warn)"></span>
     </div>
     <div class="meta-right">
-      <select id="qc-diff" onchange="updateQuickControl('difficulty', this.value)" title="Difficulty" style="padding:2px 6px;font-size:0.85em">
+      <select id="qc-diff" data-control="difficulty" title="Difficulty" style="padding:2px 6px;font-size:0.85em">
         <option value="story">story</option>
         <option value="standard">standard</option>
         <option value="hard">hard</option>
       </select>
-      <select id="qc-preset" onchange="updateQuickControl('style_preset', this.value)" title="Style Preset" style="padding:2px 6px;font-size:0.85em">
+      <select id="qc-preset" data-control="style_preset" title="Style Preset" style="padding:2px 6px;font-size:0.85em">
         <option value="none">preset: none</option>
         <option value="subtle">subtle</option>
         <option value="pulp">pulp</option>
@@ -50,11 +50,11 @@
 
   <div id="bar">
     <div class="bar-controls">
-      <button id="btn-undo" class="ghost" onclick="undo()" title="Undo last turn">↶ undo</button>
-      <button id="btn-retry" class="ghost" onclick="retry()" title="Retry DM reply">↻ retry</button>
+      <button id="btn-undo" class="ghost" data-action="undo" title="Undo last turn">↶ undo</button>
+      <button id="btn-retry" class="ghost" data-action="retry" title="Retry DM reply">↻ retry</button>
       <textarea id="in" placeholder="Your action… (Enter to send, Shift+Enter for newline)" autofocus rows="1"></textarea>
-      <button id="btn-send" onclick="send()">Send</button>
-      <button id="btn-stop" class="ghost" onclick="stopTurn()" style="display:none;color:var(--err)">Stop</button>
+      <button id="btn-send" data-action="send">Send</button>
+      <button id="btn-stop" class="ghost" data-action="stop" style="display:none;color:var(--err)">Stop</button>
       <span id="timer-label" style="font-size:0.8em;color:var(--text-muted)"></span>
     </div>
   </div>
@@ -62,11 +62,11 @@
 
 <div id="side">
   <div id="tabs">
-    <button id="t-prem" onclick="setTab('prem')">Premise</button>
-    <button id="t-sum" onclick="setTab('sum')">Summary</button>
-    <button id="t-led" class="on" onclick="setTab('led')">Ledger</button>
-    <button id="t-notes" onclick="setTab('notes')">Notes</button>
-    <button id="t-aud" onclick="setTab('aud')">Audit</button>
+    <button id="t-prem" data-tab="prem">Premise</button>
+    <button id="t-sum" data-tab="sum">Summary</button>
+    <button id="t-led" class="on" data-tab="led">Ledger</button>
+    <button id="t-notes" data-tab="notes">Notes</button>
+    <button id="t-aud" data-tab="aud">Audit</button>
   </div>
   <div class="side-content" id="side-content"></div>
 </div>

@@ -37,6 +37,14 @@ jobs:
         run: |
           python -m pytest tests/
 
+      - name: Run Ruff
+        run: |
+          ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py storage.py style_guard.py
+
+      - name: Type-check shared modules
+        run: |
+          mypy --strict campaign.py storage.py style_guard.py
+
   docker-build:
     name: Verify Docker Build
     runs-on: ubuntu-latest

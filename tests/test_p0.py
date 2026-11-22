@@ -6,8 +6,9 @@ All tests:
 - Never touch the real campaigns/ directory.
 """
 import json
-import os
-import pathlib
+import subprocess
+import sys
+
 import pytest
 
 import dm
@@ -393,35 +394,18 @@ def test_config_old_file_loads(tmp_path):
 
 def test_dm_campaigns_dir_override(monkeypatch, tmp_path):
     custom_dir = tmp_path / "my_campaigns"
-    custom_dir.mkdir()
+    custom_root = custom_dir / "sandbox"
+    custom_root.mkdir(parents=True)
     monkeypatch.setenv("DM_CAMPAIGNS_DIR", str(custom_dir))
-
-    # Re-evaluate the path logic as dm.py would on import
-    import importlib
-    # We can't fully re-import, but we can verify the env-driven path construction
-    resolved = pathlib.Path(os.environ.get("DM_CAMPAIGNS_DIR") or pathlib.Path(dm.__file__).parent / "campaigns")
-    assert resolved == custom_dir
-
-    # The monkeypatched ROOT in conftest should point to the custom dir
-    # (conftest sets dm.CAMPAIGNS_DIR = tmp_path/campaigns and dm.ROOT accordingly)
-    # Here we verify the override would route files correctly
-    custom_root = custom_dir / dm.CAMPAIGN
-    custom_root.mkdir(parents=True, exist_ok=True)
-    (custom_root / "history.jsonl").write_text("", encoding="utf-8")
-
-    # Patch dm module globals to use custom_dir
-    monkeypatch.setattr(dm, "CAMPAIGNS_DIR", custom_dir)
-    monkeypatch.setattr(dm, "ROOT", custom_root)
-    monkeypatch.setattr(dm, "HISTORY", custom_root / "history.jsonl")
-    monkeypatch.setattr(dm, "STATE", custom_root / "state.json")
-    monkeypatch.setattr(dm, "SUMMARY", custom_root / "summary.md")
-    monkeypatch.setattr(dm, "LEDGER", custom_root / "ledger.json")
-    monkeypatch.setattr(dm, "UNDONE", custom_root / "undone.jsonl")
-    monkeypatch.setattr(dm, "PREMISE", custom_root / "premise.md")
-
-    # Verify that load_history reads from the custom path
+    monkeypatch.setenv("DM_SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CAMPAIGN", "sandbox")
     test_msg = {"role": "user", "content": "hello from custom dir"}
     (custom_root / "history.jsonl").write_text(json.dumps(test_msg) + "\n", encoding="utf-8")
-    history = dm.load_history()
-    assert len(history) == 1
-    assert history[0]["content"] == "hello from custom dir"
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import json, dm; print(json.dumps([str(dm.ROOT), dm.load_history()]))"],
+        check=True, capture_output=True, text=True,
+    )
+    root, history = json.loads(result.stdout)
+    assert root == str(custom_root)
+    assert history == [test_msg]

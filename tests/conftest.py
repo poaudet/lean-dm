@@ -3,7 +3,6 @@
 Sets DM_CAMPAIGNS_DIR to a temporary directory for every test so that no test
 ever touches the real campaigns/ directory.
 """
-import os
 import pytest
 
 
@@ -13,19 +12,8 @@ def isolated_campaigns_dir(tmp_path, monkeypatch):
     campaigns = tmp_path / "campaigns"
     campaigns.mkdir()
     monkeypatch.setenv("DM_CAMPAIGNS_DIR", str(campaigns))
-    # Also patch dm module-level globals so imports that happened before the env
-    # was set also pick up the new directory.
     import dm
-    monkeypatch.setattr(dm, "CAMPAIGNS_DIR", campaigns)
-    monkeypatch.setattr(dm, "ROOT", campaigns / dm.CAMPAIGN)
-    # Recalculate derived path constants
-    root = campaigns / dm.CAMPAIGN
-    monkeypatch.setattr(dm, "ROOT", root)
-    monkeypatch.setattr(dm, "HISTORY", root / "history.jsonl")
-    monkeypatch.setattr(dm, "UNDONE", root / "undone.jsonl")
-    monkeypatch.setattr(dm, "PREMISE", root / "premise.md")
-    monkeypatch.setattr(dm, "SUMMARY", root / "summary.md")
-    monkeypatch.setattr(dm, "LEDGER", root / "ledger.json")
-    monkeypatch.setattr(dm, "AUDIT", root / "audit.md")
-    monkeypatch.setattr(dm, "STATE", root / "state.json")
+    previous = dm.CAMPAIGN_CONTEXT
+    dm.bind_campaign(campaigns, dm.CAMPAIGN)
     yield campaigns
+    dm.bind_campaign(previous)
