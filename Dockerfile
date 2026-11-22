@@ -2,9 +2,10 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 RUN addgroup -S dmd && adduser -S dm -G dmd
-RUN pip install --no-cache-dir Flask==3.1.2 requests==2.32.5 waitress==3.0.2
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY dm.py config.py analyst.py arc.py campaign.py storage.py style_guard.py ./
+COPY dm.py config.py analyst.py arc.py campaign.py ledger.py narrator_context.py storage.py style_guard.py ./
 COPY styles/ ./styles/
 COPY web/ ./web/
 

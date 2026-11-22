@@ -33,7 +33,15 @@ VALID_INTENTS = ("act", "ask", "steer", "wait")
 VALID_OUTCOMES = ("clean", "partial", "complication", "setback")
 VALID_ENDS = ("decision", "question", "beat")
 VALID_HOWS = ("overt", "subtle", "offscreen")
-_HOW_RANK = {"overt": 2, "subtle": 1, "offscreen": 0}
+FALLBACK_REASONS = ("timeout", "invalid_response", "analyst_error")
+
+
+class _Brief(dict):
+    """Brief carrying diagnostics outside its narrator-visible dictionary fields."""
+
+    def __init__(self, *args, diagnostics=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.diagnostics = diagnostics or {}
 
 
 def parse_json_tolerantly(raw):
@@ -48,7 +56,7 @@ def clamp_brief(d, allowed_move_ids=None):
     """Clamp and validate raw dictionary to strict brief schema.
 
     allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
-    `how` may only be downgraded relative to the schedule, never upgraded.
+    scheduled `how` and `note` are authoritative.
     """
     if not isinstance(d, dict):
         d = {}
@@ -83,11 +91,12 @@ def clamp_brief(d, allowed_move_ids=None):
             how = str(m.get("how", "subtle")).strip().lower()
             if how not in VALID_HOWS:
                 how = "subtle"
-            if sched:
-                sched_how = str(sched.get("how", "subtle"))
-                if _HOW_RANK[how] > _HOW_RANK.get(sched_how, 1):
-                    how = sched_how
-            note = (str(m.get("note", "")).strip() or str((sched or {}).get("note", "")).strip())[:200]
+            if isinstance(sched, dict):
+                sched_how = str(sched.get("how", "subtle")).strip().lower()
+                how = sched_how if sched_how in VALID_HOWS else "subtle"
+                note = str(sched.get("note", "")).strip()[:200]
+            else:
+                note = str(m.get("note", "")).strip()[:200]
             seen.add(mid)
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
@@ -133,7 +142,9 @@ def clamp_brief(d, allowed_move_ids=None):
 
 
 def make_fallback_brief(reason="fallback"):
-    brief = copy.deepcopy(BRIEF_SCHEMA)
+    reason = reason if reason in FALLBACK_REASONS else "analyst_error"
+    brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
+                   diagnostics={"fallback_reason": reason})
     brief["narration"] = {
         "words": cfg.style_words_max if cfg.style_words_max > 0 else 140,
         "push": round((cfg.style_push / 100.0) if cfg.style_push is not None else 0.6, 2),
@@ -208,6 +219,9 @@ def save_brief(root, msg_idx, source, model, ms, brief):
         "ms": int(ms),
         "brief": brief,
     }
+    diagnostics = getattr(brief, "diagnostics", None)
+    if diagnostics:
+        entry["diagnostics"] = diagnostics
     append_jsonl(p, [entry])
 
 
@@ -330,8 +344,16 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         brief = clamp_brief(parsed, allowed_ids)
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
-    except Exception as e:
-        brief = make_fallback_brief(reason=(str(e) or type(e).__name__)[:50])
+    except concurrent.futures.TimeoutError:
+        brief = make_fallback_brief(reason="timeout")
+        ms = int((time.time() - t0) * 1000)
+        return brief, "fallback", model, ms
+    except ValueError:
+        brief = make_fallback_brief(reason="invalid_response")
+        ms = int((time.time() - t0) * 1000)
+        return brief, "fallback", model, ms
+    except Exception:
+        brief = make_fallback_brief(reason="analyst_error")
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     finally:

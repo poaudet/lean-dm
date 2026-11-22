@@ -10,8 +10,8 @@ Format per entry:
 
     Alternatives considered: <rejected options, so future changes know the "why-not">
 
-All entries below are implemented and merged (main as of `898bcbb`). A decision
-may only be changed by writing a new decision record that supersedes it.
+All entries below are implemented unless superseded by a later decision. A
+decision may only be changed by writing a new decision record that supersedes it.
 
 ---
 
@@ -155,4 +155,16 @@ Alternatives considered: Treat empty as "unset/default" (ambiguous with 0-as-off
 
 Decision: Runtime scheduling state (`last_overt_turn`, `stalled_turns`), delivered plot move completion, deadline bending, and delayed/advanced/cancelled pressure effects are persisted in `arc.json`. Act outcomes are factual summaries of played exchanges and record-pass data, never the planner's planned beat text.
 
+This supersedes D-09's statement that `arc.json` is never modified during play:
+runtime fields and progress are persisted there without using difficulty bending
+as a planner revision.
+
 Alternatives considered: Keep scheduling state only in memory; replay the same due moves until manually retired; use planned beat text as if it were resolved play.
+
+---
+
+## D-19  Analyst fallback
+
+Decision: On timeout or error, the narrator receives a safe default brief using the frozen D-05 schema. A classified fallback reason is stored separately in `briefs.jsonl` metadata, not in the narrator prompt. This supersedes D-14's statement that the narrator receives no brief.
+
+Alternatives considered: Omit the brief entirely; include raw error text in the brief or narrator prompt.

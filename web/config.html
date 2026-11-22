@@ -30,14 +30,14 @@
   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
     <h2>⚙ Settings <small style="font-weight:400"><a href="/">← back to the game</a></small></h2>
     <div style="display:flex;gap:8px">
-      <button class="ghost" onclick="exportSettings()">Export JSON</button>
-      <input type="file" id="import-file" style="display:none" onchange="importSettings(event)">
-      <button class="ghost" onclick="$('import-file').click()">Import JSON</button>
+      <button class="ghost" data-action="export">Export JSON</button>
+      <input type="file" id="import-file" style="display:none">
+      <button class="ghost" data-action="import">Import JSON</button>
     </div>
   </div>
 
   <div class="help" id="path-label"></div>
-  <input id="config-search" placeholder="Search settings…" oninput="filterFields()" style="width:100%;margin-top:12px">
+  <input id="config-search" placeholder="Search settings…" style="width:100%;margin-top:12px">
 
   <div class="group-nav" id="group-nav"></div>
   <fieldset>
@@ -49,19 +49,19 @@
     <div class="row">
       <label for="campaign-new">New campaign</label>
       <input id="campaign-new" type="text">
-      <button class="ghost" onclick="createCampaign()">Create campaign</button>
+      <button class="ghost" data-action="create-campaign">Create campaign</button>
     </div>
     <div class="err" id="e_campaign"></div>
-    <button onclick="switchCampaign()">Switch &amp; restart</button>
-    <button class="ghost" onclick="restartServer()">Restart server</button>
+    <button data-action="switch-campaign">Switch &amp; restart</button>
+    <button class="ghost" data-action="restart">Restart server</button>
   </fieldset>
   <div id="form"></div>
 </div>
 
 <div id="bar-config">
-  <button onclick="saveAll()">Save</button>
-  <button class="ghost" onclick="saveTestAll()">Save &amp; Test</button>
-  <button class="ghost" onclick="resetDefaults()">Reset to defaults</button>
+  <button data-action="save">Save</button>
+  <button class="ghost" data-action="save-test">Save &amp; Test</button>
+  <button class="ghost" data-action="reset-defaults">Reset to defaults</button>
   <span class="dirty-tag" id="dirty-tag">● Unsaved changes</span>
   <span id="status" style="font-size:0.85em;color:var(--text-muted);white-space:pre-wrap"></span>
 </div>
@@ -169,9 +169,9 @@ async function restartServer() {
 
 function renderGroups() {
   const groups = Array.from(new Set(meta.fields.map(f => f.group)));
-  let h = `<button class="ghost" onclick="showGroup('all')">All</button>`;
+  let h = `<button class="ghost" data-group-filter="all">All</button>`;
   groups.forEach(g => {
-    h += `<button class="ghost" onclick="showGroup('${esc(g)}')">${esc(g)}</button>`;
+    h += `<button class="ghost" data-group-filter="${esc(g)}">${esc(g)}</button>`;
   });
   $('group-nav').innerHTML = h;
 }
@@ -205,18 +205,18 @@ function render() {
       const id = 'f_' + f.key;
       let input;
       if (f.type === 'bool') {
-        input = `<input type="checkbox" id="${id}" ${v ? 'checked' : ''} onchange="markDirty()">`;
+        input = `<input type="checkbox" id="${id}" ${v ? 'checked' : ''}>`;
       } else if (f.type === 'select') {
-        const opts = (f.options || []).map(o => `<option value="${o}" ${v === o ? 'selected' : ''}>${o}</option>`).join('');
-        input = `<select id="${id}" onchange="markDirty()">${opts}</select>`;
+        const opts = (f.options || []).map(o => `<option value="${esc(o)}" ${v === o ? 'selected' : ''}>${esc(o)}</option>`).join('');
+        input = `<select id="${id}">${opts}</select>`;
       } else if (f.type === 'text') {
-        input = `<textarea id="${id}" rows="6" oninput="markDirty()">${esc(v)}</textarea>`;
+        input = `<textarea id="${id}" rows="6">${esc(v)}</textarea>`;
       } else if (f.type === 'secret') {
-        input = `<input id="${id}" type="password" autocomplete="off" placeholder="${meta.secret_set[f.key] ? '(set — leave blank to keep)' : '(not set)'}" oninput="markDirty()">`;
+        input = `<input id="${id}" type="password" autocomplete="off" placeholder="${meta.secret_set[f.key] ? '(set — leave blank to keep)' : '(not set)'}">`;
       } else if (f.type === 'int' || f.type === 'float') {
-        input = `<input id="${id}" type="number" step="${f.type === 'int' ? 1 : 'any'}" value="${esc(v)}" oninput="markDirty()">`;
+        input = `<input id="${id}" type="number" step="${f.type === 'int' ? 1 : 'any'}" value="${esc(v)}">`;
       } else {
-        input = `<input id="${id}" type="text" value="${esc(v)}" oninput="markDirty()">`;
+        input = `<input id="${id}" type="text" value="${esc(v)}">`;
       }
       const dflt = f.type === 'secret' ? '' : ` <i>default: ${esc(f.default === '' ? '(empty)' : String(f.default).slice(0, 60))}</i>`;
       const scopeBadge = `<span class="badge badge-scope">${f.scope || 'global'}</span>`;
@@ -225,7 +225,7 @@ function render() {
         <div class="row" id="row_${f.key}">
           <div class="row-header">
             <label for="${id}">${esc(f.label)} ${scopeBadge} ${restartBadge}</label>
-            <button class="ghost" style="padding:1px 6px;font-size:0.7em" onclick="resetField('${f.key}')" title="Reset field to default">reset</button>
+            <button class="ghost" style="padding:1px 6px;font-size:0.7em" data-reset-field="${esc(f.key)}" title="Reset field to default">reset</button>
           </div>
           ${input}
           <div class="help">${esc(f.help || '')}${dflt}</div>
@@ -352,6 +352,25 @@ function importSettings(evt) {
   reader.readAsText(file);
 }
 
+document.addEventListener('click', e => {
+  const group = e.target.closest('[data-group-filter]');
+  if (group) { showGroup(group.dataset.groupFilter); return; }
+  const reset = e.target.closest('[data-reset-field]');
+  if (reset) { resetField(reset.dataset.resetField); return; }
+  const button = e.target.closest('[data-action]');
+  if (!button) return;
+  const actions = {
+    export: exportSettings, import: () => $('import-file').click(),
+    'create-campaign': createCampaign, 'switch-campaign': switchCampaign,
+    restart: restartServer, save: saveAll, 'save-test': saveTestAll,
+    'reset-defaults': resetDefaults
+  };
+  if (actions[button.dataset.action]) actions[button.dataset.action]();
+});
+$('config-search').addEventListener('input', filterFields);
+$('import-file').addEventListener('change', importSettings);
+$('form').addEventListener('input', markDirty);
+$('form').addEventListener('change', markDirty);
 load();
 </script>
 </body>

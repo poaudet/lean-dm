@@ -41,6 +41,18 @@ def test_new_config_fields_have_defaults(tmp_path):
     assert c.web_password == ""
 
 
+def test_obsolete_record_wait_setting_is_ignored_on_save(tmp_path):
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"record_wait_sec": 9, "model": "existing"}), encoding="utf-8")
+    c = cfg_module.Config(settings_file)
+    assert c.model == "existing"
+    assert "record_wait_sec" not in c.public()["values"]
+    c.save()
+    saved = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert saved["model"] == "existing"
+    assert "record_wait_sec" not in saved
+
+
 # ---------------------------------------------------------------------------
 # 2. Select type coercion
 # ---------------------------------------------------------------------------

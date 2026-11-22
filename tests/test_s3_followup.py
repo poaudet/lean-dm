@@ -1,3 +1,4 @@
+import base64
 import io
 import zipfile
 
@@ -17,6 +18,27 @@ def test_health_endpoint_bypasses_basic_auth(monkeypatch):
     monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "web_password": "secret"})
     with dm.app.test_client() as client:
         assert client.get("/healthz").status_code == 200
+
+
+def test_failed_basic_auth_is_throttled_before_posts_or_gets(monkeypatch):
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "web_password": "secret"})
+    monkeypatch.setattr(dm, "AUTH_FAILURES", {})
+    now = [100.0]
+    monkeypatch.setattr(dm, "monotonic", lambda: now[0])
+    bad = {"Authorization": "Basic " + base64.b64encode(b":wrong").decode("ascii")}
+    good = {"Authorization": "Basic " + base64.b64encode(b":secret").decode("ascii")}
+
+    with dm.app.test_client() as client:
+        assert client.get("/").status_code == 401
+        for _ in range(10):
+            assert client.get("/", headers=bad).status_code == 401
+        blocked = client.post("/api/turn", headers=good, json={"text": "move"})
+        assert blocked.status_code == 429
+        assert int(blocked.headers["Retry-After"]) > 0
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/", headers=good, environ_overrides={"REMOTE_ADDR": "127.0.0.2"}).status_code == 200
+        now[0] += 60
+        assert client.get("/", headers=good).status_code == 200
 
 
 def test_loopback_web_bind_does_not_require_password(monkeypatch):

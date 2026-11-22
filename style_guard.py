@@ -1,9 +1,12 @@
 """Deterministic style repetition guard."""
+from __future__ import annotations
+
 import re
 from collections import Counter
+from collections.abc import Mapping, Sequence
 
 
-def compute_style_guard(history):
+def compute_style_guard(history: Sequence[Mapping[str, str]]) -> list[str]:
     dm_msgs = [message["content"] for message in history if message.get("role") == "assistant"]
     if not dm_msgs:
         return []
@@ -14,7 +17,7 @@ def compute_style_guard(history):
             opener = " ".join(words[:5])
             if opener and opener not in openers:
                 openers.append(opener)
-    counts = Counter()
+    counts: Counter[str] = Counter()
     for message in dm_msgs[-12:]:
         words = re.findall(r"\b[A-Za-z0-9'-]+\b", message.lower())
         for index in range(len(words) - 2):

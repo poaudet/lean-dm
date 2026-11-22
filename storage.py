@@ -1,13 +1,17 @@
 """Shared text and JSON response helpers."""
+from __future__ import annotations
+
 import json
 import os
 import pathlib
 import re
 import threading
 import uuid
+from collections.abc import Iterable
+from typing import Any
 
 
-def atomic_write(path, text, mode=None):
+def atomic_write(path: str | os.PathLike[str], text: str, mode: int | None = None) -> None:
     path = pathlib.Path(path)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -19,7 +23,7 @@ def atomic_write(path, text, mode=None):
         tmp.unlink(missing_ok=True)
 
 
-def append_jsonl(path, items):
+def append_jsonl(path: str | os.PathLike[str], items: Iterable[object]) -> None:
     path = pathlib.Path(path)
     data = "".join(
         (item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)) + "\n"
@@ -34,11 +38,11 @@ def append_jsonl(path, items):
         stream.write(data)
 
 
-def replace_lines(path, lines):
+def replace_lines(path: str | os.PathLike[str], lines: Iterable[str]) -> None:
     atomic_write(path, "".join(line + "\n" for line in lines))
 
 
-def clean_reply(text):
+def clean_reply(text: str | None) -> str:
     """Strip reasoning blocks that some models emit inline."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
     if "</think>" in text:
@@ -46,7 +50,7 @@ def clean_reply(text):
     return text.split("<think>", 1)[0].strip()
 
 
-def parse_json_response(raw):
+def parse_json_response(raw: str | None) -> Any:
     """Parse the first JSON object or array in a model response."""
     text = clean_reply(raw)
     decoder = json.JSONDecoder()

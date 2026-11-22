@@ -345,55 +345,6 @@ def apply_played_moves(arc, played_moves, turn):
 
 
 # ---------------------------------------------------------------------------
-# Planner Validation & Act Boundary
-# ---------------------------------------------------------------------------
-
-def validate_planner_revision(old_arc, new_arc):
-    """Validate planner output diff against invariants (A6).
-
-    Reject any change to done beats, recorded outcomes, or central_question
-    unless explicitly resolved.
-    """
-    if not isinstance(new_arc, dict):
-        return False, "Planner output is not a JSON object"
-
-    # Central question check
-    if old_arc.get("central_question") != new_arc.get("central_question"):
-        if not new_arc.get("central_question_resolved"):
-            return False, "central_question altered without central_question_resolved: true"
-
-    # Verify done beats in old acts were not altered or dropped
-    old_acts_by_n = {a["n"]: a for a in old_arc.get("acts", [])}
-    new_acts_by_n = {a["n"]: a for a in new_arc.get("acts", [])}
-
-    for n, old_act in old_acts_by_n.items():
-        if n not in new_acts_by_n:
-            return False, f"Act {n} was removed in new plan"
-        new_act = new_acts_by_n[n]
-
-        # Outcomes check: existing outcomes cannot be changed
-        old_outcomes = old_act.get("outcomes", [])
-        new_outcomes = new_act.get("outcomes", [])
-        if len(new_outcomes) < len(old_outcomes):
-            return False, f"Outcomes for Act {n} were deleted"
-        for i, o in enumerate(old_outcomes):
-            if new_outcomes[i] != o:
-                return False, f"Outcome {i} for Act {n} was modified"
-
-        # Done beats check: done beats must remain done and untouched
-        old_done_beats = {b["id"]: b for b in old_act.get("beats", []) if b.get("status") == "done"}
-        new_beats_by_id = {b["id"]: b for b in new_act.get("beats", [])}
-        for bid, ob in old_done_beats.items():
-            if bid not in new_beats_by_id:
-                return False, f"Done beat {bid} was deleted in Act {n}"
-            nb = new_beats_by_id[bid]
-            if nb.get("status") != "done":
-                return False, f"Done beat {bid} changed status to {nb.get('status')}"
-
-    return True, "Valid"
-
-
-# ---------------------------------------------------------------------------
 # Planning: Initial Arc & Act Planning Prompts
 # ---------------------------------------------------------------------------
 

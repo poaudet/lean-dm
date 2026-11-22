@@ -91,43 +91,6 @@ def test_deadline_slip_table():
 
 
 # ---------------------------------------------------------------------------
-# 2. Revision guard: Planner altering done beats or outcomes is rejected (A6)
-# ---------------------------------------------------------------------------
-
-def test_act_boundary_revision_guard():
-    old_arc = json.loads(json.dumps(SAMPLE_ARC))
-    old_arc["acts"][0]["beats"][0]["status"] = "done"
-    old_arc["acts"][0]["outcomes"] = ["Messenger was found dead."]
-
-    # Valid revision: keeps done beats and outcomes
-    new_arc = json.loads(json.dumps(old_arc))
-    new_arc["acts"][0]["beats"][1]["status"] = "done"
-    ok, msg = arc.validate_planner_revision(old_arc, new_arc)
-    assert ok is True
-
-    # Invalid: removes or alters a done beat
-    bad_arc1 = json.loads(json.dumps(old_arc))
-    bad_arc1["acts"][0]["beats"][0]["status"] = "pending"
-    ok, msg = arc.validate_planner_revision(old_arc, bad_arc1)
-    assert ok is False
-    assert "Done beat" in msg
-
-    # Invalid: alters past outcomes
-    bad_arc2 = json.loads(json.dumps(old_arc))
-    bad_arc2["acts"][0]["outcomes"] = ["A completely different outcome."]
-    ok, msg = arc.validate_planner_revision(old_arc, bad_arc2)
-    assert ok is False
-    assert "Outcome 0" in msg
-
-    # Invalid: alters central_question without resolved flag
-    bad_arc3 = json.loads(json.dumps(old_arc))
-    bad_arc3["central_question"] = "Can we bake a pie?"
-    ok, msg = arc.validate_planner_revision(old_arc, bad_arc3)
-    assert ok is False
-    assert "central_question" in msg
-
-
-# ---------------------------------------------------------------------------
 # 3. Act boundary accepted writes arc_log.jsonl (A6)
 # ---------------------------------------------------------------------------
 

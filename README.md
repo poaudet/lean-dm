@@ -9,8 +9,8 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 ## Features (v4)
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
-- **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Background record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
-- **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play.
+- **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
+- **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
 - **Out-of-Character (OOC) Notes Routing (P2)**: Messages starting with `//`, `ooc`, or `note to dm:` bypass `history.jsonl` and are answered out of character in `notes.jsonl`. Promoted to canon only upon explicit request.
 - **Writing Style Enforcement & Style Guard (P1)**: Style presets in `styles/` (`subtle`, `pulp`, `noir`, `terse`) with word count ranges, push factor, and style notes. Pure deterministic `style_guard` prevents repetitive sentence openers and overused 3-grams.
 - **Modern Responsive Web UI & SSE Streaming (P4)**: Dark/light themes, mobile drawer, textarea auto-grow, SSE streaming (`/api/stream`), live stage indicators (`analyzing` → `narrating` → `recording`), premise/ledger/notes editors, HTTP Basic auth, and campaign transcript export.
@@ -26,6 +26,8 @@ lean-dm/
 ├── analyst.py                # Pre-turn director's brief & OOC notes routing
 ├── arc.py                    # Hidden arc planning, difficulty scheduling & record pass
 ├── campaign.py               # Campaign filesystem paths and locks
+├── ledger.py                 # Canon ledger operations and rendering
+├── narrator_context.py       # Narrator context and style instructions
 ├── storage.py                # Atomic writes, JSONL append, and model JSON parsing
 ├── style_guard.py            # Deterministic style repetition guard
 ├── styles/                   # Markdown writing style presets
@@ -38,7 +40,7 @@ lean-dm/
 │   ├── config.html
 │   ├── app.js
 │   └── style.css
-├── decisions.md              # Architecture decision records (D-01 through D-18)
+├── decisions.md              # Architecture decision records (D-01 through D-19)
 ├── Dockerfile                # Container definition
 ├── docker-compose.yaml
 └── campaigns/
@@ -90,8 +92,11 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `style_guard` | bool | `false` | campaign | Style | Prevent repetitive openers and trigrams |
 | `analyst_enabled` | bool | `false` | campaign | Analyst | Generate pre-turn director's brief |
 | `analyst_timeout_sec` | int | `25` | global | Reliability | Analyst timeout in seconds |
-| `notes_routing` | bool | `false` | campaign | Notes | Intercept OOC notes (`//`, `ooc:`) |
+| `notes_routing` | bool | `false` | campaign | Notes | Intercept OOC notes (`//`, `ooc`, `note to dm:`) |
 | `web_password` | secret | `""` | global | App | HTTP Basic authentication password |
+
+Arc recording runs synchronously to keep undo and retry ordered. The unused
+`record_wait_sec` setting is ignored and removed on the next settings save.
 
 ---
 
@@ -100,6 +105,10 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 The web server refuses to start on a non-loopback address unless `web_password` is
 configured. For local-only use, set `host` to `127.0.0.1`; for Docker or other
 network access, configure `DM_WEB_PASSWORD` before starting the container.
+When using the Compose bind mount, ensure the host `campaigns/` directory is
+writable by the image's non-root `dm` user.
+After ten failed authentication attempts, further attempts from that address
+are temporarily throttled; the healthcheck remains available.
 
 ```bash
 # Start in terminal mode
@@ -161,14 +170,17 @@ python dm.py --show-context
 Tests run using pytest and use temporary isolated directories via `DM_CAMPAIGNS_DIR`. They mock LLM API calls and never touch real campaigns.
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python -m pytest tests/
+ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py storage.py style_guard.py
+mypy --strict campaign.py storage.py style_guard.py
 ```
 
 Test coverage:
 - `tests/test_p0.py`: Characterization baseline (golden context, undo/retry guards, atomic order).
 - `tests/test_p1.py`: Config schema, campaign overlay, writing style injection, deterministic style guard, word counting.
 - `tests/test_p2.py`: Analyst briefs, timeouts, fallbacks, OOC notes routing, canon promotion.
-- `tests/test_p3.py`: Hidden arc, scheduling, difficulty bending table, revision diff guards, sentinel leak tests.
+- `tests/test_p3.py`: Hidden arc, scheduling, difficulty bending table, and sentinel leak tests.
 - `tests/test_p4.py`: Web UI assets, SSE streaming, HTTP Basic auth, premise/ledger editing, ZIP and transcript exports.
 
 ---

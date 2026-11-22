@@ -53,6 +53,12 @@ import analyst
 import arc
 from campaign import Campaign
 from config import SETTINGS_PATH, cfg
+from ledger import KINDS as KINDS
+from ledger import _lst as _lst
+from ledger import apply_ledger_ops, render_ledger
+from ledger import slug as slug
+from narrator_context import assemble_context
+from narrator_context import merge_same_role as merge_same_role
 from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
 from style_guard import compute_style_guard
 
@@ -98,8 +104,9 @@ MAINT_THREAD = None
 JOB = {"name": "", "running": False, "msg": ""}
 LAST = {"est": 0, "prompt_tokens": None, "cached": None}
 POST_COUNTS = defaultdict(lambda: deque())
+AUTH_FAILURES = {}
+AUTH_FAILURE_LOCK = threading.Lock()
 
-KINDS = ("player", "person", "place", "item", "promise", "clock", "rule", "thread")
 RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
 
 
@@ -216,131 +223,14 @@ def tok(n_chars):
 def est_tokens(msgs):
     return tok(sum(len(m["content"]) for m in msgs))
 
-def slug(s):
-    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:48]
-
-def _lst(x):
-    return x if isinstance(x, list) else []
-
-def apply_ledger_ops(ledger, ops):
-    by = {e["id"]: e for e in ledger}
-    for u in _lst(ops.get("upsert")):
-        if not isinstance(u, dict):
-            continue
-        eid = slug(u.get("id") or u.get("name") or "")
-        if not eid or not str(u.get("state", "")).strip():
-            continue
-        e = by.get(eid) or {"id": eid}
-        if e.get("pinned"):                             # D-12: skip pinned entries
-            continue
-        kind = str(u.get("kind", "")).strip().lower()
-        e["kind"] = kind if kind in KINDS else e.get("kind", "thread")
-        e["name"] = str(u.get("name") or e.get("name") or eid).strip()
-        e["state"] = str(u["state"]).strip()
-        src = str(u.get("src", "")).strip().lower()
-        e["src"] = src if src in ("player", "dm", "note") else e.get("src", "dm")
-        try:
-            e["msg"] = int(u.get("msg"))
-        except (TypeError, ValueError):
-            e.setdefault("msg", None)
-        e["status"] = "active"                          # an upsert reopens a closed entry
-        by[eid] = e
-    for i in _lst(ops.get("close")):
-        s_id = slug(i)
-        if s_id in by and not by[s_id].get("pinned"):
-            by[s_id]["status"] = "closed"
-    for i in _lst(ops.get("delete")):
-        s_id = slug(i)
-        if s_id in by and not by[s_id].get("pinned"):
-            by.pop(s_id, None)
-    out = list(by.values())
-    if len(out) > cfg.ledger_max:                       # over the cap: oldest CLOSED entries go first
-        closed = sorted((e for e in out if e.get("status") == "closed" and not e.get("pinned")), key=lambda e: e.get("msg") or 0)
-        drop = {e["id"] for e in closed[: len(out) - cfg.ledger_max]}
-        out = [e for e in out if e["id"] not in drop]
-    return out
-
-def render_ledger(ledger):
-    if not ledger:
-        return ""
-    order = {k: i for i, k in enumerate(KINDS)}
-    act = sorted((e for e in ledger if e.get("status") != "closed"),
-                 key=lambda e: (order.get(e.get("kind"), 99), str(e.get("name", ""))))
-    closed = sorted((e for e in ledger if e.get("status") == "closed"),
-                    key=lambda e: e.get("msg") or 0)[-cfg.ledger_closed_max:] if cfg.ledger_closed_max else []
-    lines, cur = [], None
-    for e in act:
-        if e.get("kind") != cur:
-            cur = e.get("kind")
-            lines.append(f"[{str(cur).upper()}]")
-        lines.append(f"- {e.get('name')}: {e.get('state')}")
-    if closed:
-        lines.append("[PAST / RESOLVED — do not revive]")
-        lines += [f"- {e.get('name')}: {e.get('state')}" for e in closed]
-    return "\n".join(lines)
-
-def merge_same_role(msgs):
-    out = []
-    for m in msgs:
-        if out and out[-1]["role"] == m["role"]:
-            out[-1] = {"role": m["role"], "content": out[-1]["content"] + "\n\n" + m["content"]}
-        else:
-            out.append(m)
-    return out
-
 def build_context(history, brief=None):
-    """history must end with the pending player action."""
+    """Build the narrator prompt for history ending in the pending player action."""
     k = folded()
-    parts = [cfg.system_prompt]
-    if p := read(PREMISE):
-        parts.append("PREMISE (fixed canon):\n" + p)
-    if cfg.style_enabled:
-        style_parts = []
-        preset = cfg.style_preset
-        if preset and preset != "none":
-            preset_file = pathlib.Path(__file__).parent / "styles" / f"{preset}.md"
-            if preset_file.exists():
-                style_parts.append(preset_file.read_text(encoding="utf-8").strip())
-        if cfg.style_words_min > 0 or cfg.style_words_max > 0:
-            if cfg.style_words_min > 0 and cfg.style_words_max > 0:
-                style_parts.append(f"Target length: {cfg.style_words_min}–{cfg.style_words_max} words per reply.")
-            elif cfg.style_words_max > 0:
-                style_parts.append(f"Target length: at most {cfg.style_words_max} words per reply.")
-            else:
-                style_parts.append(f"Target length: at least {cfg.style_words_min} words per reply.")
-        if cfg.style_push >= 0:
-            style_parts.append(f"Style push: {cfg.style_push}/100.")
-        if cfg.style_notes and cfg.style_notes.strip():
-            style_parts.append("Style notes:\n" + cfg.style_notes.strip())
-        style_parts.append(
-            "Rules: Every reply must end on a concrete new development or decision point, "
-            "avoid recapping the player's action, and keep atmosphere to the minority of sentences."
-        )
-        parts.append("STYLE:\n" + "\n\n".join(style_parts))
-    if k and (s := read(SUMMARY)):
-        parts.append("STORY SO FAR (older play, already summarized; everything after it is verbatim below):\n" + s)
-    tail = history[min(k, len(history) - 1):]
-    if tail and tail[0]["role"] == "assistant":         # only if history parity was ever disturbed
-        tail = tail[1:]
-    msgs = merge_same_role(tail)
-    canon = render_ledger(load_ledger()) if cfg.ledger_enabled else ""
-    if canon and msgs and msgs[-1]["role"] == "user":   # volatile part goes LAST to keep the prefix cacheable
-        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                    "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
-                    "of earlier turns, the ledger wins. Never mention it to the player.\n" + canon}
-    if cfg.style_guard and msgs and msgs[-1]["role"] == "user":
-        guard = compute_style_guard(history)
-        if guard:
-            msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                        "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
-    if brief and msgs and msgs[-1]["role"] == "user":
-        brief_text = json.dumps(brief, ensure_ascii=False, indent=1)
-        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                    "\n\n---\nDIRECTOR'S BRIEF (never mention it to the player):\n" + brief_text}
-    if canon and msgs and msgs[-1]["role"] == "user":
-        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
-                    "\n\n--- end of ledger: now narrate the outcome of the player's action above."}
-    return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
+    return assemble_context(
+        history, brief, folded_count=k, premise=read(PREMISE),
+        summary=read(SUMMARY) if k else "",
+        canon=render_ledger(load_ledger()) if cfg.ledger_enabled else "",
+    )
 
 def ctx_label():
     est, real = LAST["est"], LAST["prompt_tokens"]
@@ -1025,10 +915,32 @@ def check_auth():
         return None
     if not cfg.web_password:
         return None
-    auth = request.authorization
-    if not auth or not auth.password or not hmac.compare_digest(
-            auth.password.encode("utf-8"), cfg.web_password.encode("utf-8")):
+    if not request.headers.get("Authorization"):
         return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
+
+    auth = request.authorization
+    valid = bool(auth and auth.password and hmac.compare_digest(
+        auth.password.encode("utf-8"), cfg.web_password.encode("utf-8")))
+    now = monotonic()
+    address = request.remote_addr or ""
+    with AUTH_FAILURE_LOCK:
+        failures = AUTH_FAILURES.get(address)
+        if failures:
+            while failures and now - failures[0] >= 60:
+                failures.popleft()
+            if len(failures) >= 10:
+                retry_after = str(max(1, int(60 - (now - failures[0])) + 1))
+                return Response("Too many authentication attempts", 429, {"Retry-After": retry_after})
+        if valid:
+            AUTH_FAILURES.pop(address, None)
+            return None
+        if not failures:
+            if address not in AUTH_FAILURES and len(AUTH_FAILURES) >= 1024:
+                oldest = min(AUTH_FAILURES, key=lambda key: AUTH_FAILURES[key][-1] if AUTH_FAILURES[key] else 0)
+                del AUTH_FAILURES[oldest]
+            failures = AUTH_FAILURES[address] = deque()
+        failures.append(now)
+    return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
 
 @app.before_request
 def guard_admin():
@@ -1038,7 +950,8 @@ def guard_admin():
         return jsonify({"ok": False, "error": "cross-origin request refused", "errors": {}}), 403
     if not config_locked():
         return None
-    scope = request.args.get("scope") or (request.get_json(silent=True) or {}).get("scope") or "global"
+    body = request.get_json(silent=True)
+    scope = request.args.get("scope") or (body.get("scope") if isinstance(body, dict) else None) or "global"
     if request.path == "/api/restart" or (request.path == "/api/config" and scope != "campaign"):
         msg = ("Global settings and restart are disabled while the server is reachable without a "
                "web_password. Set one (DM_WEB_PASSWORD or settings.json) or bind to 127.0.0.1.")
@@ -1166,6 +1079,8 @@ def api_premise():
 @app.route("/api/ledger", methods=["POST"])
 def api_ledger_action():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "unknown action"}), 400
     action = body.get("action")
     if action not in ("pin", "delete", "upsert"):
         return jsonify({"ok": False, "error": "unknown action"}), 400

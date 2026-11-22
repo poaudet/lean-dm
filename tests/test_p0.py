@@ -6,6 +6,9 @@ All tests:
 - Never touch the real campaigns/ directory.
 """
 import json
+import subprocess
+import sys
+
 import pytest
 
 import dm
@@ -391,17 +394,18 @@ def test_config_old_file_loads(tmp_path):
 
 def test_dm_campaigns_dir_override(monkeypatch, tmp_path):
     custom_dir = tmp_path / "my_campaigns"
-    custom_dir.mkdir()
+    custom_root = custom_dir / "sandbox"
+    custom_root.mkdir(parents=True)
     monkeypatch.setenv("DM_CAMPAIGNS_DIR", str(custom_dir))
-
-    # Bind the imported module to the relocated campaign directory and exercise I/O.
-    context = dm.bind_campaign(custom_dir, dm.CAMPAIGN)
-    custom_root = context.root
-    custom_root.mkdir(parents=True, exist_ok=True)
-
-    # Verify that load_history reads from the custom path
+    monkeypatch.setenv("DM_SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("CAMPAIGN", "sandbox")
     test_msg = {"role": "user", "content": "hello from custom dir"}
     (custom_root / "history.jsonl").write_text(json.dumps(test_msg) + "\n", encoding="utf-8")
-    history = dm.load_history()
-    assert len(history) == 1
-    assert history[0]["content"] == "hello from custom dir"
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import json, dm; print(json.dumps([str(dm.ROOT), dm.load_history()]))"],
+        check=True, capture_output=True, text=True,
+    )
+    root, history = json.loads(result.stdout)
+    assert root == str(custom_root)
+    assert history == [test_msg]

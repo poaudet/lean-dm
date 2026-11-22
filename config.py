@@ -84,7 +84,6 @@ FIELDS = [
     F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", scope="global", min=10),
     F("analyst_timeout_sec", "Analyst timeout (s)", "int", 25, "Reliability", "Timeout for analyst call in seconds.", scope="global", min=1),
     F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
-    F("record_wait_sec", "Record wait (s)", "int", 3, "Reliability", "Max seconds analyst waits for record pass.", scope="global", min=0),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
