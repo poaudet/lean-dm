@@ -8,9 +8,12 @@ Doctrine:
 - Pure scheduling function allowed_moves() is unit-tested without LLM calls.
 """
 import json
+import logging
 
 from config import cfg
 from storage import append_jsonl, atomic_write, parse_json_response, replace_lines
+
+logger = logging.getLogger(__name__)
 
 # Difficulty parameters
 # Min turns between overt moves
@@ -67,7 +70,7 @@ def load_arc(root):
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict) and "version" in data and "acts" in data:
-            return data
+            return normalize_arc(data)
     except (ValueError, OSError):
         pass
     return None
@@ -94,14 +97,26 @@ def snapshot_arc(root, msg_idx):
 def restore_arc_snapshot(root, msg_idx):
     """Restore arc state from snapshot for the given msg_idx."""
     snap_p = arc_snap_dir(root) / f"{int(msg_idx)}.json"
-    if snap_p.exists():
-        try:
-            data = json.loads(snap_p.read_text(encoding="utf-8"))
-            save_arc(root, data)
-            return True
-        except Exception:
-            pass
+    if not snap_p.exists():
+        logger.warning("arc snapshot %s is missing; the arc was not rewound", snap_p.name)
+        return False
+    try:
+        data = json.loads(snap_p.read_text(encoding="utf-8"))
+        save_arc(root, data)
+        return True
+    except Exception as e:
+        logger.warning("arc snapshot %s is unreadable: %s", snap_p.name, e)
     return False
+
+
+def prune_arc_snapshots(root, below):
+    """Delete snapshots for msg indexes < below (undo can never reach them)."""
+    d = root / "arc_snap"
+    if not d.is_dir():
+        return
+    for f in d.glob("*.json"):
+        if f.stem.isdigit() and int(f.stem) < below:
+            f.unlink(missing_ok=True)
 
 
 # Files that make up the mutable arc runtime state (used to roll back a failed retry).
@@ -201,8 +216,8 @@ def get_arc_chip(arc):
     act_n = arc.get("act", 1)
     acts = arc.get("acts", [])
     status = "active"
-    for a in acts:
-        if a.get("n") == act_n:
+    for a in acts if isinstance(acts, list) else []:
+        if isinstance(a, dict) and a.get("n") == act_n:
             status = a.get("status", "active")
             break
     return f"Act {act_n} · {status}"
@@ -219,7 +234,7 @@ def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stal
     Returns: list of dicts: [{"id": step_id, "how": "overt|subtle", "note": text, "pressure_id": pid}]
     Hard cap: <= 2 plot moves returned.
     """
-    if not arc or not isinstance(arc, dict):
+    if not arc or not isinstance(arc, dict) or arc.get("terminal"):
         return []
 
     diff = difficulty.lower() if difficulty in ("story", "standard", "hard") else "standard"
@@ -384,6 +399,71 @@ PLANNER_SYSTEM = (
 )
 
 
+def _num(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _dicts(value):
+    return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+
+def normalize_beats(beats, act_n=1):
+    out = []
+    for i, b in enumerate(_dicts(beats), start=1):
+        b = dict(b)
+        b["id"] = str(b.get("id") or f"a{act_n}b{i}")
+        b["text"] = str(b.get("text") or "")
+        b["status"] = b.get("status") if b.get("status") in ("pending", "done") else "pending"
+        out.append(b)
+    return out
+
+
+def normalize_arc(arc):
+    """Coerce a planner-produced arc into the shape the scheduler expects; drops malformed acts, beats and steps."""
+    if not isinstance(arc, dict):
+        raise ValueError("arc is not an object")
+    arc = dict(arc)
+    acts = []
+    for a in _dicts(arc.get("acts")):
+        a = dict(a)
+        n = _num(a.get("n"), None)
+        if n is None:
+            continue
+        a["n"] = n
+        a["beats"] = normalize_beats(a.get("beats"), n)
+        acts.append(a)
+    arc["acts"] = acts
+    pressures = []
+    for p in _dicts(arc.get("pressures")):
+        p = dict(p)
+        steps = []
+        for s in _dicts(p.get("steps")):
+            s = dict(s)
+            if s.get("at_minutes") is None or _num(s.get("at_minutes"), None) is None:
+                continue
+            s["at_minutes"] = _num(s["at_minutes"])
+            steps.append(s)
+        p["steps"] = steps
+        for key in ("deadline_minutes", "effective_deadline_minutes"):
+            if key in p:
+                n = _num(p[key], None)
+                if n is None:
+                    del p[key]
+                else:
+                    p[key] = n
+        pressures.append(p)
+    arc["pressures"] = pressures
+    clock = arc.get("clock")
+    arc["clock"] = {**(clock if isinstance(clock, dict) else {}),
+                    "minutes": _num((clock or {}).get("minutes") if isinstance(clock, dict) else 0)}
+    if "act" in arc:
+        arc["act"] = _num(arc["act"], 1)
+    return arc
+
+
 def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     """Generate initial arc.json via planner model."""
     model = cfg.planner_model or cfg.scribe_model or cfg.model
@@ -408,8 +488,8 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     arc = parse_json_response(raw)
     if not isinstance(arc, dict):
         raise ValueError("planner response did not contain a JSON object")
-    # Validate minimal fields
-    if not arc.get("central_question") or not arc.get("acts"):
+    arc = normalize_arc(arc)
+    if not arc.get("central_question") or not arc["acts"]:
         raise ValueError("Invalid arc structure generated by planner")
     arc["version"] = 1
     arc["revision"] = 0
@@ -444,6 +524,10 @@ def _clamp_elapsed(value, default=5, lo=1, hi=120):
     except (TypeError, ValueError, OverflowError):
         return default
     return max(lo, min(hi, n))
+
+
+def _is_last_act(arc, act_n):
+    return act_n >= max((_num(a.get("n")) for a in _dicts(arc.get("acts"))), default=act_n)
 
 
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
@@ -553,7 +637,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     pending_beats = [b for b in active_act.get("beats", []) if b.get("status") == "pending"]
     if not pending_beats and active_act.get("beats"):
         act_complete = True
-    if act_n == 3 and not central_question_resolved:
+    if _is_last_act(arc, act_n) and not central_question_resolved:
         act_complete = False
 
     words = len(dm_reply.split())
@@ -653,13 +737,13 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
                     {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
                     {"role": "user", "content": prompt},
                 ], model=model, track=False, retries=1, fallback=True)
-                beats = parse_json_response(raw)
-                if isinstance(beats, list) and beats:
+                beats = normalize_beats(parse_json_response(raw), next_n)
+                if beats:
                     next_act["beats"] = beats
             except Exception:
                 next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications", "status": "pending"}]
     else:
-        arc["terminal"] = act_n == 3 and central_question_resolved
+        arc["terminal"] = bool(central_question_resolved)
         arc["central_question_resolved"] = central_question_resolved
 
     arc["revision"] = arc.get("revision", 0) + 1

@@ -13,6 +13,8 @@ def isolated_campaigns_dir(tmp_path, monkeypatch):
     campaigns.mkdir()
     monkeypatch.setenv("DM_CAMPAIGNS_DIR", str(campaigns))
     import dm
+    dm.POST_COUNTS.clear()
+    dm.AUTH_FAILURES.clear()
     previous = dm.CAMPAIGN_CONTEXT
     dm.bind_campaign(campaigns, dm.CAMPAIGN)
     yield campaigns

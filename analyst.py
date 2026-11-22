@@ -12,6 +12,7 @@ import concurrent.futures
 import copy
 import json
 import re
+import threading
 import time
 import uuid
 
@@ -258,25 +259,30 @@ def load_notes(root):
     return out
 
 
+NOTES_LOCK = threading.Lock()
+
+
 def save_note(root, note):
     p = notes_path(root)
-    append_jsonl(p, [note])
+    with NOTES_LOCK:
+        append_jsonl(p, [note])
 
 
 def update_note_canon(root, note_id, is_canon=True):
     p = notes_path(root)
-    if not p.exists():
-        return False
-    notes = load_notes(root)
-    found = False
-    for n in notes:
-        if n.get("id") == note_id:
-            n["canon"] = is_canon
-            found = True
-            break
-    if found:
-        replace_lines(p, [json.dumps(n, ensure_ascii=False) for n in notes])
-    return found
+    with NOTES_LOCK:
+        if not p.exists():
+            return False
+        notes = load_notes(root)
+        found = False
+        for n in notes:
+            if n.get("id") == note_id:
+                n["canon"] = is_canon
+                found = True
+                break
+        if found:
+            replace_lines(p, [json.dumps(n, ensure_ascii=False) for n in notes])
+        return found
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +311,8 @@ ANALYST_SYSTEM = (
 )
 
 
-def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn):
+def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
+                ledger_text="", act_goal=""):
     """Run analyst model call with timeout and fallback."""
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
     allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
@@ -318,7 +325,10 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         f"DIFFICULTY: {cfg.difficulty}\n"
         f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
         f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
-        f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n\n"
+        f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
+        + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
+        + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
+        + "\n"
         f"RECENT PLAY:\n{play_str}\n\n"
         f"PLAYER ACTION:\n{player_action}\n\n"
         "Output ONLY the JSON brief."

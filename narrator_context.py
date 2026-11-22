@@ -67,7 +67,7 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
         brief_text = json.dumps(brief, ensure_ascii=False, indent=1)
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nDIRECTOR'S BRIEF (never mention it to the player):\n" + brief_text}
-    if canon and has_player_action and has_extra_instructions:
+    if has_player_action and has_extra_instructions:
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\nNow narrate the outcome of the player's action above."}
     return [{"role": "system", "content": "\n\n".join(parts)}] + msgs

@@ -106,6 +106,7 @@ LAST = {"est": 0, "prompt_tokens": None, "cached": None}
 POST_COUNTS = defaultdict(lambda: deque())
 AUTH_FAILURES = {}
 AUTH_FAILURE_LOCK = threading.Lock()
+LEDGER_LOCK = threading.RLock()
 
 RETRY_CODES = (408, 425, 429, 500, 502, 503, 504)
 
@@ -435,8 +436,10 @@ def ledger_pass(upto=None):
             {"role": "user", "content": "CURRENT LEDGER:\n" + json.dumps(ledger, ensure_ascii=False) +
              "\n\nNEW PLAY (message index in brackets):\n" + fmt_play(h, a, b) + "\n\n" + LEDGER_PROMPT}],
             model=scribe_model(), track=False, **scribe_extra()))
-        ledger = apply_ledger_ops(ledger, parse_json_obj(raw))
-        atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
+        ops = parse_json_obj(raw)
+        with LEDGER_LOCK:                               # the model call took minutes; edits made meanwhile must survive
+            ledger = apply_ledger_ops(load_ledger(strict=True), ops)
+            atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
         set_state(ledgered=b)                           # pointer LAST, per range
         logger.info("Ledger recorded messages %s–%s; %s entries", a, b - 1, len(ledger))
 
@@ -518,7 +521,8 @@ def rebuild_ledger():
         h = load_history()
         if LEDGER.exists() and read(LEDGER) not in ("", "[]"):
             shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
-        atomic_write(LEDGER, "[]")
+        with LEDGER_LOCK:
+            atomic_write(LEDGER, "[]")
         set_state(ledgered=0)
         upto = max(0, len(h) - 2 * cfg.ledger_lag_turns)
         ledger_pass(upto=upto - upto % 2)
@@ -622,20 +626,33 @@ def _generate_stream(ctx):
         raise RuntimeError("model returned an empty reply")
     yield {"done": True, "dm": dm}
 
+def _act_goal():
+    if not cfg.arc_enabled:
+        return ""
+    arc_state = arc.load_arc(ROOT)
+    if not arc_state:
+        return ""
+    act = next((a for a in arc_state.get("acts", []) if a.get("n") == arc_state.get("act", 1)), {})
+    return str(act.get("goal") or "")
+
 def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
         return []
-    arc_state = arc.load_arc(ROOT)
-    if not arc_state:
+    try:
+        arc_state = arc.load_arc(ROOT)
+        if not arc_state:
+            return []
+        h = load_history() if history is None else history
+        turn = len(h) // 2 + 1
+        rt = arc_state.get("runtime") or {}
+        return arc.allowed_moves(
+            arc_state, cfg.difficulty, turn,
+            last_overt_turn=rt.get("last_overt_turn"),
+            stalled_turns=_int(rt.get("stalled_turns")),
+        )
+    except Exception as e:
+        logger.warning("Could not compute allowed plot moves; continuing without: %s", e)
         return []
-    h = load_history() if history is None else history
-    turn = len(h) // 2 + 1
-    rt = arc_state.get("runtime") or {}
-    return arc.allowed_moves(
-        arc_state, cfg.difficulty, turn,
-        last_overt_turn=rt.get("last_overt_turn"),
-        stalled_turns=_int(rt.get("stalled_turns")),
-    )
 
 def _record_kwargs(brief):
     """Return the record-pass arguments derived from the analyst brief."""
@@ -646,6 +663,30 @@ def _record_kwargs(brief):
         "intent": brief.get("intent", "act"),
         "analyst_act_complete": bool(brief.get("act_complete", False)),
     }
+
+def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
+    """Auto-plan a missing arc, then run the record pass for a committed turn."""
+    if not retry and arc.arc_is_corrupt(ROOT):
+        warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
+    elif not retry and not arc.load_arc(ROOT):
+        try:
+            new_arc = arc.plan_initial_arc(
+                read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
+                history + [user, {"role": "assistant", "content": dm}],
+                chat_complete
+            )
+            arc.save_arc(ROOT, new_arc)
+        except Exception as e:
+            logger.warning("Arc auto-planning failed: %s", e)
+    try:
+        arc.run_record_pass(ROOT, text, dm, msg_idx, chat_complete,
+                            history=played_history, **_record_kwargs(brief))
+    except Exception as e:
+        logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
+    try:
+        arc.prune_arc_snapshots(ROOT, max(folded(), ledgered()))
+    except OSError as e:
+        logger.warning("Could not prune arc snapshots: %s", e)
 
 def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
     """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
@@ -691,7 +732,8 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                 allowed = get_allowed_moves()
                 guard_items = compute_style_guard(history) if cfg.style_guard else []
                 brief, source, model_used, ms = analyst.run_analyst(
-                    ROOT, history, text, allowed, guard_items, chat_complete
+                    ROOT, history, text, allowed, guard_items, chat_complete,
+                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal()
                 )
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
@@ -730,24 +772,12 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
 
         if cfg.arc_enabled:
             if stream:
-                yield {"stage": "recording"}
-            if not retry and arc.arc_is_corrupt(ROOT):
-                warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-            elif not retry and not arc.load_arc(ROOT):
                 try:
-                    new_arc = arc.plan_initial_arc(
-                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
-                        history + [user, {"role": "assistant", "content": dm}],
-                        chat_complete
-                    )
-                    arc.save_arc(ROOT, new_arc)
-                except Exception as e:
-                    logger.warning("Arc auto-planning failed: %s", e)
-            try:
-                arc.run_record_pass(ROOT, text, dm, msg_idx, chat_complete,
-                                    history=played_history, **_record_kwargs(brief))
-            except Exception as e:
-                logger.warning("Arc record pass failed: %s", e)
+                    yield {"stage": "recording"}
+                except GeneratorExit:                   # client left: the turn is committed, keep the arc in step
+                    _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry)
+                    raise
+            _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry)
         yield {"done": True, "dm": dm}
     except BaseException:
         if retry and not committed and arc_backup is not None:
@@ -883,6 +913,9 @@ def game_state():
 # ---------------- web UI ----------------
 
 app = Flask(__name__)
+if os.environ.get("DM_TRUST_PROXY") == "1":                  # behind a TLS-terminating reverse proxy
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 WEB_DIR = pathlib.Path(__file__).parent / "web"
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -906,7 +939,7 @@ def validate_web_security():
     if cfg.host not in LOOPBACK_HOSTS and not cfg.web_password:
         raise RuntimeError(
             "Refusing to bind beyond loopback without web_password; set DM_WEB_PASSWORD "
-            "or bind to 127.0.0.1."
+            "(applies even with an existing settings.json) or bind to 127.0.0.1."
         )
 
 @app.before_request
@@ -1012,9 +1045,41 @@ def api_turn():
             return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 502
 
+class ThinkFilter:
+    """Hide <think>…</think> text from a live stream, tolerating tags split across chunks."""
+    def __init__(self):
+        self.buf, self.hidden = "", False
+
+    def feed(self, piece):
+        self.buf += piece
+        out = ""
+        while self.buf:
+            tag = "</think>" if self.hidden else "<think>"
+            i = self.buf.find(tag)
+            if i >= 0:
+                if not self.hidden:
+                    out += self.buf[:i]
+                self.buf, self.hidden = self.buf[i + len(tag):], not self.hidden
+                continue
+            keep = next((n for n in range(min(len(tag) - 1, len(self.buf)), 0, -1)
+                         if tag.startswith(self.buf[-n:])), 0)
+            if not self.hidden:
+                out += self.buf[:len(self.buf) - keep]
+            self.buf = self.buf[len(self.buf) - keep:]
+            break
+        return out
+
+    def flush(self):
+        out = "" if self.hidden else self.buf
+        self.buf = ""
+        return out
+
 @app.route("/api/stream", methods=["POST"])
 def api_stream():
-    ensure_configured()
+    try:
+        ensure_configured()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
     text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty"}), 400
@@ -1022,13 +1087,24 @@ def api_stream():
         return jsonify({"error": "turn already in progress"}), 409
 
     def event_stream():
-        for event in run_turn(text, stream=True, lock_acquired=True):
-            if event.get("stage"):
-                yield f"data: {json.dumps({'stage': event['stage']})}\n\n"
-            elif event.get("chunk"):
-                yield f"data: {json.dumps({'chunk': event['chunk']})}\n\n"
-            elif event.get("done") and event.get("ooc"):
-                yield f"data: {json.dumps({'chunk': event['dm']})}\n\n"
+        think = ThinkFilter()
+        try:
+            for event in run_turn(text, stream=True, lock_acquired=True):
+                if event.get("stage"):
+                    yield f"data: {json.dumps({'stage': event['stage']})}\n\n"
+                elif event.get("chunk"):
+                    if event.get("ooc"):
+                        yield f"data: {json.dumps({'chunk': event['chunk'], 'ooc': True})}\n\n"
+                        continue
+                    piece = think.feed(event["chunk"])
+                    if piece:
+                        yield f"data: {json.dumps({'chunk': piece})}\n\n"
+            tail = think.flush()
+            if tail:
+                yield f"data: {json.dumps({'chunk': tail})}\n\n"
+        except Exception as e:
+            logger.warning("Streaming turn failed: %s", e)
+            yield f"data: {json.dumps({'error': str(e)[:300]})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(event_stream(), mimetype="text/event-stream")
@@ -1084,6 +1160,10 @@ def api_ledger_action():
     action = body.get("action")
     if action not in ("pin", "delete", "upsert"):
         return jsonify({"ok": False, "error": "unknown action"}), 400
+    with LEDGER_LOCK:
+        return _ledger_action(action, body)
+
+def _ledger_action(action, body):
     if LEDGER.exists():
         shutil.copy(LEDGER, ROOT / f"ledger.{int(time.time())}.bak.json")
         backups = sorted(ROOT.glob("ledger.*.bak.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1207,13 +1287,17 @@ def api_notes_canon(note_id):
     if note.get("canon"):
         return jsonify({"ok": True})
     if note.get("proposal") and isinstance(note["proposal"], dict):
-        ledger = load_ledger(strict=True)
-        ledger = apply_ledger_ops(ledger, {"upsert": [note["proposal"]]})
-        atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
+        with LEDGER_LOCK:
+            ledger = apply_ledger_ops(load_ledger(strict=True), {"upsert": [note["proposal"]]})
+            atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
     else:
         prem = read(PREMISE)
         clean_q = analyst.strip_ooc_prefix(note.get("q", ""))
-        addition = f"\n\n## Canon notes\n- {clean_q}: {note.get('a', '')}"
+        line = f"- {clean_q}: {note.get('a', '')}"
+        if "## Canon notes" in prem:
+            addition = "\n" + line
+        else:
+            addition = f"\n\n## Canon notes\n{line}"
         atomic_write(PREMISE, (prem + addition).strip())
     analyst.update_note_canon(ROOT, note_id, True)
     return jsonify({"ok": True})
@@ -1350,9 +1434,9 @@ if __name__ == "__main__":
         if not (cfg.api_key and cfg.model):
             print("[not configured yet — open /config to set the model and API key]")
         print(f"web UI → http://{'localhost' if cfg.host == '127.0.0.1' else cfg.host}:{cfg.port}\n")
-        if os.environ.get("DM_USE_WAITERSS", "").strip() == "1":
+        if os.environ.get("DM_USE_WAITRESS", "").strip() == "1":
             from waitress import serve
-            serve(app, host=cfg.host, port=cfg.port, threads=1)
+            serve(app, host=cfg.host, port=cfg.port, threads=4)
         else:
             app.run(host=cfg.host, port=cfg.port, debug=False)
     else:

@@ -69,7 +69,7 @@ def test_stream_emits_ooc_answer_inline(monkeypatch):
         response = client.post("/api/stream", json={"text": "// where are we?"})
         body = response.get_data(as_text=True)
 
-    assert '"chunk": "The answer."' in body
+    assert body.count('"chunk": "The answer."') == 1
     assert "data: [DONE]" in body
 
 

@@ -87,15 +87,24 @@ FIELDS = [
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
-    F("host", "Web host", "str", "0.0.0.0", "App", "Non-loopback binds require a web password.", scope="global", restart=True),
+    F("host", "Web host", "str", "127.0.0.1", "App", "Non-loopback binds require a web password. DM_HOST overrides this at runtime.", scope="global", restart=True),
     F("port", "Web port", "int", 7860, "App", "", scope="global", restart=True, min=1, max=65535),
     F("campaign", "Default campaign", "str", "default", "App", "Folder under campaigns/. Switching needs a restart.", scope="global", restart=True),
     F("web_password", "Web password", "secret", "", "App", "Required when binding beyond loopback.", scope="global"),
 ]
 
 ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "model", "SCRIBE_MODEL": "scribe_model",
-           "SCRIBE_TEMP": "scribe_temp", "HISTORY_TURNS": "keep_min_turns", "DM_PORT": "port", "CAMPAIGN": "campaign",
-           "DM_WEB_PASSWORD": "web_password"}
+           "SCRIBE_TEMP": "scribe_temp", "HISTORY_TURNS": "keep_min_turns", "DM_PORT": "port", "CAMPAIGN": "campaign"}
+
+# Applied on every start, even when settings.json already exists. Never written back to the file.
+RUNTIME_ENV = {"DM_WEB_PASSWORD": "web_password", "DM_HOST": "host"}
+
+
+def runtime_override(key):
+    for env_key, k in RUNTIME_ENV.items():
+        if k == key and os.environ.get(env_key, "").strip():
+            return os.environ[env_key].strip()
+    return None
 
 
 class Config:
@@ -114,6 +123,9 @@ class Config:
             raise AttributeError(key)
         try:
             f = self._by[key]
+            override = runtime_override(key)
+            if override is not None:
+                return override
             if f.get("scope") == "campaign" and key in self._campaign_vals:
                 return self._campaign_vals[key]
             return self._vals[key]
@@ -287,7 +299,7 @@ class Config:
                 "values": resolved,
                 "global_values": {k: ("" if self._by[k]["type"] == "secret" else v) for k, v in self._vals.items()},
                 "campaign_values": {k: ("" if self._by[k]["type"] == "secret" else v) for k, v in self._campaign_vals.items()},
-                "secret_set": {k: bool(self._vals.get(k) or self._campaign_vals.get(k)) for k, f in self._by.items() if f["type"] == "secret"},
+                "secret_set": {k: bool(self._vals.get(k) or self._campaign_vals.get(k) or runtime_override(k)) for k, f in self._by.items() if f["type"] == "secret"},
                 "path": str(self._path),
                 "campaign_path": str(self._campaign_path) if self._campaign_path else None,
             }
