@@ -94,6 +94,10 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 
 ## CLI Usage & Commands
 
+The web server refuses to start on a non-loopback address unless `web_password` is
+configured. For local-only use, set `host` to `127.0.0.1`; for Docker or other
+network access, configure `DM_WEB_PASSWORD` before starting the container.
+
 ```bash
 # Start in terminal mode
 python dm.py

@@ -83,10 +83,10 @@ FIELDS = [
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
-    F("host", "Web host", "str", "0.0.0.0", "App", "Use 0.0.0.0 in Docker, and put auth in front of it.", scope="global", restart=True),
+    F("host", "Web host", "str", "0.0.0.0", "App", "Non-loopback binds require a web password.", scope="global", restart=True),
     F("port", "Web port", "int", 7860, "App", "", scope="global", restart=True, min=1, max=65535),
     F("campaign", "Default campaign", "str", "default", "App", "Folder under campaigns/. Switching needs a restart.", scope="global", restart=True),
-    F("web_password", "Web password", "secret", "", "App", "Optional password for HTTP Basic auth. Empty = no auth.", scope="global"),
+    F("web_password", "Web password", "secret", "", "App", "Required when binding beyond loopback.", scope="global"),
 ]
 
 ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "model", "SCRIBE_MODEL": "scribe_model",

@@ -993,17 +993,26 @@ WEB_DIR = pathlib.Path(__file__).parent / "web"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 def config_locked():
-    """Reachable beyond loopback with no password: global config writes and restart are refused.
-    DM_ALLOW_OPEN_CONFIG=1 is the explicit escape hatch."""
-    if os.environ.get("DM_ALLOW_OPEN_CONFIG") == "1":
-        return False
+    """Reachable beyond loopback with no password: global config writes and restart are refused."""
     return cfg.host not in LOOPBACK_HOSTS and not cfg.web_password
 
 def _same_origin():
     origin = request.headers.get("Origin")
     if not origin:
-        return True
-    return urlsplit(origin).netloc in {request.host, request.headers.get("X-Forwarded-Host", "")}
+        return request.headers.get("Host", "").casefold() == request.host.casefold()
+    parsed = urlsplit(origin)
+    return (
+        parsed.scheme == request.scheme
+        and parsed.netloc.casefold() == request.host.casefold()
+        and request.headers.get("Host", "").casefold() == request.host.casefold()
+    )
+
+def validate_web_security():
+    if cfg.host not in LOOPBACK_HOSTS and not cfg.web_password:
+        raise RuntimeError(
+            "Refusing to bind beyond loopback without web_password; set DM_WEB_PASSWORD "
+            "or bind to 127.0.0.1."
+        )
 
 @app.before_request
 def check_auth():
@@ -1094,6 +1103,8 @@ def api_stream():
                 yield f"data: {json.dumps({'stage': event['stage']})}\n\n"
             elif event.get("chunk"):
                 yield f"data: {json.dumps({'chunk': event['chunk']})}\n\n"
+            elif event.get("done") and event.get("ooc"):
+                yield f"data: {json.dumps({'chunk': event['dm']})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(event_stream(), mimetype="text/event-stream")
@@ -1405,6 +1416,8 @@ if __name__ == "__main__":
         print(f"[arc planned successfully: central question='{new_arc.get('central_question')}']")
         sys.exit()
     if "--web" in argv:
+        validate_web_security()
+        init_files()
         if not (cfg.api_key and cfg.model):
             print("[not configured yet — open /config to set the model and API key]")
         print(f"web UI → http://{'localhost' if cfg.host == '127.0.0.1' else cfg.host}:{cfg.port}\n")

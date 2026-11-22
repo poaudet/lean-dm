@@ -40,10 +40,10 @@ def test_password_or_loopback_unlocks(monkeypatch):
         assert r.status_code == 400
 
 
-def test_escape_hatch(monkeypatch):
+def test_environment_escape_hatch_does_not_unlock_open_admin(monkeypatch):
     _cfg(monkeypatch, host="0.0.0.0", web_password="")
     monkeypatch.setenv("DM_ALLOW_OPEN_CONFIG", "1")
-    assert dm.config_locked() is False
+    assert dm.config_locked() is True
 
 
 def test_cross_origin_post_refused(monkeypatch):

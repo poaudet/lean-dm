@@ -9,6 +9,7 @@ services:
       - DM_BASE_URL=${DM_BASE_URL:-}
       - DM_API_KEY=${DM_API_KEY:-}
       - DM_MODEL=${DM_MODEL:-}
+      - DM_WEB_PASSWORD=${DM_WEB_PASSWORD:-}
       - SCRIBE_MODEL=${SCRIBE_MODEL:-}
       - HISTORY_TURNS=${HISTORY_TURNS:-8}
       - CAMPAIGN=${CAMPAIGN:-default}

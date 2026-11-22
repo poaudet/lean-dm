@@ -253,9 +253,10 @@ function resetField(k) {
   markDirty();
 }
 
-function collect() {
+function collect(scope) {
   const ch = {};
   for (const f of meta.fields) {
+    if ((f.scope || 'global') !== scope) continue;
     const el = $('f_' + f.key);
     if (!el) continue;
     if (f.type === 'bool') ch[f.key] = el.checked;
@@ -269,21 +270,23 @@ function collect() {
 async function saveAll() {
   document.querySelectorAll('.err').forEach(e => e.textContent = '');
   $('status').textContent = 'saving…';
-  const r = await fetch('/api/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ changes: collect() })
-  });
-  const d = await r.json();
-  if (!d.ok) {
-    for (const k in d.errors) {
-      const e = $(k === 'campaign' ? 'e_field_campaign' : 'e_' + k);
-      if (e) e.textContent = d.errors[k];
+  for (const scope of ['campaign', 'global']) {
+    const r = await fetch('/api/config?scope=' + scope, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ changes: collect(scope) })
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      for (const k in d.errors || {}) {
+        const e = $(k === 'campaign' ? 'e_field_campaign' : 'e_' + k);
+        if (e) e.textContent = d.errors[k];
+      }
+      $('status').textContent = d.error || 'Fix errors above';
+      return false;
     }
-    $('status').textContent = d.error || 'Fix errors above';
-    return false;
+    meta = d;
   }
-  meta = d;
   isDirty = false;
   $('dirty-tag').style.display = 'none';
   render();

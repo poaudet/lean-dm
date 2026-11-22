@@ -1,6 +1,7 @@
 // web/app.js — Front-end client for lean-dm
 const $ = id => document.getElementById(id);
 let state = null, busy = false, currentTab = 'led', lastSent = '', abortCtrl = null, streamTimer = null;
+let sideDirty = false;
 
 // Safe markdown parser
 function esc(s) {
@@ -111,6 +112,10 @@ function updateMeter(s) {
 
 // Tabs & Sidebar
 function setTab(t) {
+  if (sideDirty && t !== currentTab) {
+    toast('Save your sidebar edits before changing tabs', 'err');
+    return;
+  }
   currentTab = t;
   ['prem', 'sum', 'led', 'notes', 'aud'].forEach(x => {
     const el = $('t-' + x);
@@ -123,15 +128,16 @@ function renderSide() {
   if (!state) return;
   const f = $('side-content');
   if (!f) return;
+  if (sideDirty) return;
   if (document.activeElement && f.contains(document.activeElement)) return;
 
   if (currentTab === 'prem') {
     f.innerHTML = `
       <h3>Premise</h3>
-      <textarea id="prem-text" rows="10" style="width:100%">${esc(state.premise || '')}</textarea>
+      <textarea id="prem-text" rows="10" style="width:100%" oninput="sideDirty=true">${esc(state.premise || '')}</textarea>
       <button onclick="savePremise()">Save Premise</button>
       <h3 style="margin-top:16px">Style Notes</h3>
-      <textarea id="style-notes-text" rows="4" style="width:100%" placeholder="Custom writing style instructions...">${esc(state.style_notes || '')}</textarea>
+      <textarea id="style-notes-text" rows="4" style="width:100%" placeholder="Custom writing style instructions..." oninput="sideDirty=true">${esc(state.style_notes || '')}</textarea>
       <button class="ghost" onclick="saveStyleNotes()">Save Style Notes</button>
     `;
   } else if (currentTab === 'sum') {
@@ -253,7 +259,11 @@ function savePremise() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text })
   }).then(r => r.json()).then(d => {
-    if (d.ok) toast('Premise saved', 'success');
+    if (d.ok) {
+      sideDirty = false;
+      toast('Premise saved', 'success');
+      return refresh(false);
+    }
     else toast(d.error || 'Failed to save', 'err');
   });
 }
@@ -265,7 +275,11 @@ function saveStyleNotes() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ changes: { style_notes: notes } })
   }).then(r => r.json()).then(d => {
-    if (d.ok) toast('Style notes saved', 'success');
+    if (d.ok) {
+      sideDirty = false;
+      toast('Style notes saved', 'success');
+      return refresh(false);
+    }
     else toast('Failed to save style notes', 'err');
   });
 }
