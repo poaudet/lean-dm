@@ -32,6 +32,7 @@ VALID_INTENTS = ("act", "ask", "steer", "wait")
 VALID_OUTCOMES = ("clean", "partial", "complication", "setback")
 VALID_ENDS = ("decision", "question", "beat")
 VALID_HOWS = ("overt", "subtle", "offscreen")
+_HOW_RANK = {"overt": 2, "subtle": 1, "offscreen": 0}
 
 
 def parse_json_tolerantly(raw):
@@ -47,7 +48,11 @@ def parse_json_tolerantly(raw):
 
 
 def clamp_brief(d, allowed_move_ids=None):
-    """Clamp and validate raw dictionary to strict brief schema."""
+    """Clamp and validate raw dictionary to strict brief schema.
+
+    allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
+    `how` may only be downgraded relative to the schedule, never upgraded.
+    """
     if not isinstance(d, dict):
         d = {}
     out = dict(BRIEF_SCHEMA)
@@ -67,19 +72,26 @@ def clamp_brief(d, allowed_move_ids=None):
     # plot_moves (cap at 2 moves max)
     raw_moves = d.get("plot_moves")
     moves = []
+    seen = set()
     if isinstance(raw_moves, list):
         for m in raw_moves:
             if not isinstance(m, dict):
                 continue
             mid = str(m.get("id", "")).strip()
-            if not mid:
+            if not mid or mid in seen:
                 continue
             if allowed_move_ids is not None and mid not in allowed_move_ids:
                 continue
+            sched = allowed_move_ids.get(mid) if isinstance(allowed_move_ids, dict) else None
             how = str(m.get("how", "subtle")).strip().lower()
             if how not in VALID_HOWS:
                 how = "subtle"
-            note = str(m.get("note", "")).strip()[:200]
+            if sched:
+                sched_how = str(sched.get("how", "subtle"))
+                if _HOW_RANK[how] > _HOW_RANK.get(sched_how, 1):
+                    how = sched_how
+            note = (str(m.get("note", "")).strip() or str((sched or {}).get("note", "")).strip())[:200]
+            seen.add(mid)
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
                 break
@@ -287,7 +299,7 @@ ANALYST_SYSTEM = (
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn):
     """Run analyst model call with timeout and fallback."""
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
-    allowed_ids = {m["id"] for m in allowed_moves} if allowed_moves else set()
+    allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
 
     n_turns = cfg.analyst_context_turns
     h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history

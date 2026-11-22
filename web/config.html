@@ -280,7 +280,7 @@ async function saveAll() {
       const e = $(k === 'campaign' ? 'e_field_campaign' : 'e_' + k);
       if (e) e.textContent = d.errors[k];
     }
-    $('status').textContent = 'Fix errors above';
+    $('status').textContent = d.error || 'Fix errors above';
     return false;
   }
   meta = d;

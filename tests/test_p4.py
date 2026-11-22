@@ -223,6 +223,7 @@ def test_campaigns_api_list_and_create(tmp_path):
 
 def test_api_restart(monkeypatch):
     calls = []
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "host": "127.0.0.1"})
 
     class FakeThread:
         def __init__(self, target, daemon):
