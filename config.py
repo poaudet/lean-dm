@@ -86,7 +86,8 @@ FIELDS = [
 ]
 
 ENV_MAP = {"DM_BASE_URL": "base_url", "DM_API_KEY": "api_key", "DM_MODEL": "model", "SCRIBE_MODEL": "scribe_model",
-           "SCRIBE_TEMP": "scribe_temp", "HISTORY_TURNS": "keep_min_turns", "DM_PORT": "port", "CAMPAIGN": "campaign"}
+           "SCRIBE_TEMP": "scribe_temp", "HISTORY_TURNS": "keep_min_turns", "DM_PORT": "port", "CAMPAIGN": "campaign",
+           "DM_WEB_PASSWORD": "web_password"}
 
 
 class Config:

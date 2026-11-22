@@ -31,6 +31,7 @@ Dependencies: pip install flask requests
 
 import json, os, sys, pathlib, threading, time, html, re, shutil, hmac, zipfile, io
 import requests
+from urllib.parse import urlsplit
 from flask import Flask, request, jsonify, Response, send_from_directory
 from config import cfg, SETTINGS_PATH
 import analyst
@@ -693,15 +694,26 @@ def _generate(ctx, stream):
         raise RuntimeError("model returned an empty reply")
     return dm
 
-def get_allowed_moves():
+def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
         return []
     arc_state = arc.load_arc(ROOT)
     if not arc_state:
         return []
-    h = load_history()
+    h = load_history() if history is None else history
     turn = len(h) // 2 + 1
-    return arc.allowed_moves(arc_state, cfg.difficulty, turn)
+    rt = arc_state.get("runtime") or {}
+    return arc.allowed_moves(
+        arc_state, cfg.difficulty, turn,
+        last_overt_turn=rt.get("last_overt_turn"),
+        stalled_turns=_int(rt.get("stalled_turns")),
+    )
+
+def _record_kwargs(brief):
+    """Return the record-pass arguments derived from the analyst brief."""
+    if not brief:
+        return {}
+    return {"played_moves": brief.get("plot_moves") or [], "intent": brief.get("intent", "act")}
 
 def player_turn(text, stream=False):
     with TURN_LOCK:
@@ -745,7 +757,8 @@ def player_turn(text, stream=False):
                     print(f"[arc: auto-planning failed: {e}]")
             # Run record pass
             try:
-                arc.run_record_pass(ROOT, text, dm, len(history) + 1, chat_complete)
+                arc.run_record_pass(ROOT, text, dm, len(history) + 1, chat_complete,
+                                    **_record_kwargs(brief))
             except Exception as e:
                 print(f"[arc: record pass failed: {e}]")
 
@@ -777,41 +790,39 @@ def undo_turn():
             PREMISE.unlink()                            # undoing the opening un-pins it too
         return text
 
+def _retry_brief(h, rerun_analyst):
+    """Director's brief for retrying the last exchange: reuse the stored one unless asked to re-run."""
+    if not cfg.analyst_enabled:
+        return None
+    player_idx = len(h) - 2
+    if not rerun_analyst:
+        brief = analyst.load_brief_for_msg(ROOT, player_idx)
+        if brief:
+            return brief
+    allowed = get_allowed_moves(h[:-2])
+    guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
+    brief, source, model_used, ms = analyst.run_analyst(
+        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
+    )
+    analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
+    return brief
+
 def retry_turn(stream=False, rerun_analyst=False):
     """Regenerate the DM's last reply for the same player action."""
     with TURN_LOCK:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
         arc_backup = arc.backup_state(ROOT) if cfg.arc_enabled else None
-        if cfg.arc_enabled:
-            arc.restore_arc_snapshot(ROOT, len(h) - 1)
-            arc.truncate_records(ROOT, len(h) - 1)
-            arc.truncate_arc_log(ROOT, len(h) - 1)
-        brief = None
-        if cfg.analyst_enabled:
-            player_idx = len(h) - 2
-            if rerun_analyst:
-                allowed = get_allowed_moves()
-                guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
-                brief, source, model_used, ms = analyst.run_analyst(
-                    ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
-                )
-                analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
-            else:
-                brief = analyst.load_brief_for_msg(ROOT, player_idx)
-                if not brief:
-                    allowed = get_allowed_moves()
-                    guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
-                    brief, source, model_used, ms = analyst.run_analyst(
-                        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
-                    )
-                    analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
-
         try:
+            if cfg.arc_enabled:
+                arc.restore_arc_snapshot(ROOT, len(h) - 1)
+                arc.truncate_records(ROOT, len(h) - 1)
+                arc.truncate_arc_log(ROOT, len(h) - 1)
+            brief = _retry_brief(h, rerun_analyst)
             dm = _generate(build_context(h[:-1], brief=brief), stream)
         except BaseException:
-            # Generation failed, so the old reply stays in history: the arc must stay
-            # consistent with it, not with the rollback done above.
+            # Anything failing after the rewind (analyst, scheduling, generation) leaves the
+            # old reply in history, so the arc must go back to match it.
             if arc_backup is not None:
                 arc.restore_state(ROOT, arc_backup)
             raise
@@ -823,7 +834,8 @@ def retry_turn(stream=False, rerun_analyst=False):
         set_state(last_words=words, overlong=overlong)
         if cfg.arc_enabled:
             try:
-                arc.run_record_pass(ROOT, h[-2]["content"], dm, len(h) - 1, chat_complete)
+                arc.run_record_pass(ROOT, h[-2]["content"], dm, len(h) - 1, chat_complete,
+                                    **_record_kwargs(brief))
             except Exception as e:
                 print(f"[arc: record pass failed on retry: {e}]")
     return dm
@@ -848,8 +860,10 @@ def game_state():
         undo_reason = "Exchange is folded into summary or ledger"
 
     auth_warning = None
-    if cfg.host not in ("127.0.0.1", "localhost") and not cfg.web_password:
+    if cfg.host not in LOOPBACK_HOSTS and not cfg.web_password:
         auth_warning = f"Warning: Server is accessible on {cfg.host}:{cfg.port} without a web_password set."
+        if config_locked():
+            auth_warning += " Global settings and restart are locked until you set one (DM_WEB_PASSWORD or settings.json)."
 
     return {
         "campaign": CAMPAIGN,
@@ -887,13 +901,43 @@ def game_state():
 app = Flask(__name__)
 WEB_DIR = pathlib.Path(__file__).parent / "web"
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+def config_locked():
+    """Reachable beyond loopback with no password: global config writes and restart are refused.
+    DM_ALLOW_OPEN_CONFIG=1 is the explicit escape hatch."""
+    if os.environ.get("DM_ALLOW_OPEN_CONFIG") == "1":
+        return False
+    return cfg.host not in LOOPBACK_HOSTS and not cfg.web_password
+
+def _same_origin():
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    return urlsplit(origin).netloc in {request.host, request.headers.get("X-Forwarded-Host", "")}
+
 @app.before_request
 def check_auth():
     if not cfg.web_password:
         return None
     auth = request.authorization
-    if not auth or not auth.password or not hmac.compare_digest(auth.password, cfg.web_password):
+    if not auth or not auth.password or not hmac.compare_digest(
+            auth.password.encode("utf-8"), cfg.web_password.encode("utf-8")):
         return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="lean-dm"'})
+
+@app.before_request
+def guard_admin():
+    if request.method != "POST":
+        return None
+    if not _same_origin():
+        return jsonify({"ok": False, "error": "cross-origin request refused", "errors": {}}), 403
+    if not config_locked():
+        return None
+    scope = request.args.get("scope") or (request.get_json(silent=True) or {}).get("scope") or "global"
+    if request.path == "/api/restart" or (request.path == "/api/config" and scope != "campaign"):
+        msg = ("Global settings and restart are disabled while the server is reachable without a "
+               "web_password. Set one (DM_WEB_PASSWORD or settings.json) or bind to 127.0.0.1.")
+        return jsonify({"ok": False, "error": msg, "errors": {}}), 403
 
 @app.route("/")
 def index():
@@ -1008,7 +1052,8 @@ def api_stream():
                     except Exception as e:
                         print(f"[arc: auto-planning failed: {e}]")
                 try:
-                    arc.run_record_pass(ROOT, text, dm_cleaned, len(history) + 1, chat_complete)
+                    arc.run_record_pass(ROOT, text, dm_cleaned, len(history) + 1, chat_complete,
+                                        **_record_kwargs(brief))
                 except Exception as e:
                     print(f"[arc: record pass failed: {e}]")
 
