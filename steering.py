@@ -75,11 +75,10 @@ def save_steering(root, state):
 
 
 def snapshot_steering(root, msg_idx):
+    """Record the pre-turn state. A missing state is stored as null so undo can clear it."""
     state = load_steering(root)
-    if not state:
-        return
-    atomic_write(steering_snap_dir(root) / f"{_int(msg_idx)}.json",
-                 json.dumps(state, indent=2, ensure_ascii=False))
+    payload = json.dumps(state, indent=2, ensure_ascii=False) if state else "null"
+    atomic_write(steering_snap_dir(root) / f"{_int(msg_idx)}.json", payload)
 
 
 def restore_steering_snapshot(root, msg_idx):
@@ -93,6 +92,9 @@ def restore_steering_snapshot(root, msg_idx):
     except (ValueError, OSError) as e:
         logger.warning("steering snapshot %s is unreadable: %s", snap.name, e)
         return False
+    if data is None:
+        steering_path(root).unlink(missing_ok=True)     # no state existed before this turn
+        return True
     if not isinstance(data, dict):
         logger.warning("steering snapshot %s is not an object; steering was not rewound", snap.name)
         return False

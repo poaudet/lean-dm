@@ -10,6 +10,8 @@ Doctrine:
 import json
 import logging
 
+import steering
+
 from config import cfg
 from storage import append_jsonl, atomic_write, parse_json_response, replace_lines
 
@@ -119,8 +121,8 @@ def prune_arc_snapshots(root, below):
             f.unlink(missing_ok=True)
 
 
-# Files that make up the mutable arc runtime state (used to roll back a failed retry).
-_RUNTIME_FILES = ("arc.json", "records.jsonl", "arc_log.jsonl")
+# Files that make up the mutable runtime state (used to roll back a failed retry).
+_RUNTIME_FILES = ("arc.json", "records.jsonl", "arc_log.jsonl", "steering.json")
 
 
 def backup_state(root):
@@ -512,7 +514,10 @@ RECORD_PROMPT = (
     '    {"id": "<pressure_id>", "effect": "advanced|delayed|countered|cancelled|none"}\n'
     '  ],\n'
     '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>,\n'
-    '  "central_question_resolved": <bool: whether play resolved the campaign central question>\n'
+    '  "central_question_resolved": <bool: whether play resolved the campaign central question>,\n'
+    '  "objective": "<string: the player-facing goal right now, at most 160 chars>",\n'
+    '  "open_question": "<string: the decision currently facing the player, at most 160 chars>",\n'
+    '  "progress": <bool: true if a beat was completed, the objective changed, or the open question was resolved>\n'
     "}"
 )
 
@@ -532,50 +537,72 @@ def _is_last_act(arc, act_n):
 
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
                     intent="act", history=None, analyst_act_complete=False):
-    """Execute record pass over the newest turn, updating clock, beats, pressures.
+    """Execute record pass over the newest turn, updating clock, beats, pressures and steering.
 
     played_moves / intent come from the analyst brief (empty / "act" when it is off).
+    Runs when the arc or the steering state is enabled; one model call covers both (A2).
     """
     arc = load_arc(root)
-    if not arc:
+    steering_on = bool(cfg.steering_enabled)
+    if not arc and not steering_on:
         return
 
     # Snapshot BEFORE updating (I4)
-    snapshot_arc(root, msg_idx)
+    if arc:
+        snapshot_arc(root, msg_idx)
+    if steering_on:
+        steering.snapshot_steering(root, msg_idx)
 
     if intent == "ask":
-        append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
-                             "pressures": [], "act_complete": False,
-                             "words": len(dm_reply.split())})
+        # D5: an ask costs no time and leaves the open question untouched.
+        if arc:
+            append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
+                                 "pressures": [], "act_complete": False,
+                                 "words": len(dm_reply.split())})
         return
 
     model = cfg.scribe_model or cfg.model
-    act_n = arc.get("act", 1)
-    active_act = next((a for a in arc.get("acts", []) if a.get("n") == act_n), {})
+    act_n = arc.get("act", 1) if arc else 1
+    active_act = next((a for a in arc.get("acts", []) if a.get("n") == act_n), {}) if arc else {}
+    previous = steering.load_steering(root) if steering_on else None
 
-    prompt = (
-        f"CURRENT ARC STATUS:\n"
-        f"Act {act_n}: {active_act.get('goal', '')}\n"
-        f"Central question: {arc.get('central_question', '')}\n"
-        f"Pending beats: {json.dumps([b for b in active_act.get('beats', []) if b.get('status') == 'pending'], ensure_ascii=False)}\n"
-        f"Active pressures: {json.dumps(arc.get('pressures', []), ensure_ascii=False)}\n\n"
+    blocks = []
+    if arc:
+        blocks.append(
+            f"CURRENT ARC STATUS:\n"
+            f"Act {act_n}: {active_act.get('goal', '')}\n"
+            f"Central question: {arc.get('central_question', '')}\n"
+            f"Pending beats: {json.dumps([b for b in active_act.get('beats', []) if b.get('status') == 'pending'], ensure_ascii=False)}\n"
+            f"Active pressures: {json.dumps(arc.get('pressures', []), ensure_ascii=False)}\n"
+        )
+    if steering_on:
+        prev = previous or {}
+        blocks.append(
+            "CURRENT STEERING (player-facing):\n"
+            f"Objective: {prev.get('objective') or '(none yet)'}\n"
+            f"Open question: {prev.get('open_question') or '(none yet)'}\n"
+        )
+    blocks.append(
         f"LATEST EXCHANGE:\n"
         f"PLAYER: {player_action}\n"
         f"DM: {dm_reply}\n\n"
         f"{RECORD_PROMPT}"
     )
+    prompt = "\n".join(blocks)
 
     messages = [
         {"role": "system", "content": "You are the continuity recorder for a text RPG. Output only JSON."},
         {"role": "user", "content": prompt},
     ]
 
+    failed = False
     try:
         raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
         res = parse_json_response(raw)
         if not isinstance(res, dict):
             raise ValueError("record response did not contain a JSON object")
     except Exception:
+        failed = True
         # Fallback record
         res = {
             "elapsed_minutes": 5,
@@ -583,6 +610,14 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
             "pressures": [],
             "act_complete": False,
         }
+
+    if steering_on:
+        state = (steering.stalled_steering(previous, msg_idx) if failed
+                 else steering.clamp_steering(res, previous, msg_idx, source="record"))
+        steering.save_steering(root, state)
+
+    if not arc:
+        return
 
     # Update clock
     elapsed = _clamp_elapsed(res.get("elapsed_minutes"))

@@ -312,7 +312,7 @@ ANALYST_SYSTEM = (
 
 
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
-                ledger_text="", act_goal=""):
+                ledger_text="", act_goal="", steering_text=""):
     """Run analyst model call with timeout and fallback."""
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
     allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
@@ -328,6 +328,7 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
         + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
         + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
+        + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
         + "\n"
         f"RECENT PLAY:\n{play_str}\n\n"
         f"PLAYER ACTION:\n{player_action}\n\n"
