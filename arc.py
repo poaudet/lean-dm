@@ -7,13 +7,9 @@ Doctrine:
 - D-10: UI never shows arc or plot moves; only a non-spoiler chip ("Act 1 · active").
 - Pure scheduling function allowed_moves() is unit-tested without LLM calls.
 """
-import copy
 import json
 import os
-import pathlib
-import re
-import shutil
-import time
+
 from config import cfg
 
 # Difficulty parameters
@@ -169,7 +165,7 @@ def truncate_records(root, upto_msg_idx):
                 kept.append(line)
         except Exception:
             pass
-    p.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+    p.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
 
 
 def truncate_arc_log(root, upto_msg_idx):
@@ -186,7 +182,7 @@ def truncate_arc_log(root, upto_msg_idx):
                 kept.append(line)
         except Exception:
             pass
-    p.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+    p.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
 
 
 def append_arc_log(root, rev, at_msg, act, kind, diff, reason):

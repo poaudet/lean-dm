@@ -4,7 +4,11 @@ campaigns/settings.json (override with DM_SETTINGS) is the single source of trut
 or on the web UI's /config page. Values apply live, except fields marked "restart".
 On the very first run, DM_* env vars / a legacy .env are imported once; after that .env is ignored.
 """
-import json, os, pathlib, re, threading
+import json
+import os
+import pathlib
+import re
+import threading
 
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")

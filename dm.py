@@ -29,15 +29,28 @@ Everything before the last message is append-only, so provider prefix caching ca
 Dependencies: pip install flask requests
 """
 
-import json, os, sys, pathlib, threading, time, html, re, shutil, hmac, zipfile, io
-import requests
+import hmac
+import html
+import io
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import threading
+import time
+import zipfile
 from collections import defaultdict, deque
 from time import monotonic
 from urllib.parse import urlsplit
-from flask import Flask, request, jsonify, Response, send_from_directory
-from config import cfg, SETTINGS_PATH
+
+import requests
+from flask import Flask, Response, jsonify, request, send_from_directory
+
 import analyst
 import arc
+from config import SETTINGS_PATH, cfg
 
 # ---------------- paths ----------------
 
@@ -112,7 +125,7 @@ def read(path):
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 def raw_history_lines():
-    return [l for l in HISTORY.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [line for line in HISTORY.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def load_history():
     out = []
@@ -512,7 +525,8 @@ def split_ranges(h, a, end):
     return out
 
 def parse_json_obj(raw):
-    return json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+    cleaned = clean_reply(raw)
+    return json.loads(cleaned[cleaned.index("{"): cleaned.rindex("}") + 1])
 
 LEDGER_PROMPT = (
     "Update the canon ledger from the new play. Return ONLY JSON: "
@@ -532,7 +546,7 @@ LEDGER_PROMPT = (
     "'(DM said X at [n])' to the state.\n"
     "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
 
-def record_pass(upto=None):
+def ledger_pass(upto=None):
     """Advance the ledger over history[ledgered:upto]. Caller holds MAINT_LOCK."""
     h = load_history()
     ptr = ledgered()
@@ -572,7 +586,7 @@ def fold_if_needed():
         return
     end = k + n
     if cfg.ledger_enabled:
-        record_pass(upto=end)                           # never fold what the ledger has not seen
+        ledger_pass(upto=end)                           # never fold what the ledger has not seen
     ref = render_ledger(load_ledger())
     summary = read(SUMMARY)
     for a, b in split_ranges(h, k, end):
@@ -637,7 +651,7 @@ def rebuild_ledger():
         atomic_write(LEDGER, "[]")
         set_state(ledgered=0)
         upto = max(0, len(h) - 2 * cfg.ledger_lag_turns)
-        record_pass(upto=upto - upto % 2)
+        ledger_pass(upto=upto - upto % 2)
 
 def reset_fold():
     """Migrate a v2 campaign: archive summary/facts, show the full history again."""
@@ -658,7 +672,7 @@ def maintain():
         return
     try:
         if cfg.ledger_enabled:
-            record_pass()
+            ledger_pass()
         fold_if_needed()
         if cfg.audit_every_turns:
             n = len(load_history())
@@ -699,6 +713,44 @@ def _generate(ctx, stream):
         raise RuntimeError("model returned an empty reply")
     return dm
 
+def _generate_stream(ctx):
+    """Stream a narrator reply while preserving retries, fallback, usage, and cleaning."""
+    ensure_configured()
+    LAST.update(est=est_tokens(ctx), prompt_tokens=None, cached=None)
+
+    def open_(model):
+        payload = {"model": model, "messages": ctx, "stream": True,
+                   "stream_options": {"include_usage": True}, **narrator_extra()}
+        return _with_retries(lambda: _raw_post(payload, stream=True))
+
+    r = _with_fallback(open_, cfg.model)
+    full = ""
+    try:
+        for line in r.iter_lines():
+            if not line or not line.startswith(b"data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == b"[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("error"):
+                raise RuntimeError(f"API error mid-stream: {str(chunk['error'])[:300]}")
+            note_usage(chunk.get("usage"))
+            choices = chunk.get("choices") or []
+            piece = ((choices[0].get("delta") or {}).get("content") or "") if choices else ""
+            if piece:
+                full += piece
+                yield {"chunk": piece}
+    finally:
+        r.close()
+    dm = clean_reply(full)
+    if not dm:
+        raise RuntimeError("model returned an empty reply")
+    yield {"done": True, "dm": dm}
+
 def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
         return []
@@ -720,18 +772,26 @@ def _record_kwargs(brief):
         return {}
     return {"played_moves": brief.get("plot_moves") or [], "intent": brief.get("intent", "act")}
 
-def player_turn(text, stream=False):
-    with TURN_LOCK:
+def run_turn(text, stream=False, lock_acquired=False):
+    """Single turn engine shared by CLI, normal web turns, and SSE web turns."""
+    if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
+        raise RuntimeError("turn already in progress")
+    elif not lock_acquired:
+        lock_acquired = True
+    try:
         history = load_history()
         if cfg.notes_routing and analyst.is_ooc_note(text):
             entry = analyst.handle_ooc_note(
                 ROOT, text, history, read(PREMISE), read(SUMMARY),
                 render_ledger(load_ledger()), chat_complete
             )
-            return entry["a"]
+            yield {"done": True, "dm": entry["a"], "ooc": True}
+            return
 
         brief = None
         if cfg.analyst_enabled:
+            if stream:
+                yield {"stage": "analyzing"}
             allowed = get_allowed_moves()
             guard_items = compute_style_guard(history) if cfg.style_guard else []
             brief, source, model_used, ms = analyst.run_analyst(
@@ -740,7 +800,18 @@ def player_turn(text, stream=False):
             analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
         user = {"role": "user", "content": text}
-        dm = _generate(build_context(history + [user], brief=brief), stream)
+        ctx = build_context(history + [user], brief=brief)
+        if stream:
+            yield {"stage": "narrating"}
+            dm = None
+            for event in _generate_stream(ctx):
+                yield event
+                if event.get("done"):
+                    dm = event["dm"]
+        else:
+            dm = _generate(ctx, stream=False)
+        if not dm:
+            raise RuntimeError("model returned an empty reply")
         append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
@@ -749,6 +820,8 @@ def player_turn(text, stream=False):
             atomic_write(PREMISE, text)                                       # first message = pinned premise
 
         if cfg.arc_enabled:
+            if stream:
+                yield {"stage": "recording"}
             # Auto plan if arc does not exist yet (D-13)
             if arc.arc_is_corrupt(ROOT):
                 warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
@@ -766,8 +839,18 @@ def player_turn(text, stream=False):
                                     **_record_kwargs(brief))
             except Exception as e:
                 print(f"[arc: record pass failed: {e}]")
+        start_maintain()
+        yield {"done": True, "dm": dm}
+    finally:
+        TURN_LOCK.release()
 
-    start_maintain()
+def player_turn(text, stream=False):
+    dm = None
+    for event in run_turn(text, stream=stream):
+        if stream and event.get("chunk"):
+            print(event["chunk"], end="", flush=True)
+        if event.get("done"):
+            dm = event["dm"]
     return dm
 
 def _last_exchange(lines, h):
@@ -789,7 +872,7 @@ def undo_turn():
             arc.truncate_arc_log(ROOT, len(h) - 2)
         analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
-        atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-2]))
+        atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-2]))
         text = h[-2]["content"]
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
@@ -833,7 +916,7 @@ def retry_turn(stream=False, rerun_analyst=False):
             raise
         new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
         append_jsonl(UNDONE, lines[-1:])
-        atomic_write(HISTORY, "".join(l + "\n" for l in lines[:-1]) + new + "\n")
+        atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-1]) + new + "\n")
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
         set_state(last_words=words, overlong=overlong)
@@ -986,8 +1069,14 @@ def api_turn():
     if not text:
         return jsonify({"error": "empty"}), 400
     try:
-        return jsonify({"dm": player_turn(text)})
+        dm = None
+        for event in run_turn(text, stream=False):
+            if event.get("done"):
+                dm = event["dm"]
+        return jsonify({"dm": dm})
     except Exception as e:
+        if str(e) == "turn already in progress":
+            return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 502
 
 @app.route("/api/stream", methods=["POST"])
@@ -996,86 +1085,15 @@ def api_stream():
     text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
     if not text:
         return jsonify({"error": "empty"}), 400
+    if not TURN_LOCK.acquire(blocking=False):
+        return jsonify({"error": "turn already in progress"}), 409
 
     def event_stream():
-        with TURN_LOCK:
-            history = load_history()
-            if cfg.notes_routing and analyst.is_ooc_note(text):
-                entry = analyst.handle_ooc_note(
-                    ROOT, text, history, read(PREMISE), read(SUMMARY),
-                    render_ledger(load_ledger()), chat_complete
-                )
-                yield f"data: {json.dumps({'chunk': entry['a']})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            brief = None
-            if cfg.analyst_enabled:
-                yield f"data: {json.dumps({'stage': 'analyzing'})}\n\n"
-                allowed = get_allowed_moves()
-                guard_items = compute_style_guard(history) if cfg.style_guard else []
-                brief, source, model_used, ms = analyst.run_analyst(
-                    ROOT, history, text, allowed, guard_items, chat_complete
-                )
-                analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
-
-            yield f"data: {json.dumps({'stage': 'narrating'})}\n\n"
-            ctx = build_context(history + [{"role": "user", "content": text}], brief=brief)
-            payload = {"model": cfg.model, "messages": ctx, "stream": True,
-                       "stream_options": {"include_usage": True}, **narrator_extra()}
-            r = _raw_post(payload, stream=True)
-            dm_text = ""
-            try:
-                for line in r.iter_lines():
-                    if not line or not line.startswith(b"data: "):
-                        continue
-                    p = line[6:].strip()
-                    if p == b"[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(p)
-                        delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
-                        if delta:
-                            dm_text += delta
-                            yield f"data: {json.dumps({'chunk': delta})}\n\n"
-                    except Exception:
-                        continue
-            finally:
-                r.close()
-
-            dm_cleaned = clean_reply(dm_text)
-            if not dm_cleaned:
-                raise RuntimeError("Empty response from model")
-
-            user = {"role": "user", "content": text}
-            append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm_cleaned}])
-            words = len(dm_cleaned.split())
-            overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-            set_state(last_words=words, overlong=overlong)
-            if not history and not read(PREMISE):
-                atomic_write(PREMISE, text)
-
-            if cfg.arc_enabled:
-                yield f"data: {json.dumps({'stage': 'recording'})}\n\n"
-                if arc.arc_is_corrupt(ROOT):
-                    warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-                elif not arc.load_arc(ROOT):
-                    try:
-                        new_arc = arc.plan_initial_arc(
-                            read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
-                            history + [user, {"role": "assistant", "content": dm_cleaned}],
-                            chat_complete
-                        )
-                        arc.save_arc(ROOT, new_arc)
-                    except Exception as e:
-                        print(f"[arc: auto-planning failed: {e}]")
-                try:
-                    arc.run_record_pass(ROOT, text, dm_cleaned, len(history) + 1, chat_complete,
-                                        **_record_kwargs(brief))
-                except Exception as e:
-                    print(f"[arc: record pass failed: {e}]")
-
-        start_maintain()
+        for event in run_turn(text, stream=True, lock_acquired=True):
+            if event.get("stage"):
+                yield f"data: {json.dumps({'stage': event['stage']})}\n\n"
+            elif event.get("chunk"):
+                yield f"data: {json.dumps({'chunk': event['chunk']})}\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(event_stream(), mimetype="text/event-stream")

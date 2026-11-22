@@ -8,14 +8,13 @@ doctrine:
   as volatile additions in the last user message at build time (I3).
 - Notes routing handles OOC inquiries without polluting history.jsonl.
 """
+import concurrent.futures
+import copy
 import json
-import os
-import pathlib
 import re
 import time
 import uuid
-import concurrent.futures
-import copy
+
 from config import cfg
 
 BRIEF_SCHEMA = {
@@ -150,13 +149,17 @@ def make_fallback_brief(reason="fallback"):
 def is_ooc_note(text):
     """Check whether a player input is an OOC note."""
     t = (text or "").strip().lower()
-    return t.startswith("//") or t.startswith("ooc:") or t.startswith("note to dm:")
+    return t.startswith("//") or t == "ooc" or t.startswith("ooc ") or t.startswith("ooc:") or t.startswith("note to dm:")
 
 
 def strip_ooc_prefix(text):
     t = (text or "").strip()
     if t.lower().startswith("//"):
         return t[2:].strip()
+    if t.lower() == "ooc":
+        return ""
+    if t.lower().startswith("ooc "):
+        return t[3:].strip()
     if t.lower().startswith("ooc:"):
         return t[4:].strip()
     if t.lower().startswith("note to dm:"):
@@ -228,7 +231,7 @@ def truncate_briefs(root, upto_index):
                 kept.append(line)
         except (ValueError, TypeError):
             pass
-    data = "".join(l + "\n" for l in kept)
+    data = "".join(line + "\n" for line in kept)
     p.write_text(data, encoding="utf-8")
 
 
