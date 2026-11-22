@@ -1017,6 +1017,8 @@ def validate_web_security():
 
 @app.before_request
 def check_auth():
+    if request.path == "/healthz":
+        return None
     if not cfg.web_password:
         return None
     auth = request.authorization
@@ -1072,6 +1074,10 @@ def serve_web(filename):
 @app.route("/api/state")
 def api_state():
     return jsonify(game_state())
+
+@app.route("/healthz")
+def healthz():
+    return Response("ok", mimetype="text/plain")
 
 @app.route("/api/turn", methods=["POST"])
 def api_turn():

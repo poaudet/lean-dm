@@ -13,6 +13,11 @@ def test_exposed_web_bind_requires_password(monkeypatch):
     else:
         raise AssertionError("exposed bind without password was allowed")
 
+def test_health_endpoint_bypasses_basic_auth(monkeypatch):
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "web_password": "secret"})
+    with dm.app.test_client() as client:
+        assert client.get("/healthz").status_code == 200
+
 
 def test_loopback_web_bind_does_not_require_password(monkeypatch):
     monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "host": "127.0.0.1", "web_password": ""})

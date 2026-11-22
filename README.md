@@ -138,6 +138,7 @@ python dm.py --show-context
 
 ## Web API Endpoints
 
+- `GET /healthz`: Unauthenticated liveness probe for container healthchecks.
 - `GET /`: Game interface.
 - `GET /config`: Settings management interface.
 - `GET /api/state`: Returns game status, turns, ledger, premise, and non-spoiler arc chip.
