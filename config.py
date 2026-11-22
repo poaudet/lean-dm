@@ -10,6 +10,8 @@ import pathlib
 import re
 import threading
 
+from storage import atomic_write
+
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")
 
@@ -213,22 +215,14 @@ class Config:
     def save(self):
         with self._lock:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            tmp.write_text(json.dumps(self._vals, indent=2, ensure_ascii=False), encoding="utf-8")
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            tmp.replace(self._path)
+            atomic_write(self._path, json.dumps(self._vals, indent=2, ensure_ascii=False), mode=0o600)
 
     def save_campaign(self):
         with self._lock:
             if not self._campaign_path:
                 return
             self._campaign_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._campaign_path.with_name(self._campaign_path.name + ".tmp")
-            tmp.write_text(json.dumps(self._campaign_vals, indent=2, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(self._campaign_path)
+            atomic_write(self._campaign_path, json.dumps(self._campaign_vals, indent=2, ensure_ascii=False))
 
     def update(self, changes, scope="global"):
         """All-or-nothing. Returns {} on success, else {key: error}."""
@@ -266,7 +260,7 @@ class Config:
             if scope == "campaign":
                 self._campaign_vals = {}
                 if self._campaign_path and self._campaign_path.exists():
-                    self._campaign_path.write_text("{}", encoding="utf-8")
+                    atomic_write(self._campaign_path, "{}")
                 return
             key = self._vals["api_key"]
             self._vals = {f["key"]: f["default"] for f in FIELDS}

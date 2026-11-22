@@ -51,6 +51,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 import analyst
 import arc
 from config import SETTINGS_PATH, cfg
+from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
 
 # ---------------- paths ----------------
 
@@ -105,21 +106,6 @@ def warn(msg):
     if msg not in _warned:
         _warned.add(msg)
         print(f"[warn: {msg}]")
-
-def atomic_write(path, text):
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-def append_jsonl(path, items):
-    data = "".join((x if isinstance(x, str) else json.dumps(x, ensure_ascii=False)) + "\n" for x in items)
-    if path.exists() and path.stat().st_size:
-        with path.open("rb") as f:                      # never glue onto an unterminated last line
-            f.seek(-1, os.SEEK_END)
-            if f.read(1) != b"\n":
-                data = "\n" + data
-    with path.open("a", encoding="utf-8") as f:
-        f.write(data)
 
 def read(path):
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
@@ -428,13 +414,6 @@ def note_usage(u):
         d = u.get("prompt_tokens_details")
         LAST["cached"] = d.get("cached_tokens") if isinstance(d, dict) else None
 
-def clean_reply(text):
-    """Strip reasoning blocks that some models emit inline."""
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1]
-    return text.split("<think>", 1)[0].strip()
-
 def narrator_extra():
     x = {}
     if cfg.narrator_temp.strip():
@@ -525,8 +504,10 @@ def split_ranges(h, a, end):
     return out
 
 def parse_json_obj(raw):
-    cleaned = clean_reply(raw)
-    return json.loads(cleaned[cleaned.index("{"): cleaned.rindex("}") + 1])
+    value = parse_json_response(raw)
+    if not isinstance(value, dict):
+        raise ValueError("model response did not contain a JSON object")
+    return value
 
 LEDGER_PROMPT = (
     "Update the canon ledger from the new play. Return ONLY JSON: "
@@ -770,37 +751,65 @@ def _record_kwargs(brief):
     """Return the record-pass arguments derived from the analyst brief."""
     if not brief:
         return {}
-    return {"played_moves": brief.get("plot_moves") or [], "intent": brief.get("intent", "act")}
+    return {
+        "played_moves": brief.get("plot_moves") or [],
+        "intent": brief.get("intent", "act"),
+        "analyst_act_complete": bool(brief.get("act_complete", False)),
+    }
 
-def run_turn(text, stream=False, lock_acquired=False):
-    """Single turn engine shared by CLI, normal web turns, and SSE web turns."""
+def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
+    """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
     if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
         raise RuntimeError("turn already in progress")
     elif not lock_acquired:
         lock_acquired = True
+    arc_backup = None
+    committed = False
+    maintain_needed = False
     try:
-        history = load_history()
-        if cfg.notes_routing and analyst.is_ooc_note(text):
-            entry = analyst.handle_ooc_note(
-                ROOT, text, history, read(PREMISE), read(SUMMARY),
-                render_ledger(load_ledger()), chat_complete
-            )
-            yield {"done": True, "dm": entry["a"], "ooc": True}
-            return
-
-        brief = None
-        if cfg.analyst_enabled:
-            if stream:
+        if retry:
+            lines, history = raw_history_lines(), load_history()
+            _last_exchange(lines, history)
+            text = history[-2]["content"]
+            if cfg.arc_enabled:
+                arc_backup = arc.backup_state(ROOT)
+                arc.restore_arc_snapshot(ROOT, len(history) - 1)
+                arc.truncate_records(ROOT, len(history) - 1)
+                arc.truncate_arc_log(ROOT, len(history) - 1)
+            if stream and cfg.analyst_enabled and rerun_analyst:
                 yield {"stage": "analyzing"}
-            allowed = get_allowed_moves()
-            guard_items = compute_style_guard(history) if cfg.style_guard else []
-            brief, source, model_used, ms = analyst.run_analyst(
-                ROOT, history, text, allowed, guard_items, chat_complete
-            )
-            analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+            brief = _retry_brief(history, rerun_analyst)
+            user = history[-2]
+            msg_idx = len(history) - 1
+            played_history = history[:-1]
+            ctx = build_context(history[:-1], brief=brief)
+        else:
+            history = load_history()
+            if cfg.notes_routing and analyst.is_ooc_note(text):
+                entry = analyst.handle_ooc_note(
+                    ROOT, text, history, read(PREMISE), read(SUMMARY),
+                    render_ledger(load_ledger()), chat_complete
+                )
+                yield {"chunk": entry["a"], "ooc": True}
+                yield {"done": True, "dm": entry["a"], "ooc": True}
+                return
 
-        user = {"role": "user", "content": text}
-        ctx = build_context(history + [user], brief=brief)
+            brief = None
+            if cfg.analyst_enabled:
+                if stream:
+                    yield {"stage": "analyzing"}
+                allowed = get_allowed_moves()
+                guard_items = compute_style_guard(history) if cfg.style_guard else []
+                brief, source, model_used, ms = analyst.run_analyst(
+                    ROOT, history, text, allowed, guard_items, chat_complete
+                )
+                analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+
+            user = {"role": "user", "content": text}
+            msg_idx = len(history) + 1
+            played_history = history + [user]
+            ctx = build_context(history + [user], brief=brief)
+
         if stream:
             yield {"stage": "narrating"}
             dm = None
@@ -812,37 +821,52 @@ def run_turn(text, stream=False, lock_acquired=False):
             dm = _generate(ctx, stream=False)
         if not dm:
             raise RuntimeError("model returned an empty reply")
-        append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])   # commit the pair together
+
+        if retry:
+            new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
+            append_jsonl(UNDONE, lines[-1:])
+            atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-1]) + new + "\n")
+        else:
+            append_jsonl(HISTORY, [user, {"role": "assistant", "content": dm}])
+            if not history and not read(PREMISE):
+                atomic_write(PREMISE, text)
+        committed = True
+        maintain_needed = True
+        played_history = played_history + [{"role": "assistant", "content": dm}]
+
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
         set_state(last_words=words, overlong=overlong)
-        if not history and not read(PREMISE):
-            atomic_write(PREMISE, text)                                       # first message = pinned premise
 
         if cfg.arc_enabled:
             if stream:
                 yield {"stage": "recording"}
-            # Auto plan if arc does not exist yet (D-13)
-            if arc.arc_is_corrupt(ROOT):
+            if not retry and arc.arc_is_corrupt(ROOT):
                 warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-            elif not arc.load_arc(ROOT):
+            elif not retry and not arc.load_arc(ROOT):
                 try:
                     new_arc = arc.plan_initial_arc(
-                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()), history + [user, {"role": "assistant", "content": dm}], chat_complete
+                        read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
+                        history + [user, {"role": "assistant", "content": dm}],
+                        chat_complete
                     )
                     arc.save_arc(ROOT, new_arc)
                 except Exception as e:
                     print(f"[arc: auto-planning failed: {e}]")
-            # Run record pass
             try:
-                arc.run_record_pass(ROOT, text, dm, len(history) + 1, chat_complete,
-                                    **_record_kwargs(brief))
+                arc.run_record_pass(ROOT, text, dm, msg_idx, chat_complete,
+                                    history=played_history, **_record_kwargs(brief))
             except Exception as e:
                 print(f"[arc: record pass failed: {e}]")
-        start_maintain()
         yield {"done": True, "dm": dm}
+    except BaseException:
+        if retry and not committed and arc_backup is not None:
+            arc.restore_state(ROOT, arc_backup)
+        raise
     finally:
         TURN_LOCK.release()
+        if maintain_needed:
+            start_maintain()
 
 def player_turn(text, stream=False):
     dm = None
@@ -863,7 +887,9 @@ def _last_exchange(lines, h):
 
 def undo_turn():
     """Remove the last exchange (kept in undone.jsonl). Returns the player's text."""
-    with TURN_LOCK:
+    if not TURN_LOCK.acquire(blocking=False):
+        raise RuntimeError("turn already in progress")
+    try:
         lines, h = raw_history_lines(), load_history()
         _last_exchange(lines, h)
         if cfg.arc_enabled:
@@ -877,6 +903,8 @@ def undo_turn():
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
         return text
+    finally:
+        TURN_LOCK.release()
 
 def _retry_brief(h, rerun_analyst):
     """Director's brief for retrying the last exchange: reuse the stored one unless asked to re-run."""
@@ -897,36 +925,13 @@ def _retry_brief(h, rerun_analyst):
 
 def retry_turn(stream=False, rerun_analyst=False):
     """Regenerate the DM's last reply for the same player action."""
-    with TURN_LOCK:
-        lines, h = raw_history_lines(), load_history()
-        _last_exchange(lines, h)
-        arc_backup = arc.backup_state(ROOT) if cfg.arc_enabled else None
-        try:
-            if cfg.arc_enabled:
-                arc.restore_arc_snapshot(ROOT, len(h) - 1)
-                arc.truncate_records(ROOT, len(h) - 1)
-                arc.truncate_arc_log(ROOT, len(h) - 1)
-            brief = _retry_brief(h, rerun_analyst)
-            dm = _generate(build_context(h[:-1], brief=brief), stream)
-        except BaseException:
-            # Anything failing after the rewind (analyst, scheduling, generation) leaves the
-            # old reply in history, so the arc must go back to match it.
-            if arc_backup is not None:
-                arc.restore_state(ROOT, arc_backup)
-            raise
-        new = json.dumps({"role": "assistant", "content": dm}, ensure_ascii=False)
-        append_jsonl(UNDONE, lines[-1:])
-        atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-1]) + new + "\n")
-        words = len(dm.split())
-        overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-        set_state(last_words=words, overlong=overlong)
-        if cfg.arc_enabled:
-            try:
-                arc.run_record_pass(ROOT, h[-2]["content"], dm, len(h) - 1, chat_complete,
-                                    **_record_kwargs(brief))
-            except Exception as e:
-                print(f"[arc: record pass failed on retry: {e}]")
-    return dm
+    result = None
+    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst):
+        if stream and event.get("chunk"):
+            print(event["chunk"], end="", flush=True)
+        if event.get("done"):
+            result = event["dm"]
+    return result
 
 def game_state():
     history = load_history()
@@ -1121,6 +1126,8 @@ def api_retry():
     try:
         return jsonify({"dm": retry_turn()})
     except Exception as e:
+        if str(e) == "turn already in progress":
+            return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 502
 
 @app.route("/api/rebuild", methods=["POST"])

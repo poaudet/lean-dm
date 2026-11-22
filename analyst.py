@@ -16,6 +16,7 @@ import time
 import uuid
 
 from config import cfg
+from storage import append_jsonl, parse_json_response, replace_lines
 
 BRIEF_SCHEMA = {
     "intent": "act",
@@ -39,12 +40,8 @@ def parse_json_tolerantly(raw):
     """Find and parse first balanced JSON object."""
     if not raw or not isinstance(raw, str):
         return None
-    try:
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        return json.loads(raw[start:end])
-    except (ValueError, json.JSONDecodeError):
-        return None
+    parsed = parse_json_response(raw)
+    return parsed if isinstance(parsed, dict) else None
 
 
 def clamp_brief(d, allowed_move_ids=None):
@@ -211,9 +208,7 @@ def save_brief(root, msg_idx, source, model, ms, brief):
         "ms": int(ms),
         "brief": brief,
     }
-    line = json.dumps(entry, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    append_jsonl(p, [entry])
 
 
 def truncate_briefs(root, upto_index):
@@ -231,8 +226,7 @@ def truncate_briefs(root, upto_index):
                 kept.append(line)
         except (ValueError, TypeError):
             pass
-    data = "".join(line + "\n" for line in kept)
-    p.write_text(data, encoding="utf-8")
+    replace_lines(p, kept)
 
 
 def load_notes(root):
@@ -252,9 +246,7 @@ def load_notes(root):
 
 def save_note(root, note):
     p = notes_path(root)
-    line = json.dumps(note, ensure_ascii=False) + "\n"
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line)
+    append_jsonl(p, [note])
 
 
 def update_note_canon(root, note_id, is_canon=True):
@@ -269,8 +261,7 @@ def update_note_canon(root, note_id, is_canon=True):
             found = True
             break
     if found:
-        data = "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in notes)
-        p.write_text(data, encoding="utf-8")
+        replace_lines(p, [json.dumps(n, ensure_ascii=False) for n in notes])
     return found
 
 
