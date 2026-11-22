@@ -66,6 +66,8 @@ FIELDS = [
     F("difficulty", "Difficulty", "select", "standard", "Gameplay", "Game difficulty (story/standard/hard).",
       scope="campaign", options=["story", "standard", "hard"]),
     F("arc_enabled", "Hidden arc", "bool", False, "Gameplay", "Enable hidden arc, clock, and pacing manager.", scope="campaign"),
+    F("steering_enabled", "Steering state", "bool", False, "Gameplay",
+      "Track the player-facing objective and open question after every turn.", scope="campaign"),
     # ---- style
     F("style_enabled", "Writing style enforcement", "bool", False, "Style", "Enable writing style enforcement.", scope="campaign"),
     F("style_preset", "Style preset", "select", "none", "Style", "Preset style to apply.",

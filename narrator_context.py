@@ -16,7 +16,7 @@ def merge_same_role(msgs):
             out.append(m)
     return out
 
-def assemble_context(history, brief=None, *, folded_count, premise, summary, canon):
+def assemble_context(history, brief=None, *, folded_count, premise, summary, canon, steering=""):
     """Assemble a prompt using a snapshot of campaign state."""
     parts = [cfg.system_prompt]
     if premise:
@@ -52,7 +52,7 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
     msgs = merge_same_role(tail)
     has_player_action = bool(msgs and msgs[-1]["role"] == "user")
     guard = compute_style_guard(history) if cfg.style_guard and has_player_action else []
-    has_extra_instructions = bool(guard or brief)
+    has_extra_instructions = bool(guard or brief or steering)
     if canon and has_player_action:   # volatile part goes LAST to keep the prefix cacheable
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
@@ -60,6 +60,10 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
         suffix = ("\n--- end of ledger" if has_extra_instructions else
                   "\n\n--- end of ledger: now narrate the outcome of the player's action above.")
         msgs[-1]["content"] += suffix
+    if steering and has_player_action:   # A5: after the ledger, before the brief (I3)
+        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                    "\n\n---\nCURRENT STEERING — where the story is pushing. Player-facing; "
+                    "never mention this block.\n" + steering}
     if guard:
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
@@ -71,4 +75,3 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\nNow narrate the outcome of the player's action above."}
     return [{"role": "system", "content": "\n\n".join(parts)}] + msgs
-
