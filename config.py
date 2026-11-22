@@ -5,12 +5,15 @@ or on the web UI's /config page. Values apply live, except fields marked "restar
 On the very first run, DM_* env vars / a legacy .env are imported once; after that .env is ignored.
 """
 import json
+import logging
 import os
 import pathlib
 import re
 import threading
 
 from storage import atomic_write
+
+logger = logging.getLogger(__name__)
 
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")
@@ -134,7 +137,8 @@ class Config:
                                 except ValueError:
                                     pass
                 except (ValueError, OSError) as e:
-                    print(f"[config] {self._campaign_path} unreadable ({e}); ignoring campaign overrides")
+                    logger.warning("%s unreadable; ignoring campaign overrides: %s",
+                                   self._campaign_path, e)
 
     @staticmethod
     def _coerce(f, v):
@@ -178,7 +182,8 @@ class Config:
             try:
                 data = json.loads(self._path.read_text(encoding="utf-8"))
             except (ValueError, OSError) as e:
-                print(f"[config] {self._path} unreadable ({e}); using defaults, file left untouched")
+                logger.warning("%s unreadable; using defaults, file left untouched: %s",
+                               self._path, e)
                 return
             if isinstance(data, dict):
                 for k, v in data.items():
@@ -186,11 +191,12 @@ class Config:
                         try:
                             self._vals[k] = self._coerce(self._by[k], v)
                         except ValueError:
-                            print(f"[config] ignoring invalid value for {k}")
+                            logger.warning("Ignoring invalid value for %s", k)
             return
         n = self._seed_from_env()
         self.save()
-        print(f"[config] created {self._path}" + (f" (imported {n} values from env/.env)" if n else ""))
+        logger.info("Created %s%s", self._path,
+                    f" (imported {n} values from env/.env)" if n else "")
 
     def _seed_from_env(self):
         src = {}

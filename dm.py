@@ -33,6 +33,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import os
 import pathlib
 import re
@@ -54,6 +55,8 @@ from campaign import Campaign
 from config import SETTINGS_PATH, cfg
 from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
 from style_guard import compute_style_guard
+
+logger = logging.getLogger(__name__)
 
 # ---------------- paths ----------------
 
@@ -127,7 +130,7 @@ _warned = set()
 def warn(msg):
     if msg not in _warned:
         _warned.add(msg)
-        print(f"[warn: {msg}]")
+        logger.warning(msg)
 
 def read(path):
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
@@ -390,7 +393,8 @@ def _with_retries(fn, retries=None):
             if attempt == n - 1 or (isinstance(e, ApiError) and not e.retry):
                 raise
             wait = (e.wait if isinstance(e, ApiError) and e.wait else None) or min(90.0, cfg.retry_base_sec * 2 ** attempt)
-            print(f"[api error ({str(e)[:120]}); retry {attempt + 1}/{n - 1} in {wait:.0f}s]")
+            logger.info("API error (%s); retry %s/%s in %.0fs",
+                        str(e)[:120], attempt + 1, n - 1, wait)
             time.sleep(wait)
 
 def _with_fallback(call, primary, fallback=True):
@@ -399,7 +403,7 @@ def _with_fallback(call, primary, fallback=True):
     except TRANSIENT as e:
         fb = cfg.fallback_model
         if fallback and fb and fb != primary:
-            print(f"[{primary} failed ({str(e)[:100]}); trying fallback {fb}]")
+            logger.info("%s failed (%s); trying fallback %s", primary, str(e)[:100], fb)
             return call(fb)
         raise
 
@@ -544,7 +548,7 @@ def ledger_pass(upto=None):
         ledger = apply_ledger_ops(ledger, parse_json_obj(raw))
         atomic_write(LEDGER, json.dumps(ledger, ensure_ascii=False, indent=1))
         set_state(ledgered=b)                           # pointer LAST, per range
-        print(f"[ledger: messages {a}–{b - 1} recorded; {len(ledger)} entries]")
+        logger.info("Ledger recorded messages %s–%s; %s entries", a, b - 1, len(ledger))
 
 def fold_if_needed():
     """Once the verbatim tail passes the budget, fold its oldest part into chapters. Caller holds MAINT_LOCK."""
@@ -586,7 +590,7 @@ def fold_if_needed():
         summary = (summary + "\n\n" if summary else "") + header + "\n" + chapter
         atomic_write(SUMMARY, summary)
     set_state(folded=end)                               # pointer LAST: a crash can duplicate, never lose
-    print(f"[fold: messages {k}–{end - 1} folded into chapters]")
+    logger.info("Folded messages %s–%s into chapters", k, end - 1)
 
 def _audit():
     h = load_history()
@@ -613,7 +617,7 @@ def _audit():
     atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
                         f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
     set_state(audited=len(h))
-    print(f"[audit written to {AUDIT}]")
+    logger.info("Audit written to %s", AUDIT)
 
 def run_audit():
     with MAINT_LOCK:
@@ -641,7 +645,7 @@ def reset_fold():
         shutil.move(str(facts), str(legacy / f"facts.{stamp}.json"))
     atomic_write(SUMMARY, "")
     set_state(folded=0, ledgered=0)
-    print(f"[v2 summary/facts archived in {legacy}; folded=0]")
+    logger.info("Archived v2 summary/facts in %s; folded=0", legacy)
 
 def maintain():
     lock = MAINT_LOCK
@@ -656,7 +660,7 @@ def maintain():
             if n - _int(get_state().get("audited")) >= 2 * cfg.audit_every_turns:
                 _audit()
     except Exception as e:
-        print(f"[maintenance failed, will retry next turn: {e}]")
+        logger.warning("Maintenance failed; will retry next turn: %s", e)
     finally:
         lock.release()
 
@@ -848,12 +852,12 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     )
                     arc.save_arc(ROOT, new_arc)
                 except Exception as e:
-                    print(f"[arc: auto-planning failed: {e}]")
+                    logger.warning("Arc auto-planning failed: %s", e)
             try:
                 arc.run_record_pass(ROOT, text, dm, msg_idx, chat_complete,
                                     history=played_history, **_record_kwargs(brief))
             except Exception as e:
-                print(f"[arc: record pass failed: {e}]")
+                logger.warning("Arc record pass failed: %s", e)
         yield {"done": True, "dm": dm}
     except BaseException:
         if retry and not committed and arc_backup is not None:
@@ -1393,6 +1397,7 @@ def cli():
 
 if __name__ == "__main__":
     argv = sys.argv
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     maint_cmd = any(a in argv for a in ("--reset-fold", "--rebuild-ledger", "--audit"))
     init_files()
     if "--show-context" in argv:
