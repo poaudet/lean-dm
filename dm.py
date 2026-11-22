@@ -59,16 +59,55 @@ CAMPAIGN = cfg.campaign
 if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
-CAMPAIGNS_DIR = pathlib.Path(os.environ.get("DM_CAMPAIGNS_DIR") or pathlib.Path(__file__).parent / "campaigns")
-ROOT = CAMPAIGNS_DIR / CAMPAIGN
-HISTORY, UNDONE = ROOT / "history.jsonl", ROOT / "undone.jsonl"
-PREMISE, SUMMARY = ROOT / "premise.md", ROOT / "summary.md"
-LEDGER, AUDIT, STATE = ROOT / "ledger.json", ROOT / "audit.md", ROOT / "state.json"
+class Campaign:
+    """Campaign-owned filesystem paths and synchronization primitives."""
+    def __init__(self, campaigns_dir, name):
+        self.name = name
+        self.campaigns_dir = pathlib.Path(campaigns_dir)
+        self.root = self.campaigns_dir / name
+        self.history = self.root / "history.jsonl"
+        self.undone = self.root / "undone.jsonl"
+        self.premise = self.root / "premise.md"
+        self.summary = self.root / "summary.md"
+        self.ledger = self.root / "ledger.json"
+        self.audit = self.root / "audit.md"
+        self.state = self.root / "state.json"
+        self.turn_lock = threading.Lock()
+        self.maintenance_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.job_lock = threading.Lock()
 
-TURN_LOCK = threading.Lock()    # one player action (turn / undo / retry) at a time
-MAINT_LOCK = threading.Lock()   # one maintenance job (ledger / fold / audit) at a time
-STATE_LOCK = threading.Lock()
-JOB_LOCK = threading.Lock()
+
+def bind_campaign(campaigns_dir=None, name=None):
+    """Set the active campaign and refresh compatibility aliases used by commands/tests."""
+    global CAMPAIGN_CONTEXT, CAMPAIGN, CAMPAIGNS_DIR, ROOT
+    global HISTORY, UNDONE, PREMISE, SUMMARY, LEDGER, AUDIT, STATE
+    global TURN_LOCK, MAINT_LOCK, STATE_LOCK, JOB_LOCK
+    if isinstance(campaigns_dir, Campaign):
+        context = campaigns_dir
+    else:
+        base = campaigns_dir or os.environ.get("DM_CAMPAIGNS_DIR")
+        if not base:
+            base = pathlib.Path(__file__).parent / "campaigns"
+        context = Campaign(base, name or CAMPAIGN)
+    previous = globals().get("CAMPAIGN_CONTEXT")
+    thread = globals().get("MAINT_THREAD")
+    if previous is not None and previous is not context and thread and thread.is_alive():
+        thread.join()
+    CAMPAIGN_CONTEXT = context
+    CAMPAIGN = context.name
+    CAMPAIGNS_DIR, ROOT = context.campaigns_dir, context.root
+    HISTORY, UNDONE = context.history, context.undone
+    PREMISE, SUMMARY = context.premise, context.summary
+    LEDGER, AUDIT, STATE = context.ledger, context.audit, context.state
+    TURN_LOCK, MAINT_LOCK = context.turn_lock, context.maintenance_lock
+    STATE_LOCK, JOB_LOCK = context.state_lock, context.job_lock
+    cfg.set_campaign_path(context.root / "campaign.json")
+    return context
+
+
+CAMPAIGN_CONTEXT = bind_campaign()
+
 MAINT_THREAD = None
 JOB = {"name": "", "running": False, "msg": ""}
 LAST = {"est": 0, "prompt_tokens": None, "cached": None}
@@ -649,7 +688,8 @@ def reset_fold():
     print(f"[v2 summary/facts archived in {legacy}; folded=0]")
 
 def maintain():
-    if not MAINT_LOCK.acquire(blocking=False):          # single-flight
+    lock = MAINT_LOCK
+    if not lock.acquire(blocking=False):                # single-flight
         return
     try:
         if cfg.ledger_enabled:
@@ -662,7 +702,7 @@ def maintain():
     except Exception as e:
         print(f"[maintenance failed, will retry next turn: {e}]")
     finally:
-        MAINT_LOCK.release()
+        lock.release()
 
 def start_maintain():
     global MAINT_THREAD

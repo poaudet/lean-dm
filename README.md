@@ -21,7 +21,7 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 
 ```
 lean-dm/
-├── dm.py                     # Main application entry point (Flask web & CLI)
+├── dm.py                     # Main entry point, Campaign context, Flask web & CLI
 ├── config.py                 # Configuration schema, coercion & dual-scope persistence
 ├── analyst.py                # Pre-turn director's brief & OOC notes routing
 ├── arc.py                    # Hidden arc planning, difficulty scheduling & record pass
