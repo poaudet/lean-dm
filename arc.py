@@ -693,7 +693,9 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     turn = (int(msg_idx) - 1) // 2 + 1
     played, touched = apply_played_moves(arc, played_moves, turn)
     rt = arc.setdefault("runtime", {})
-    if beats_done or played:
+    # B6: only a completed beat resets the stall counter. Playing a beat hook does not
+    # complete the beat, so it must not clear the escalation either (B3).
+    if beats_done:
         rt["stalled_turns"] = 0
     elif intent in ("act", "steer"):
         rt["stalled_turns"] = int(rt.get("stalled_turns", 0)) + 1
