@@ -207,7 +207,7 @@ class Config:
             if "min" in f and n < f["min"]:
                 raise ValueError(f"must be ≥ {f['min']}")
             if "max" in f and n > f["max"]:
-                raise ValueError(f\"must be ≤ {f['max']}\")
+                raise ValueError(f"must be ≤ {f['max']}")
             return n
         s = "" if v is None else str(v)
         if t == "optfloat":
