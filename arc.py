@@ -45,6 +45,20 @@ DELAY_MINUTES = {
     "hard": 0,
 }
 
+# B2: turns without progress before a beat hook is pushed even while a pressure is due.
+# Initial values, to be tuned after playtest.
+STALL_THRESHOLD = {
+    "story": 2,
+    "standard": 3,
+    "hard": 5,
+}
+
+# B3: turns a hook stays at one level before escalating (subtle -> overt -> offer).
+HOOK_ESCALATION = 2
+
+# Beat moves carry this prefix so they never collide with a pressure step id.
+BEAT_MOVE_PREFIX = "beat."
+
 
 def arc_path(root):
     return root / "arc.json"
@@ -228,12 +242,39 @@ def get_arc_chip(arc):
 # Scheduling: pure function allowed_moves()
 # ---------------------------------------------------------------------------
 
+def pending_beat(arc):
+    """The next pending beat of the active act, or None. Pure, no I/O (B2)."""
+    if not arc or not isinstance(arc, dict):
+        return None
+    act_n = arc.get("act", 1)
+    for a in arc.get("acts") or []:
+        if not isinstance(a, dict) or a.get("n") != act_n:
+            continue
+        for b in a.get("beats") or []:
+            if isinstance(b, dict) and b.get("status") == "pending":
+                return b
+    return None
+
+
+def hook_level(stalled_turns):
+    """B3: a hook rises subtle -> overt -> offer while it goes unanswered."""
+    try:
+        n = int(stalled_turns)
+    except (TypeError, ValueError):
+        n = 0
+    if n >= 2 * HOOK_ESCALATION:
+        return "offer"
+    if n >= HOOK_ESCALATION:
+        return "overt"
+    return "subtle"
+
+
 def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stalled_turns=0):
     """Calculate due plot moves for the current turn.
 
     Pure function: no I/O, no LLM calls.
-    Returns: list of dicts: [{"id": step_id, "how": "overt|subtle", "note": text, "pressure_id": pid}]
-    Hard cap: <= 2 plot moves returned.
+    Returns: list of dicts: [{"id": step_id, "how": "overt|subtle|offer", "note": text, "pressure_id": pid}]
+    Hard cap: <= 2 plot moves returned. Deadlines first, then the beat hook (B2).
     """
     if not arc or not isinstance(arc, dict) or arc.get("terminal"):
         return []
@@ -299,6 +340,20 @@ def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stal
             "pressure_id": "rescue",
         })
 
+    # B2: the next pending beat's hook, once the stall threshold is reached (or at once
+    # when no pressure move is due). B3: its level rises while it goes unanswered, and
+    # that escalation overrides the overt cooldown.
+    beat = pending_beat(arc)
+    if beat and beat.get("hook") and len(results) < 2:
+        threshold = STALL_THRESHOLD.get(diff, 3)
+        if not results or stalled_turns >= threshold:
+            results.append({
+                "id": f"{BEAT_MOVE_PREFIX}{beat.get('id')}",
+                "how": hook_level(stalled_turns),
+                "note": str(beat["hook"])[:200],
+                "pressure_id": "beat",
+            })
+
     return results[:2]
 
 
@@ -337,8 +392,9 @@ def apply_delay(p, difficulty):
 def apply_played_moves(arc, played_moves, turn):
     """Apply the moves the brief played this turn to runtime state.
 
-    Marks played steps done, expires a pressure whose deadline move was played, and records
-    last_overt_turn. Returns (played {id: how}, touched pressure ids).
+    Marks played pressure steps done, expires a pressure whose deadline move was played, and
+    records last_overt_turn. A played beat hook is NOT marked done (B6): only the record pass
+    completes a beat. Returns (played {id: how}, touched pressure ids).
     """
     rt = arc.setdefault("runtime", {})
     played = {}
@@ -376,9 +432,9 @@ PLANNER_SYSTEM = (
     '  "acts": [\n'
     '    {"n": 1, "status": "active", "goal": "Establish stakes and confront immediate obstacle",\n'
     '     "beats": [\n'
-    '       {"id": "a1b1", "text": "Opening discovery", "status": "pending"},\n'
-    '       {"id": "a1b2", "text": "Escalation", "status": "pending"},\n'
-    '       {"id": "a1b3", "text": "Act climax", "status": "pending"}\n'
+    '       {"id": "a1b1", "text": "Opening discovery", "hook": "A lead the player can see", "status": "pending"},\n'
+    '       {"id": "a1b2", "text": "Escalation", "hook": "A lead the player can see", "status": "pending"},\n'
+    '       {"id": "a1b3", "text": "Act climax", "hook": "A lead the player can see", "status": "pending"}\n'
     '     ], "outcomes": []},\n'
     '    {"n": 2, "status": "planned", "goal": "Rising action and deepening stakes", "beats": [], "outcomes": []},\n'
     '    {"n": 3, "status": "planned", "goal": "Climax and resolution", "beats": [], "outcomes": []}\n'
@@ -396,6 +452,9 @@ PLANNER_SYSTEM = (
     "- Act 1 has 3-5 concrete dramatic beats.\n"
     "- Acts 2 and 3 have goals outlined, but empty beats (D-04: planned later based on outcomes).\n"
     "- 1-2 pressures with in-game minute timings.\n"
+    "- Every beat needs a 'hook': at most 200 chars, a lead the PLAYER can perceive.\n"
+    "- A hook must never name the antagonist or reveal the solution. It is shown to the player.\n"
+    "- 'text' is the private plan and is never shown to the player.\n"
     "- Return ONLY the valid JSON object."
 )
 
@@ -417,6 +476,7 @@ def normalize_beats(beats, act_n=1):
         b = dict(b)
         b["id"] = str(b.get("id") or f"a{act_n}b{i}")
         b["text"] = str(b.get("text") or "")
+        b["hook"] = str(b.get("hook") or "")[:200]
         b["status"] = b.get("status") if b.get("status") in ("pending", "done") else "pending"
         out.append(b)
     return out
@@ -764,7 +824,10 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
                 f"CENTRAL QUESTION: {arc.get('central_question')}\n"
                 f"ACT {next_n} GOAL: {next_act.get('goal', '')}\n\n"
                 "Provide 3-5 sequential dramatic beats for Act " + str(next_n) + " as a JSON list:\n"
-                '[{"id": "a' + str(next_n) + 'b1", "text": "...", "status": "pending"}, ...]'
+                '[{"id": "a' + str(next_n) + 'b1", "text": "...", "hook": "a lead the player can see", '
+                '"status": "pending"}, ...]\n'
+                "Each hook is at most 200 chars, is shown to the player, and never names the "
+                "antagonist or reveals the solution."
             )
             try:
                 raw = chat_fn([
@@ -775,7 +838,8 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
                 if beats:
                     next_act["beats"] = beats
             except Exception:
-                next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications", "status": "pending"}]
+                next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications",
+                                      "hook": "An opening the player can act on", "status": "pending"}]
     else:
         arc["terminal"] = bool(central_question_resolved)
         arc["central_question_resolved"] = central_question_resolved
