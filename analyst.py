@@ -283,6 +283,11 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
 
     # act_complete
     out["act_complete"] = bool(d.get("act_complete", False))
+
+    # D5: an ask advances nothing, so no move is played and none is deferred.
+    if out["intent"] == "ask":
+        out["plot_moves"] = []
+        out["deferred"] = []
     return out
 
 
@@ -448,204 +453,12 @@ ANALYST_SYSTEM = (
     "Evaluate the player's action and return ONLY a JSON brief with this structure:\n"
     "{\n"
     '  "intent": "act|ask|steer|wait",\n'
-    '  "assessment": "one sentence: what the player attempts and how it lands in this scene",\n'
-    '  "outcome": "clean|partial|complication|setback",\n'
-    '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen|offer", "note": "what player perceives"}],\n'
-    '  "deferred": [{"id": "move_id", "reason": "why it waits"}],\n'
-    '  "keep_true": [{"id": "ledger_id", "why": "what must stay true"}],\n'
-    '  "narration": {"words": 140, "push": 0.7, "end": "decision|question|beat"},\n'
-    '  "clarify": null,\n'
-    '  "act_complete": false\n'
-    "}\n"
-    "Rules:\n"
-    "- If intent is 'ask': direct answer <= 80 words, no plot move, no time passage.\n"
-    "- If intent is 'steer': honor within difficulty.\n"
-    "- If intent is 'act': resolve per assessment/outcome.\n"
-    "- 'clarify' only if intent is genuinely ambiguous (rarely).\n"
-    "- Choose plot_moves ONLY from the allowed_moves provided. If none are allowed, return [].\n"
-    "- Every allowed move is MANDATORY: play it, or list it in 'deferred' with a reason.\n"
-    "- A move deferred twice in a row is played whether you defer it again or not.\n"
-    "- 'how' is set by the scheduler; never change it. 'offer' means a clear in-world opening.\n"
-    "- 'keep_true' takes ledger ids only. An id not in the ledger is dropped.\n"
-    "- Authority on conflict: ledger beats summary beats recent play.\n"
-)
-
-
-def _truncate_tok(text, budget):
-    """Keep the newest `budget` tokens of text, cutting oldest-first (C1)."""
-    if not text:
-        return ""
-    limit = max(200, int(budget)) * max(0.5, float(cfg.chars_per_tok))
-    limit = int(limit)
-    if len(text) <= limit:
-        return text
-    return text[-limit:]
-
-
-def _is_retryable(exc):
-    """C4: retry once on 429/5xx, mirroring dm.ApiError.retry."""
-    if isinstance(exc, concurrent.futures.TimeoutError):
-        return False
-    if getattr(exc, "retry", False) is True:
-        return True
-    text = str(exc)
-    return text.startswith("HTTP 5") or text.startswith("HTTP 429")
-
-
-def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
-                ledger_text="", act_goal="", steering_text="", defer_counts=None,
-                premise="", summary="", hooks=None, previous_brief=None, ledger=None):
-    """Run analyst model call with timeout, one retry, and fallback (C1, C4)."""
-    model = cfg.analyst_model or cfg.scribe_model or cfg.model
-    allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
-    recent_text = _recent_text(history)
-
-    n_turns = cfg.analyst_context_turns
-    h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history
-    play_str = "\n".join(f"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for i, m in enumerate(h_tail))
-
-    user_prompt = (
-        f"DIFFICULTY: {cfg.difficulty}\n"
-        f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
-        f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
-        f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
-        + (f"PREMISE:\n{premise}\n" if premise else "")
-        + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
-        + (f"STORY SO FAR:\n{_truncate_tok(summary, cfg.analyst_summary_tok)}\n" if summary else "")
-        + (f"PENDING HOOKS: {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
-        + (f"PREVIOUS BRIEF: {json.dumps(previous_brief, ensure_ascii=False)}\n" if previous_brief else "")
-        + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
-        + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
-        + "\n"
-        f"RECENT PLAY:\n{play_str}\n\n"
-        f"PLAYER ACTION:\n{player_action}\n\n"
-        "Output ONLY the JSON brief."
-    )
-
-    messages = [
-        {"role": "system", "content": ANALYST_SYSTEM},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    t0 = time.time()
-    timeout = max(0.1, float(cfg.analyst_timeout_sec))
-    attempts = max(0, int(cfg.analyst_retries)) + 1
-
-    def attempt():
-        """One analyst call bounded by the remaining timeout budget (C4)."""
-        remaining = timeout - (time.time() - t0)
-        if remaining <= 0:
-            raise concurrent.futures.TimeoutError()
-        # No `with` block: its exit calls shutdown(wait=True) and would sit there until the
-        # model call finishes, which defeats the timeout (D-14).
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
-            return future.result(timeout=remaining)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    try:
-        raw = None
-        for n in range(attempts):
-            try:
-                raw = attempt()
-                break
-            except concurrent.futures.TimeoutError:
-                raise
-            except Exception as e:
-                if n == attempts - 1 or not _is_retryable(e):
-                    raise
-        parsed = parse_json_tolerantly(raw)
-        if not parsed:
-            raise ValueError("Unparseable JSON from analyst")
-        brief = clamp_brief(parsed, allowed_ids, defer_counts, ledger=ledger,
-                            player_action=player_action, recent_text=recent_text)
-        ms = int((time.time() - t0) * 1000)
-        return brief, "analyst", model, ms
-    except concurrent.futures.TimeoutError:
-        brief = make_fallback_brief(reason="timeout", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
-        ms = int((time.time() - t0) * 1000)
-        return brief, "fallback", model, ms
-    except ValueError:
-        brief = make_fallback_brief(reason="invalid_response", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
-        ms = int((time.time() - t0) * 1000)
-        return brief, "fallback", model, ms
-    except Exception:
-        brief = make_fallback_brief(reason="analyst_error", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
-        ms = int((time.time() - t0) * 1000)
-        return brief, "fallback", model, ms
-
-
-# ---------------------------------------------------------------------------
-# OOC Notes responder
-# ---------------------------------------------------------------------------
-
-OOC_SYSTEM = (
-    "You are the Dungeon Master responding OUT OF CHARACTER (OOC) to a player note.\n"
-    "Answer the player's question or clarification directly, plainly, and honestly.\n"
-    "Never advance the story, roll dice, or narrate in character.\n"
-    "If the player is proposing a canon fact or world detail, end your response with a JSON block:\n"
-    '```json\n{"canon_proposal": {"id": "slug", "kind": "person|place|item|rule", "name": "...", "state": "..."}}\n```\n'
-    "Otherwise do not include any JSON."
-)
-
-
-def handle_ooc_note(root, note_text, history, premise_text, summary_text, ledger_text, chat_fn):
-    """Answer an OOC note, save to notes.jsonl, and return answer text."""
-    clean_q = strip_ooc_prefix(note_text)
-    model = cfg.analyst_model or cfg.scribe_model or cfg.model
-
-    h_tail = history[-12:] if len(history) > 12 else history
-    play_str = "\n".join(f"{'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for m in h_tail)
-
-    prompt = (
-        f"PREMISE:\n{premise_text}\n\n"
-        f"SUMMARY:\n{summary_text}\n\n"
-        f"CANON LEDGER:\n{ledger_text}\n\n"
-        f"RECENT PLAY:\n{play_str}\n\n"
-        f"PLAYER'S OOC NOTE:\n{clean_q}\n"
-    )
-
-    messages = [
-        {"role": "system", "content": OOC_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
-
-    try:
-        reply = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
-    except Exception as e:
-        reply = f"[OOC: received your note. (Error answering: {e})]"
-
-    # Extract proposal if present
-    proposal = None
-    if "```json" in reply:
-        try:
-            json_str = reply.split("```json", 1)[1].split("```", 1)[0].strip()
-            data = json.loads(json_str)
-            proposal = data.get("canon_proposal")
-        except Exception:
-            pass
-    elif '{"canon_proposal"' in reply:
-        try:
-            data = parse_json_tolerantly(reply)
-            if data:
-                proposal = data.get("canon_proposal")
-        except Exception:
-            pass
-
-    clean_a = re.sub(r"```json.*?```", "", reply, flags=re.S).strip()
-
-    note_entry = {
-        "id": str(uuid.uuid4())[:8],
-        "ts": int(time.time()),
-        "q": note_text,
-        "a": clean_a or reply,
-        "canon": False,
-        "proposal": proposal,
-    }
-    save_note(root, note_entry)
-    return note_entry
+    '  \"assessment\": \"one sentence: what the player attempts and how it lands in this scene\",\n'
+    '  \"outcome\": \"clean|partial|complication|setback\",\n'
+    '  \"plot_moves\": [{\"id\": \"move_id\", \"how\": \"overt|subtle|offscreen|offer\", \"note\": \"what player perceives\"}],\n'
+    '  \"deferred\": [{\"id\": \"move_id\", \"reason\": \"why it waits\"}],\n'
+    '  \"keep_true\": [{\"id\": \"ledger_id\", \"why\": \"what must stay true\"}],\n'
+    '  \"narration\": {\"words\": 140, \"push\": 0.7, \"end\": \"decision|question|beat\"},\n'
+    '  \"clarify\": null,\n'
+    '  \"act_complete\": false\n'
+    \"}\\n\"\n    \"Rules:\\n\"\n    \"- If intent is 'ask': direct answer <= 80 words, no plot move, no time passage.\\n\"\n    \"- If intent is 'steer': honor within difficulty.\\n\"\n    \"- If intent is 'act': resolve per assessment/outcome.\\n\"\n    \"- 'clarify' only if intent is genuinely ambiguous (rarely).\\n\"\n    \"- Choose plot_moves ONLY from the allowed_moves provided. If none are allowed, return [].\\n\"\n    \"- Every allowed move is MANDATORY: play it, or list it in 'deferred' with a reason.\\n\"\n    \"- A move deferred twice in a row is played whether you defer it again or not.\\n\"\n    \"- 'how' is set by the scheduler; never change it. 'offer' means a clear in-world opening.\\n\"\n    \"- 'keep_true' takes ledger ids only. An id not in the ledger is dropped.\\n\"\n    \"- Authority on conflict: ledger beats summary beats recent play.\\n\"\n)\n\n\ndef _truncate_tok(text, budget):\n    \"\"\"Keep the newest `budget` tokens of text, cutting oldest-first (C1).\"\"\"\n    if not text:\n        return \"\"\n    limit = max(200, int(budget)) * max(0.5, float(cfg.chars_per_tok))\n    limit = int(limit)\n    if len(text) <= limit:\n        return text\n    return text[-limit:]\n\n\ndef _is_retryable(exc):\n    \"\"\"C4: retry once on 429/5xx, mirroring dm.ApiError.retry.\"\"\"\n    if isinstance(exc, concurrent.futures.TimeoutError):\n        return False\n    if getattr(exc, \"retry\", False) is True:\n        return True\n    text = str(exc)\n    return text.startswith(\"HTTP 5\") or text.startswith(\"HTTP 429\")\n\n\ndef run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,\n                ledger_text=\"\", act_goal=\"\", steering_text=\"\", defer_counts=None,\n                premise=\"\", summary=\"\", hooks=None, previous_brief=None, ledger=None):\n    \"\"\"Run analyst model call with timeout, one retry, and fallback (C1, C4).\"\"\"\n    model = cfg.analyst_model or cfg.scribe_model or cfg.model\n    allowed_ids = {m[\"id\"]: m for m in allowed_moves} if allowed_moves else {}\n    recent_text = _recent_text(history)\n\n    n_turns = cfg.analyst_context_turns\n    h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history\n    play_str = \"\\n\".join(f\"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}\" for i, m in enumerate(h_tail))\n\n    user_prompt = (\n        f\"DIFFICULTY: {cfg.difficulty}\\n\"\n        f\"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\\n\"\n        f\"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\\n\"\n        f\"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\\n\"\n        + (f\"PREMISE:\\n{premise}\\n\" if premise else \"\")\n        + (f\"CURRENT ACT GOAL: {act_goal}\\n\" if act_goal else \"\")\n        + (f\"STORY SO FAR:\\n{_truncate_tok(summary, cfg.analyst_summary_tok)}\\n\" if summary else \"\")\n        + (f\"PENDING HOOKS: {json.dumps(hooks, ensure_ascii=False)}\\n\" if hooks else \"\")\n        + (f\"PREVIOUS BRIEF: {json.dumps(previous_brief, ensure_ascii=False)}\\n\" if previous_brief else \"\")\n        + (f\"CANON LEDGER:\\n{ledger_text}\\n\" if ledger_text else \"\")\n        + (f\"CURRENT STEERING (player-facing):\\n{steering_text}\\n\" if steering_text else \"\")\n        + \"\\n\"\n        f\"RECENT PLAY:\\n{play_str}\\n\\n\"\n        f\"PLAYER ACTION:\\n{player_action}\\n\\n\"\n        \"Output ONLY the JSON brief.\"\n    )\n\n    messages = [\n        {\"role\": \"system\", \"content\": ANALYST_SYSTEM},\n        {\"role\": \"user\", \"content\": user_prompt},\n    ]\n\n    t0 = time.time()\n    timeout = max(0.1, float(cfg.analyst_timeout_sec))\n    attempts = max(0, int(cfg.analyst_retries)) + 1\n\n    def attempt():\n        \"\"\"One analyst call bounded by the remaining timeout budget (C4).\"\"\"\n        remaining = timeout - (time.time() - t0)\n        if remaining <= 0:\n            raise concurrent.futures.TimeoutError()\n        # No `with` block: its exit calls shutdown(wait=True) and would sit there until the\n        # model call finishes, which defeats the timeout (D-14).\n        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)\n        try:\n            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)\n            return future.result(timeout=remaining)\n        finally:\n            executor.shutdown(wait=False, cancel_futures=True)\n\n    try:\n        raw = None\n        for n in range(attempts):\n            try:\n                raw = attempt()\n                break\n            except concurrent.futures.TimeoutError:\n                raise\n            except Exception as e:\n                if n == attempts - 1 or not _is_retryable(e):\n                    raise\n        parsed = parse_json_tolerantly(raw)\n        if not parsed:\n            raise ValueError(\"Unparseable JSON from analyst\")\n        brief = clamp_brief(parsed, allowed_ids, defer_counts, ledger=ledger,\n                            player_action=player_action, recent_text=recent_text)\n        ms = int((time.time() - t0) * 1000)\n        return brief, \"analyst\", model, ms\n    except concurrent.futures.TimeoutError:\n        brief = make_fallback_brief(reason=\"timeout\", allowed_moves=allowed_moves, ledger=ledger,\n                                    player_action=player_action, recent_text=recent_text)\n        ms = int((time.time() - t0) * 1000)\n        return brief, \"fallback\", model, ms\n    except ValueError:\n        brief = make_fallback_brief(reason=\"invalid_response\", allowed_moves=allowed_moves, ledger=ledger,\n                                    player_action=player_action, recent_text=recent_text)\n        ms = int((time.time() - t0) * 1000)\n        return brief, \"fallback\", model, ms\n    except Exception:\n        brief = make_fallback_brief(reason=\"analyst_error\", allowed_moves=allowed_moves, ledger=ledger,\n                                    player_action=player_action, recent_text=recent_text)\n        ms = int((time.time() - t0) * 1000)\n        return brief, \"fallback\", model, ms\n\n\n# ---------------------------------------------------------------------------\n# OOC Notes responder\n# ---------------------------------------------------------------------------\n\nOOC_SYSTEM = (\n    \"You are the Dungeon Master responding OUT OF CHARACTER (OOC) to a player note.\\n\"\n    \"ROLE: Answer the player's question or clarification directly, plainly, and honestly.\\n\"\n    \"\\n\"\n    \"INPUTS: PREMISE, SUMMARY, the CANON LEDGER, CURRENT STEERING and RECENT PLAY. On conflict\\n\"\n    \"the ledger beats the summary, and the summary beats recent play.\\n\"\n    \"\\n\"\n    \"TASK: Answer in at most 120 words. Never advance the story, roll dice, or narrate in\\n\"\n    \"character.\\n\"\n    \"\\n\"\n    \"OUTPUT: The answer as plain prose. If, and only if, the player is proposing a canon fact\\n\"\n    \"or world detail, end with this block:\\n\"\n    '```json\\n{\"canon_proposal\": {\"id\": \"slug\", \"kind\": \"person|place|item|rule\", \"name\": \"...\", \"state\": \"...\"}}\\n```\\n'\n    \"Output only the answer and, when it applies, that one JSON block. No code fences around\\n\"\n    \"the prose, no commentary.\\n\"\n    \"\\n\"\n    \"RULES:\\n\"\n    \"1. Never invent a fact. If something is not established, say so plainly.\\n\"\n    \"2. When the player seems to want something that is not established, offer a canon\\n\"\n    \"   proposal rather than asserting it.\\n\"\n    \"3. Use the canonical names from the ledger.\\n\"\n    \"4. Do not hint at anything the player has not been shown.\\n\"\n    \"\\n\"\n    \"WHEN UNSURE: say it is not established, and offer a canon proposal.\"\n)\n\n\ndef handle_ooc_note(root, note_text, history, premise_text, summary_text, ledger_text, chat_fn,\n                    steering_text=\"\"):\n    \"\"\"Answer an OOC note, save to notes.jsonl, and return answer text.\"\"\"\n    clean_q = strip_ooc_prefix(note_text)\n    model = cfg.analyst_model or cfg.scribe_model or cfg.model\n\n    h_tail = history[-12:] if len(history) > 12 else history\n    play_str = \"\\n\".join(f\"{'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}\" for m in h_tail)\n\n    prompt = (\n        f\"PREMISE:\\n{premise_text}\\n\\n\"\n        f\"SUMMARY:\\n{summary_text}\\n\\n\"\n        f\"CANON LEDGER:\\n{ledger_text}\\n\\n\"\n        + (f\"CURRENT STEERING (player-facing):\\n{steering_text}\\n\\n\" if steering_text else \"\")\n        + f\"RECENT PLAY:\\n{play_str}\\n\\n\"\n        f\"PLAYER'S OOC NOTE:\\n{clean_q}\\n\"\n    )\n\n    messages = [\n        {\"role\": \"system\", \"content\": OOC_SYSTEM},\n        {\"role\": \"user\", \"content\": prompt},\n    ]\n\n    try:\n        reply = chat_fn(messages, model=model, track=False, retries=1, fallback=True)\n    except Exception as e:\n        reply = f\"[OOC: received your note. (Error answering: {e})]\"\n\n    # Extract proposal if present\n    proposal = None\n    if \"```json\" in reply:\n        try:\n            json_str = reply.split(\"```json\", 1)[1].split(\"```\", 1)[0].strip()\n            data = json.loads(json_str)\n            proposal = data.get(\"canon_proposal\")\n        except Exception:\n            pass\n    elif '{\"canon_proposal\"' in reply:\n        try:\n            data = parse_json_tolerantly(reply)\n            if data:\n                proposal = data.get(\"canon_proposal\")\n        except Exception:\n            pass\n\n    clean_a = re.sub(r\"```json.*?```\", \"\", reply, flags=re.S).strip()\n\n    note_entry = {\n        \"id\": str(uuid.uuid4())[:8],\n        \"ts\": int(time.time()),\n        \"q\": note_text,\n        \"a\": clean_a or reply,\n        \"canon\": False,\n        \"proposal\": proposal,\n    }\n    save_note(root, note_entry)\n    return note_entry\n
