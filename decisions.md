@@ -51,6 +51,11 @@ Alternatives considered: Generate all acts up front; generate each act only when
 
 Decision: The JSON brief format — fields `intent`, `assessment`, `outcome`, `plot_moves`, `keep_true`, `narration`, `clarify`, `act_complete` — is frozen. Changing it requires a new decision record.
 
+This field set remains the baseline. It is extended, not replaced, by D-20,
+which authorises the additions the steering handoff requires (`deferred`,
+`keep_true` as `{id, why}`, and the record pass's `objective`,
+`open_question` and `progress`).
+
 Alternatives considered: Free-form text brief; Markdown brief; schema versioned independently.
 
 ---
@@ -65,7 +70,13 @@ Alternatives considered: Keep notes in history with a tag; strip notes from cont
 
 ## D-07  Precedence
 
-Decision: Narration instruction precedence is per-turn brief > style block > system_prompt. The default system_prompt keeps its "120-220 words" line unchanged; each style preset states explicitly that it overrides length guidance.
+Decision: Narration instruction precedence is per-turn brief > style block > system_prompt. Each style preset states explicitly that it overrides length guidance.
+
+The clause stating that the default system_prompt keeps its "120-220 words"
+line unchanged is superseded by D-22: `brief.narration.words` becomes the
+single word target. The prompt rewrite that removes the hard-coded range lands
+in WP4 (E3); until then the two numbers coexist and D-22 records the intended
+end state.
 
 Alternatives considered: Last-wins (append order in the system message); style block always wins over system_prompt; brief is advisory only.
 
@@ -168,3 +179,33 @@ Alternatives considered: Keep scheduling state only in memory; replay the same d
 Decision: On timeout or error, the narrator receives a safe default brief using the frozen D-05 schema. A classified fallback reason is stored separately in `briefs.jsonl` metadata, not in the narrator prompt. This supersedes D-14's statement that the narrator receives no brief.
 
 Alternatives considered: Omit the brief entirely; include raw error text in the brief or narrator prompt.
+
+---
+
+## D-20  Steering requirements handoff
+
+Decision: The "Lean-DM: Steering Requirements" handoff (November 2026) is adopted as the governing ADR for the steering work. It is implemented in packages WP1–WP7, one branch and one PR per package, in order. Each package must ship alone with the existing suite green. The Step 0 reconciliation table is committed before any package is coded, and every Partial or Open requirement is implemented; Covered requirements are left alone.
+
+This supersedes D-05's freeze on the brief schema. The D-05 field set stays the baseline, but the handoff adds `deferred` (B4), changes `keep_true` to a list of `{id, why}` (C2), and adds `objective`, `open_question` and `progress` to the record pass (A2). Those additions are authorised by this record rather than by a separate one per field.
+
+Alternatives considered: One ADR per requirement (seven-plus records for one coherent feature); treat the handoff as a design note and keep D-05 frozen (blocks every package).
+
+---
+
+## D-21  Steering state ownership
+
+Decision: `steering.json` holds the player-facing objective, open question and live lead. The record pass is its single writer and runs after the reply is committed, so the state reflects what the player actually read. It runs whenever `steering_enabled` is on, even with `arc_enabled` off, and shares one model call with the arc when both are on. Snapshots live in `steering_snap/<msg>.json` and are restored by /undo and /retry. A failed update keeps the previous state, increments `turns_since_progress` and sets `source` to `fallback`.
+
+The file never contains arc ids, beat text, pressure ids or antagonist data (I8).
+
+Alternatives considered: Let the analyst write it (it runs before narration, so it would describe the turn the player has not read yet); store it in `state.json` (mixes engine pointers with player-facing text); no snapshots (undo would leave the Now panel describing a turn that no longer exists).
+
+---
+
+## D-22  Word budget single source
+
+Decision: `brief.narration.words` is the only word target. The default system prompt no longer states a number; when no brief exists a configured default applies. This supersedes D-07's statement that the default system_prompt keeps its "120-220 words" line unchanged.
+
+The prompt rewrite that removes the hard-coded range lands in WP4 (E3). Until then the two numbers still coexist, and this record documents the intended end state.
+
+Alternatives considered: Keep the range in the system prompt and let the brief override it (two sources of truth, the conflict the handoff reports); drop the brief field and keep only the prompt (loses per-turn control).
