@@ -24,6 +24,7 @@ BRIEF_SCHEMA = {
     "assessment": "The player acts.",
     "outcome": "clean",
     "plot_moves": [],
+    "deferred": [],
     "keep_true": [],
     "narration": {"words": 140, "push": 0.6, "end": "decision"},
     "clarify": None,
@@ -33,8 +34,12 @@ BRIEF_SCHEMA = {
 VALID_INTENTS = ("act", "ask", "steer", "wait")
 VALID_OUTCOMES = ("clean", "partial", "complication", "setback")
 VALID_ENDS = ("decision", "question", "beat")
-VALID_HOWS = ("overt", "subtle", "offscreen")
+VALID_HOWS = ("overt", "subtle", "offscreen", "offer")
 FALLBACK_REASONS = ("timeout", "invalid_response", "analyst_error")
+
+# B4: a due move may be deferred at most this many consecutive turns.
+MAX_DEFERS = 2
+MAX_DEFERRED = 8
 
 
 class _Brief(dict):
@@ -53,11 +58,24 @@ def parse_json_tolerantly(raw):
     return parsed if isinstance(parsed, dict) else None
 
 
-def clamp_brief(d, allowed_move_ids=None):
+def _defer_count(defer_counts, mid):
+    try:
+        return int((defer_counts or {}).get(mid, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _norm_how(value):
+    how = str(value or "").strip().lower()
+    return how if how in VALID_HOWS else "subtle"
+
+
+def clamp_brief(d, allowed_move_ids=None, defer_counts=None):
     """Clamp and validate raw dictionary to strict brief schema.
 
     allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
-    scheduled `how` and `note` are authoritative.
+    scheduled `how` and `note` are authoritative and every due move is mandatory (B4).
+    defer_counts: {move id: consecutive turns deferred}, used to force a move back in.
     """
     if not isinstance(d, dict):
         d = {}
@@ -75,6 +93,24 @@ def clamp_brief(d, allowed_move_ids=None):
     outcome = str(d.get("outcome", "")).strip().lower()
     out["outcome"] = outcome if outcome in VALID_OUTCOMES else "clean"
 
+    # deferred (B4): {id, reason}, capped
+    deferred = []
+    deferred_ids = set()
+    raw_deferred = d.get("deferred")
+    if isinstance(raw_deferred, list):
+        for item in raw_deferred:
+            if not isinstance(item, dict):
+                continue
+            did = str(item.get("id", "")).strip()
+            if not did or did in deferred_ids:
+                continue
+            if allowed_move_ids is not None and did not in allowed_move_ids:
+                continue
+            deferred_ids.add(did)
+            deferred.append({"id": did, "reason": str(item.get("reason", "")).strip()[:150]})
+            if len(deferred) >= MAX_DEFERRED:
+                break
+
     # plot_moves (cap at 2 moves max)
     raw_moves = d.get("plot_moves")
     moves = []
@@ -89,12 +125,9 @@ def clamp_brief(d, allowed_move_ids=None):
             if allowed_move_ids is not None and mid not in allowed_move_ids:
                 continue
             sched = allowed_move_ids.get(mid) if isinstance(allowed_move_ids, dict) else None
-            how = str(m.get("how", "subtle")).strip().lower()
-            if how not in VALID_HOWS:
-                how = "subtle"
+            how = _norm_how(m.get("how", "subtle"))
             if isinstance(sched, dict):
-                sched_how = str(sched.get("how", "subtle")).strip().lower()
-                how = sched_how if sched_how in VALID_HOWS else "subtle"
+                how = _norm_how(sched.get("how", "subtle"))
                 note = str(sched.get("note", "")).strip()[:200]
             else:
                 note = str(m.get("note", "")).strip()[:200]
@@ -102,7 +135,25 @@ def clamp_brief(d, allowed_move_ids=None):
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
                 break
+
+    # B4: every due move is mandatory. One in neither plot_moves nor deferred is added
+    # with its scheduled how/note; one deferred MAX_DEFERS times in a row is forced in.
+    if isinstance(allowed_move_ids, dict):
+        forced = {i for i in deferred_ids if _defer_count(defer_counts, i) >= MAX_DEFERS}
+        if forced:
+            deferred = [x for x in deferred if x["id"] not in forced]
+            deferred_ids -= forced
+        for mid, sched in allowed_move_ids.items():
+            if len(moves) >= 2:
+                break
+            if mid in seen or mid in deferred_ids:
+                continue
+            moves.append({"id": mid, "how": _norm_how(sched.get("how", "subtle")),
+                          "note": str(sched.get("note", "")).strip()[:200]})
+            seen.add(mid)
+
     out["plot_moves"] = moves
+    out["deferred"] = deferred
 
     # keep_true (<= 8 items)
     kt = d.get("keep_true")
@@ -142,7 +193,8 @@ def clamp_brief(d, allowed_move_ids=None):
     return out
 
 
-def make_fallback_brief(reason="fallback"):
+def make_fallback_brief(reason="fallback", allowed_moves=None):
+    """Built brief for a failed analyst call. Plays the due moves in code (B5)."""
     reason = reason if reason in FALLBACK_REASONS else "analyst_error"
     brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
                    diagnostics={"fallback_reason": reason})
@@ -152,6 +204,13 @@ def make_fallback_brief(reason="fallback"):
         "end": "decision",
     }
     brief["assessment"] = "Action proceeds."
+    played = []
+    for m in (allowed_moves or [])[:2]:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        played.append({"id": str(m["id"]), "how": _norm_how(m.get("how", "subtle")),
+                       "note": str(m.get("note", "")).strip()[:200]})
+    brief["plot_moves"] = played
     return brief
 
 
@@ -296,7 +355,8 @@ ANALYST_SYSTEM = (
     '  "intent": "act|ask|steer|wait",\n'
     '  "assessment": "one sentence: what the player attempts and how it lands in this scene",\n'
     '  "outcome": "clean|partial|complication|setback",\n'
-    '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen", "note": "what player perceives"}],\n'
+    '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen|offer", "note": "what player perceives"}],\n'
+    '  "deferred": [{"id": "move_id", "reason": "why it waits"}],\n'
     '  "keep_true": ["<=8 canon items at risk of contradiction"],\n'
     '  "narration": {"words": 140, "push": 0.7, "end": "decision|question|beat"},\n'
     '  "clarify": null,\n'
@@ -308,11 +368,14 @@ ANALYST_SYSTEM = (
     "- If intent is 'act': resolve per assessment/outcome.\n"
     "- 'clarify' only if intent is genuinely ambiguous (rarely).\n"
     "- Choose plot_moves ONLY from the allowed_moves provided. If none are allowed, return [].\n"
+    "- Every allowed move is MANDATORY: play it, or list it in 'deferred' with a reason.\n"
+    "- A move deferred twice in a row is played whether you defer it again or not.\n"
+    "- 'how' is set by the scheduler; never change it. 'offer' means a clear in-world opening.\n"
 )
 
 
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
-                ledger_text="", act_goal="", steering_text=""):
+                ledger_text="", act_goal="", steering_text="", defer_counts=None):
     """Run analyst model call with timeout and fallback."""
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
     allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
@@ -352,19 +415,19 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         parsed = parse_json_tolerantly(raw)
         if not parsed:
             raise ValueError("Unparseable JSON from analyst")
-        brief = clamp_brief(parsed, allowed_ids)
+        brief = clamp_brief(parsed, allowed_ids, defer_counts)
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
     except concurrent.futures.TimeoutError:
-        brief = make_fallback_brief(reason="timeout")
+        brief = make_fallback_brief(reason="timeout", allowed_moves=allowed_moves)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except ValueError:
-        brief = make_fallback_brief(reason="invalid_response")
+        brief = make_fallback_brief(reason="invalid_response", allowed_moves=allowed_moves)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except Exception:
-        brief = make_fallback_brief(reason="analyst_error")
+        brief = make_fallback_brief(reason="analyst_error", allowed_moves=allowed_moves)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     finally:
