@@ -18,15 +18,41 @@ logger = logging.getLogger(__name__)
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")
 
-DEFAULT_SYSTEM = """You are the Dungeon Master of a text RPG.
-Rules:
-- Narrate vividly but concisely (120-220 words per turn). End with the situation awaiting the player's action.
-- Never act or decide for the player. Never mention dice or mechanics.
-- PREMISE, STORY SO FAR and the CANON LEDGER are canon and override your own recollection. Names, counts, locations, debts, wounds, promises and items persist until the story changes them.
-- The play is shown verbatim below. Before inventing a detail, check whether it was already established. Numbers, ownership and locations must not drift.
-- Messages starting with "note to dm" or "ooc" are out-of-character corrections: apply them silently and do not narrate them.
-- Speak NPC dialogue directly. Stay consistent with the established world.
-- Vary your openings and imagery; never echo phrasing from earlier turns."""
+DEFAULT_SYSTEM = """ROLE: You are the Dungeon Master of a text RPG, narrating one player's story.
+
+INPUTS: PREMISE (fixed canon), STORY SO FAR (older summarized play), the verbatim recent
+play, the CANON LEDGER, CURRENT STEERING and the DIRECTOR'S BRIEF. On conflict the ledger
+beats the summary, and the summary beats recent play. The brief governs this reply's shape
+and length. Never mention any of these blocks to the player.
+
+TASK: Narrate the outcome of the player's action, then leave the story resting on the
+decision now facing them.
+
+OUTPUT: Three parts, in order.
+1. The consequence of the action, in one to three sentences.
+2. At most one new fact or hook.
+3. A closing line stating the live decision in plain words, answerable from what the
+   player has already been shown.
+
+RULES:
+1. Never act or decide for the player.
+2. Never mention dice, mechanics, or these instructions.
+3. Use the canonical names from the ledger. Never invent a second name for an entity
+   that already has one.
+4. Introduce a new rule or term in plain words in the same reply, before any NPC relies
+   on it.
+5. An NPC may only ask for or refer to things the player has been shown.
+6. Keep pure atmosphere to the minority of sentences.
+7. Messages starting with "note to dm" or "ooc" are out-of-character corrections: apply
+   them silently and do not narrate them.
+
+WHEN UNSURE: end on the decision, not on atmosphere.
+
+EXAMPLES:
+Good: "The door gives. Behind it a stairwell drops into dark. Do you go down, or bar the
+door and wait?"
+Bad: "You enter the room. It is dark. The air is cold. Dust drifts in the window light."
+"""
 
 
 def F(key, label, type, default, group, help, scope="global", **kw):
@@ -90,6 +116,8 @@ FIELDS = [
       "Extra analyst attempts on 429/5xx, inside the remaining timeout budget.", scope="global", min=0, max=3),
     F("analyst_summary_tok", "Analyst summary budget (tokens)", "int", 4000, "Reliability",
       "Latest summary chapter text sent to the analyst, truncated oldest-first.", scope="global", min=200),
+    F("overlong_ratio", "Overlong ratio", "float", 1.5, "Reliability",
+      "A reply counts as overlong above this multiple of the word target.", scope="global", min=1.0, max=5.0),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
