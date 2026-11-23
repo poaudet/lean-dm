@@ -105,7 +105,10 @@ FIELDS = [
     F("style_guard", "Style guard", "bool", False, "Style", "Prevent repetitive openers and overused phrases.", scope="campaign"),
     # ---- analyst & notes
     F("analyst_enabled", "Analyst brief", "bool", False, "Analyst", "Produce director's brief before narrator.", scope="campaign"),
-    F("notes_routing", "Notes routing", "bool", False, "Notes", "Route OOC notes outside of history into notes.jsonl.", scope="campaign"),
+    F("notes_routing", "Notes routing", "bool", True, "Notes",
+      "Route OOC notes outside of history into notes.jsonl.", scope="campaign"),
+    F("notes_in_context", "OOC answers in context", "int", 5, "Notes",
+      "How many recent OOC answers the narrator is told to treat as true.", scope="campaign", min=0),
     # ---- reliability
     F("retries", "Retries", "int", 6, "Reliability", "On 429/5xx/timeouts/empty replies.", scope="global", min=0, max=20),
     F("retry_base_sec", "Retry base delay (s)", "float", 5.0, "Reliability", "Exponential; Retry-After is honored. Capped at 90 s.", scope="global", min=0.5),
@@ -204,7 +207,7 @@ class Config:
             if "min" in f and n < f["min"]:
                 raise ValueError(f"must be ≥ {f['min']}")
             if "max" in f and n > f["max"]:
-                raise ValueError(f"must be ≤ {f['max']}")
+                raise ValueError(f\"must be ≤ {f['max']}\")
             return n
         s = "" if v is None else str(v)
         if t == "optfloat":
