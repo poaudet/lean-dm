@@ -51,6 +51,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 import analyst
 import arc
+import steering
 from campaign import Campaign
 from config import SETTINGS_PATH, cfg
 from ledger import KINDS as KINDS
@@ -126,8 +127,7 @@ def ensure_configured():
 def print_config():
     key = cfg.api_key[:6] + "…" if len(cfg.api_key) > 6 else ("***" if cfg.api_key else "(none)")
     print(f"settings={SETTINGS_PATH}")
-    print(f"endpoint={cfg.base_url}  key={key}")
-    print(f"model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
+    print(f"endpoint={cfg.base_url}  key={key}  model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
     print(f"campaign='{CAMPAIGN}'  fold {cfg.ctx_budget_tok // 1000}k→{cfg.ctx_target_tok // 1000}k tok  "
           f"ledger={'on' if cfg.ledger_enabled else 'off'}")
 
@@ -231,6 +231,7 @@ def build_context(history, brief=None):
         history, brief, folded_count=k, premise=read(PREMISE),
         summary=read(SUMMARY) if k else "",
         canon=render_ledger(load_ledger()) if cfg.ledger_enabled else "",
+        steering=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
     )
 
 def ctx_label():
@@ -666,9 +667,9 @@ def _record_kwargs(brief):
 
 def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     """Auto-plan a missing arc, then run the record pass for a committed turn."""
-    if not retry and arc.arc_is_corrupt(ROOT):
+    if cfg.arc_enabled and not retry and arc.arc_is_corrupt(ROOT):
         warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-    elif not retry and not arc.load_arc(ROOT):
+    elif cfg.arc_enabled and not retry and not arc.load_arc(ROOT):
         try:
             new_arc = arc.plan_initial_arc(
                 read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
@@ -684,9 +685,11 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
     try:
-        arc.prune_arc_snapshots(ROOT, max(folded(), ledgered()))
+        below = max(folded(), ledgered())
+        arc.prune_arc_snapshots(ROOT, below)
+        steering.prune_steering_snapshots(ROOT, below)
     except OSError as e:
-        logger.warning("Could not prune arc snapshots: %s", e)
+        logger.warning("Could not prune snapshots: %s", e)
 
 def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
     """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
@@ -702,11 +705,14 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
             lines, history = raw_history_lines(), load_history()
             _last_exchange(lines, history)
             text = history[-2]["content"]
-            if cfg.arc_enabled:
+            if cfg.arc_enabled or cfg.steering_enabled:
                 arc_backup = arc.backup_state(ROOT)
+            if cfg.arc_enabled:
                 arc.restore_arc_snapshot(ROOT, len(history) - 1)
                 arc.truncate_records(ROOT, len(history) - 1)
                 arc.truncate_arc_log(ROOT, len(history) - 1)
+            if cfg.steering_enabled:
+                steering.restore_steering_snapshot(ROOT, len(history) - 1)
             if stream and cfg.analyst_enabled and rerun_analyst:
                 yield {"stage": "analyzing"}
             brief = _retry_brief(history, rerun_analyst)
@@ -733,7 +739,8 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                 guard_items = compute_style_guard(history) if cfg.style_guard else []
                 brief, source, model_used, ms = analyst.run_analyst(
                     ROOT, history, text, allowed, guard_items, chat_complete,
-                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal()
+                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal(),
+                    steering_text=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
                 )
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
@@ -770,7 +777,7 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
         set_state(last_words=words, overlong=overlong)
 
-        if cfg.arc_enabled:
+        if cfg.arc_enabled or cfg.steering_enabled:
             if stream:
                 try:
                     yield {"stage": "recording"}
@@ -816,6 +823,8 @@ def undo_turn():
             arc.restore_arc_snapshot(ROOT, len(h) - 1)
             arc.truncate_records(ROOT, len(h) - 2)
             arc.truncate_arc_log(ROOT, len(h) - 2)
+        if cfg.steering_enabled:
+            steering.restore_steering_snapshot(ROOT, len(h) - 1)
         analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
         atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-2]))
@@ -907,6 +916,7 @@ def game_state():
         "difficulty": cfg.difficulty,
         "style_preset": cfg.style_preset,
         "style_notes": cfg.style_notes,
+        "steering": steering.player_fields(steering.load_steering(ROOT)) if cfg.steering_enabled else None,
     }
 
 
@@ -1046,7 +1056,7 @@ def api_turn():
         return jsonify({"error": str(e)}), 502
 
 class ThinkFilter:
-    """Hide <think>…</think> text from a live stream, tolerating tags split across chunks."""
+    """Hide … text from a live stream, tolerating tags split across chunks."""
     def __init__(self):
         self.buf, self.hidden = "", False
 
@@ -1054,7 +1064,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</think>" if self.hidden else "<think>"
+            tag = "" if self.hidden else ""
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:
@@ -1326,7 +1336,7 @@ def api_config_test():
 def cli():
     history = load_history()
     print(f"=== Campaign '{CAMPAIGN}' — {sum(m['role'] == 'user' for m in history)} turns — "
-          f"/undo /retry /context /ledger /rebuild /audit /quit ===\n")
+          f"/undo /retry /now /context /ledger /rebuild /audit /quit ===\n")
     if not history:
         print("(new campaign — open with your character concept and the opening scene; "
               "this first message is pinned as the premise)\n")
@@ -1355,6 +1365,12 @@ def cli():
                 print(read(AUDIT), "\n")
             elif player == "/undo":
                 print(f"[removed; your move was: {undo_turn()}]\n")
+            elif player == "/now":
+                state = steering.load_steering(ROOT)
+                if not state:
+                    print("(no steering state yet — enable steering_enabled and play a turn)\n")
+                else:
+                    print((steering.render_steering(state) or "(nothing recorded yet)") + "\n")
             elif player == "/notes":
                 notes = analyst.load_notes(ROOT)
                 if not notes:
@@ -1379,7 +1395,7 @@ def cli():
                 retry_turn(stream=True, rerun_analyst=(player == "retry!"))
                 print(f"\n\n[{ctx_label()}]\n")
             elif player.startswith("/"):
-                print("[commands: /undo /retry retry! /brief /notes /context /ledger /rebuild /audit /quit]\n")
+                print("[commands: /undo /retry retry! /brief /notes /now /context /ledger /rebuild /audit /quit]\n")
             else:
                 print()
                 player_turn(player, stream=True)
