@@ -10,6 +10,7 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
 - **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
+- **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Contains no arc data.
 - **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
 - **Out-of-Character (OOC) Notes Routing (P2)**: Messages starting with `//`, `ooc`, or `note to dm:` bypass `history.jsonl` and are answered out of character in `notes.jsonl`. Promoted to canon only upon explicit request.
 - **Writing Style Enforcement & Style Guard (P1)**: Style presets in `styles/` (`subtle`, `pulp`, `noir`, `terse`) with word count ranges, push factor, and style notes. Pure deterministic `style_guard` prevents repetitive sentence openers and overused 3-grams.
@@ -25,6 +26,7 @@ lean-dm/
 ├── config.py                 # Configuration schema, coercion & dual-scope persistence
 ├── analyst.py                # Pre-turn director's brief & OOC notes routing
 ├── arc.py                    # Hidden arc planning, difficulty scheduling & record pass
+├── steering.py               # Player-facing steering state (objective, open question)
 ├── campaign.py               # Campaign filesystem paths and locks
 ├── ledger.py                 # Canon ledger operations and rendering
 ├── narrator_context.py       # Narrator context and style instructions
@@ -39,8 +41,9 @@ lean-dm/
 │   ├── index.html
 │   ├── config.html
 │   ├── app.js
+│   ├── now.js
 │   └── style.css
-├── decisions.md              # Architecture decision records (D-01 through D-19)
+├── decisions.md              # Architecture decision records (D-01 through D-22)
 ├── Dockerfile                # Container definition
 ├── docker-compose.yaml
 └── campaigns/
@@ -56,6 +59,9 @@ lean-dm/
         ├── state.json        # Engine pointers (folded, ledgered, audited)
         ├── briefs.jsonl      # Analyst director briefs keyed by player msg index
         ├── notes.jsonl       # OOC notes & canon proposals
+        ├── steering.json     # Player-facing objective and open question
+        ├── steering_snap/    # Pre-turn steering snapshots for safe undo/retry
+        │   └── <msg>.json
         ├── arc.json          # Hidden narrative arc & pressure clock (never leaked)
         ├── arc_log.jsonl     # Arc revision log (act boundaries)
         ├── records.jsonl     # Per-turn record pass output
@@ -83,6 +89,7 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `ledger_enabled` | bool | `true` | global | Context | Enable keyed canon ledger |
 | `difficulty` | select | `standard` | campaign | Gameplay | Pacing: `story`, `standard`, `hard` |
 | `arc_enabled` | bool | `false` | campaign | Gameplay | Enable hidden narrative arc manager |
+| `steering_enabled` | bool | `false` | campaign | Gameplay | Track the player-facing objective and open question |
 | `style_enabled` | bool | `false` | campaign | Style | Enable style enforcement |
 | `style_preset` | select | `none` | campaign | Style | Preset: `none`, `subtle`, `pulp`, `noir`, `terse` |
 | `style_words_min` | int | `0` | campaign | Style | Minimum words per reply (0 = off) |
@@ -140,6 +147,7 @@ python dm.py --show-context
 - `retry!`: Re-runs the analyst model and regenerates the DM reply.
 - `/brief`: Displays the analyst brief for the last turn after an explicit spoiler confirmation (D-10).
 - `/notes`: Lists out-of-character notes and their canon status.
+- `/now`: Shows the current objective and open question.
 - `/ledger`: Displays the active and resolved canon ledger entries.
 - `/context`: Displays assembled context.
 - `/rebuild`: Rebuilds the canon ledger from raw history.
@@ -153,7 +161,7 @@ python dm.py --show-context
 - `GET /healthz`: Unauthenticated liveness probe for container healthchecks.
 - `GET /`: Game interface.
 - `GET /config`: Settings management interface.
-- `GET /api/state`: Returns game status, turns, ledger, premise, and non-spoiler arc chip.
+- `GET /api/state`: Returns game status, turns, ledger, premise, non-spoiler arc chip, and the player-facing steering fields.
 - `POST /api/turn`: Standard turn completion (`{"text": "..."}`).
 - `POST /api/stream`: Server-Sent Events (SSE) streaming turn with stages: `analyzing` → `narrating` → `recording`.
 - `POST /api/undo`: Rewinds last exchange.
@@ -185,6 +193,7 @@ Test coverage:
 - `tests/test_p2.py`: Analyst briefs, timeouts, fallbacks, OOC notes routing, canon promotion.
 - `tests/test_p3.py`: Hidden arc, scheduling, difficulty bending table, and sentinel leak tests.
 - `tests/test_p4.py`: Web UI assets, SSE streaming, HTTP Basic auth, premise/ledger editing, ZIP and transcript exports.
+- `tests/test_wp1_steering.py`: Steering state — single writer, rollback, prompt injection, UI fields.
 
 ---
 
@@ -192,4 +201,5 @@ Test coverage:
 
 1. **Backwards Compatibility**: With all new features at their defaults (`false` / `none` / `""`), prompt generation is byte-identical to v3 (Invariants I11).
 2. **Opt-in Arc**: Existing campaigns continue unchanged. Enable arc management by setting `arc_enabled: true` in settings or running `python dm.py --campaign <name> --plan-arc`.
-3. **No Migration Needed**: Old `settings.json` files automatically load with sensible defaults for new fields.
+3. **Opt-in Steering**: Set `steering_enabled: true` to track the objective and open question. It works with or without the arc.
+4. **No Migration Needed**: Old `settings.json` files automatically load with sensible defaults for new fields.
