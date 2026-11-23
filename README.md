@@ -10,6 +10,7 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
 - **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
+- **Beat Hooks & Mandatory Moves (WP2)**: Each beat carries a spoiler-safe `hook` — a lead the player can perceive — which `allowed_moves()` pushes once the act stalls. Every due move is mandatory: the analyst plays it or lists it in `deferred`, and `clamp_brief` forces in anything it drops. A hook escalates subtle → overt → offer while it goes unanswered.
 - **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Contains no arc data.
 - **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
 - **Out-of-Character (OOC) Notes Routing (P2)**: Messages starting with `//`, `ooc`, or `note to dm:` bypass `history.jsonl` and are answered out of character in `notes.jsonl`. Promoted to canon only upon explicit request.
@@ -43,7 +44,7 @@ lean-dm/
 │   ├── app.js
 │   ├── now.js
 │   └── style.css
-├── decisions.md              # Architecture decision records (D-01 through D-22)
+├── decisions.md              # Architecture decision records (D-01 through D-24)
 ├── Dockerfile                # Container definition
 ├── docker-compose.yaml
 └── campaigns/
@@ -194,6 +195,7 @@ Test coverage:
 - `tests/test_p3.py`: Hidden arc, scheduling, difficulty bending table, and sentinel leak tests.
 - `tests/test_p4.py`: Web UI assets, SSE streaming, HTTP Basic auth, premise/ledger editing, ZIP and transcript exports.
 - `tests/test_wp1_steering.py`: Steering state — single writer, rollback, prompt injection, UI fields.
+- `tests/test_wp2_beat_moves.py`: Beat hooks, mandatory moves, escalation, and the fallback that plays.
 
 ---
 
