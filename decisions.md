@@ -74,9 +74,8 @@ Decision: Narration instruction precedence is per-turn brief > style block > sys
 
 The clause stating that the default system_prompt keeps its "120-220 words"
 line unchanged is superseded by D-22: `brief.narration.words` becomes the
-single word target. The prompt rewrite that removes the hard-coded range lands
-in WP4 (E3); until then the two numbers coexist and D-22 records the intended
-end state.
+single word target. WP4 (E3) removed the hard-coded range from DEFAULT_SYSTEM,
+so the two numbers no longer coexist.
 
 Alternatives considered: Last-wins (append order in the system message); style block always wins over system_prompt; brief is advisory only.
 
@@ -206,7 +205,7 @@ Alternatives considered: Let the analyst write it (it runs before narration, so 
 
 Decision: `brief.narration.words` is the only word target. The default system prompt no longer states a number; when no brief exists a configured default applies. This supersedes D-07's statement that the default system_prompt keeps its "120-220 words" line unchanged.
 
-The prompt rewrite that removes the hard-coded range lands in WP4 (E3). Until then the two numbers still coexist, and this record documents the intended end state.
+WP4 (E3) implements this: `DEFAULT_SYSTEM` states no count, `narrator_context.word_target()` resolves the target, and the assembled prompt carries exactly one "Word target:" line.
 
 Alternatives considered: Keep the range in the system prompt and let the brief override it (two sources of truth, the conflict the handoff reports); drop the brief field and keep only the prompt (loses per-turn control).
 
@@ -233,3 +232,32 @@ Decision: Every move `allowed_moves()` returns is mandatory. The analyst plays i
 `make_fallback_brief` takes the allowed list and plays the due moves in code, so a timeout or 429 never drops them.
 
 Alternatives considered: Trust the model to honour the instruction (the handoff reports that nothing currently requires it); drop deferred moves entirely (loses the analyst's ability to hold a move for a scene that is mid-beat); let the fallback brief stay empty (silently loses pacing on every provider hiccup).
+
+---
+
+## D-25  Narrator reply shape and field meanings
+
+Decision: Every narrator reply has three parts: the consequence of the action in one to three sentences, at most one new fact or hook, and a closing line stating the live decision in plain words. This lives in `DEFAULT_SYSTEM` (E1), so it applies whether or not style enforcement is on.
+
+The brief's fields are defined for the narrator in the prompt, not left implicit (E2). `narrator_context.brief_fields()` renders each field's meaning with this turn's values and is appended to the brief block, so it is present even with `style_enabled` off:
+
+- `end=decision` — the closing line states the choice facing the player.
+- `end=question` — the closing line is a direct question from an NPC or the world.
+- `end=beat` — the closing line is an event, with the decision implied.
+- `push` — at most `round((1 - push) * 100)` percent of sentences may be pure atmosphere.
+- `clarify` — ask that one short in-character question and advance nothing.
+- `intent=ask` — answer directly in at most 80 words, with no new events.
+
+The "end on a decision" rule previously lived only in the `style_enabled` block, so it vanished when style was off. It is now unconditional.
+
+Alternatives considered: Keep the field meanings in the analyst prompt only (the narrator never sees the analyst prompt); hard-code the meanings in the brief JSON (unreadable to the model); rely on the model inferring `end` from the value name (the handoff reports this is exactly what fails).
+
+---
+
+## D-26  Post-check instead of regeneration
+
+Decision: Streaming makes silent regeneration impossible, so the narrator's reply is checked after the fact rather than rewritten. `dm.compute_shape_ok()` verifies the closing line matches the requested `end` (a question mark for `question`, a non-empty closing line otherwise). `overlong` is computed against the brief's word target times `overlong_ratio` (default 1.5), not against `style_words_max`, so it works with style enforcement off.
+
+Both flags are stored in `state.json` and exposed by `game_state()`, and the UI offers a one-click retry-shorter that regenerates with the budget multiplied by `SHORTER_RATIO` (0.7). The reduced budget is recorded as `word_budget` so the check applies to the retried reply too.
+
+Alternatives considered: Regenerate silently when the shape is wrong (impossible mid-stream, and doubles cost); block the reply until it passes (breaks streaming); only check when `style_enabled` (the handoff reports this is why the check never fired).
