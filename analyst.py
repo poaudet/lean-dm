@@ -41,6 +41,11 @@ FALLBACK_REASONS = ("timeout", "invalid_response", "analyst_error")
 MAX_DEFERS = 2
 MAX_DEFERRED = 8
 
+# C2: keep_true limits.
+MAX_KEEP_TRUE = 8
+MAX_FREE_TEXT = 3
+RECENT_EXCHANGES = 3
+
 
 class _Brief(dict):
     """Brief carrying diagnostics outside its narrator-visible dictionary fields."""
@@ -70,12 +75,103 @@ def _norm_how(value):
     return how if how in VALID_HOWS else "subtle"
 
 
-def clamp_brief(d, allowed_move_ids=None, defer_counts=None):
+def _ledger_entry(ledger, ref):
+    """Resolve an analyst keep_true reference to a ledger entry, by id or name."""
+    if not isinstance(ledger, list):
+        return None
+    key = str(ref or "").strip().lower()
+    if not key:
+        return None
+    for e in ledger:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("id", "")).strip().lower() == key:
+            return e
+    for e in ledger:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("name", "")).strip().lower() == key:
+            return e
+    return None
+
+
+def _keep_true_line(entry):
+    """The authoritative 'name: state' line the narrator sees for a ledger entry."""
+    name = str(entry.get("name") or entry.get("id") or "").strip()
+    state = str(entry.get("state") or "").strip()
+    return f"{name}: {state}" if state else name
+
+
+def _mentioned(entry, text):
+    """True when the entry's name or id appears in the text."""
+    if not text:
+        return False
+    low = str(text).lower()
+    for field in ("name", "id"):
+        token = str(entry.get(field) or "").strip().lower()
+        if token and token in low:
+            return True
+    return False
+
+
+def _recent_text(history, exchanges=RECENT_EXCHANGES):
+    """The last N exchanges flattened to text, for pinned-entry matching."""
+    if not isinstance(history, list) or not history:
+        return ""
+    tail = history[-2 * exchanges:] if len(history) > 2 * exchanges else history
+    return "\n".join(str(m.get("content", "")) for m in tail if isinstance(m, dict))
+
+
+def _clamp_keep_true(raw, ledger, player_action, recent_text):
+    """C2: ledger ids only, pinned entries named in play first, free text last."""
+    pinned, chosen, seen = [], [], set()
+    free_text = []
+
+    if isinstance(raw, list):
+        for item in raw:
+            why = ""
+            ref = item
+            if isinstance(item, dict):
+                ref = item.get("id") or item.get("name")
+                why = str(item.get("why", "")).strip()
+            entry = _ledger_entry(ledger, ref)
+            if entry is None:
+                text = str(ref or "").strip()
+                if text and len(free_text) < MAX_FREE_TEXT:
+                    free_text.append(text[:150])
+                continue
+            eid = str(entry.get("id"))
+            if eid in seen:
+                continue
+            seen.add(eid)
+            chosen.append(entry)
+
+    # Active pinned entries named in the action or the recent play are always kept.
+    for e in ledger if isinstance(ledger, list) else []:
+        if not isinstance(e, dict) or not e.get("pinned"):
+            continue
+        if e.get("status") == "closed":
+            continue
+        eid = str(e.get("id"))
+        if eid in seen:
+            continue
+        if _mentioned(e, player_action) or _mentioned(e, recent_text):
+            seen.add(eid)
+            pinned.append(e)
+
+    lines = [_keep_true_line(e) for e in pinned + chosen]
+    lines += free_text
+    return lines[:MAX_KEEP_TRUE]
+
+
+def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
+                player_action="", recent_text=""):
     """Clamp and validate raw dictionary to strict brief schema.
 
     allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
     scheduled `how` and `note` are authoritative and every due move is mandatory (B4).
     defer_counts: {move id: consecutive turns deferred}, used to force a move back in.
+    ledger: the canon ledger, used to resolve keep_true ids to authoritative lines (C2).
     """
     if not isinstance(d, dict):
         d = {}
@@ -155,12 +251,9 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None):
     out["plot_moves"] = moves
     out["deferred"] = deferred
 
-    # keep_true (<= 8 items)
-    kt = d.get("keep_true")
-    if isinstance(kt, list):
-        out["keep_true"] = [str(x).strip()[:150] for x in kt if str(x).strip()][:8]
-    else:
-        out["keep_true"] = []
+    # keep_true (C2: ledger ids resolved to authoritative lines, pinned first)
+    out["keep_true"] = _clamp_keep_true(
+        d.get("keep_true"), ledger, player_action, recent_text)
 
     # narration
     narr = d.get("narration") if isinstance(d.get("narration"), dict) else {}
@@ -193,8 +286,9 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None):
     return out
 
 
-def make_fallback_brief(reason="fallback", allowed_moves=None):
-    """Built brief for a failed analyst call. Plays the due moves in code (B5)."""
+def make_fallback_brief(reason="fallback", allowed_moves=None, ledger=None, player_action="",
+                        recent_text=""):
+    """Built brief for a failed analyst call. Plays the due moves in code (B5, C3)."""
     reason = reason if reason in FALLBACK_REASONS else "analyst_error"
     brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
                    diagnostics={"fallback_reason": reason})
@@ -211,6 +305,7 @@ def make_fallback_brief(reason="fallback", allowed_moves=None):
         played.append({"id": str(m["id"]), "how": _norm_how(m.get("how", "subtle")),
                        "note": str(m.get("note", "")).strip()[:200]})
     brief["plot_moves"] = played
+    brief["keep_true"] = _clamp_keep_true([], ledger, player_action, recent_text)
     return brief
 
 
@@ -357,7 +452,7 @@ ANALYST_SYSTEM = (
     '  "outcome": "clean|partial|complication|setback",\n'
     '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen|offer", "note": "what player perceives"}],\n'
     '  "deferred": [{"id": "move_id", "reason": "why it waits"}],\n'
-    '  "keep_true": ["<=8 canon items at risk of contradiction"],\n'
+    '  "keep_true": [{"id": "ledger_id", "why": "what must stay true"}],\n'
     '  "narration": {"words": 140, "push": 0.7, "end": "decision|question|beat"},\n'
     '  "clarify": null,\n'
     '  "act_complete": false\n'
@@ -371,14 +466,39 @@ ANALYST_SYSTEM = (
     "- Every allowed move is MANDATORY: play it, or list it in 'deferred' with a reason.\n"
     "- A move deferred twice in a row is played whether you defer it again or not.\n"
     "- 'how' is set by the scheduler; never change it. 'offer' means a clear in-world opening.\n"
+    "- 'keep_true' takes ledger ids only. An id not in the ledger is dropped.\n"
+    "- Authority on conflict: ledger beats summary beats recent play.\n"
 )
 
 
+def _truncate_tok(text, budget):
+    """Keep the newest `budget` tokens of text, cutting oldest-first (C1)."""
+    if not text:
+        return ""
+    limit = max(200, int(budget)) * max(0.5, float(cfg.chars_per_tok))
+    limit = int(limit)
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _is_retryable(exc):
+    """C4: retry once on 429/5xx, mirroring dm.ApiError.retry."""
+    if isinstance(exc, concurrent.futures.TimeoutError):
+        return False
+    if getattr(exc, "retry", False) is True:
+        return True
+    text = str(exc)
+    return text.startswith("HTTP 5") or text.startswith("HTTP 429")
+
+
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
-                ledger_text="", act_goal="", steering_text="", defer_counts=None):
-    """Run analyst model call with timeout and fallback."""
+                ledger_text="", act_goal="", steering_text="", defer_counts=None,
+                premise="", summary="", hooks=None, previous_brief=None, ledger=None):
+    """Run analyst model call with timeout, one retry, and fallback (C1, C4)."""
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
     allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
+    recent_text = _recent_text(history)
 
     n_turns = cfg.analyst_context_turns
     h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history
@@ -389,7 +509,11 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
         f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
         f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
+        + (f"PREMISE:\n{premise}\n" if premise else "")
         + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
+        + (f"STORY SO FAR:\n{_truncate_tok(summary, cfg.analyst_summary_tok)}\n" if summary else "")
+        + (f"PENDING HOOKS: {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
+        + (f"PREVIOUS BRIEF: {json.dumps(previous_brief, ensure_ascii=False)}\n" if previous_brief else "")
         + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
         + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
         + "\n"
@@ -405,33 +529,55 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
 
     t0 = time.time()
     timeout = max(0.1, float(cfg.analyst_timeout_sec))
+    attempts = max(0, int(cfg.analyst_retries)) + 1
 
-    # No `with` block: its exit calls shutdown(wait=True) and would sit there until the
-    # model call finishes, which defeats the timeout (D-14).
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    def attempt():
+        """One analyst call bounded by the remaining timeout budget (C4)."""
+        remaining = timeout - (time.time() - t0)
+        if remaining <= 0:
+            raise concurrent.futures.TimeoutError()
+        # No `with` block: its exit calls shutdown(wait=True) and would sit there until the
+        # model call finishes, which defeats the timeout (D-14).
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
+            return future.result(timeout=remaining)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     try:
-        future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
-        raw = future.result(timeout=timeout)
+        raw = None
+        for n in range(attempts):
+            try:
+                raw = attempt()
+                break
+            except concurrent.futures.TimeoutError:
+                raise
+            except Exception as e:
+                if n == attempts - 1 or not _is_retryable(e):
+                    raise
         parsed = parse_json_tolerantly(raw)
         if not parsed:
             raise ValueError("Unparseable JSON from analyst")
-        brief = clamp_brief(parsed, allowed_ids, defer_counts)
+        brief = clamp_brief(parsed, allowed_ids, defer_counts, ledger=ledger,
+                            player_action=player_action, recent_text=recent_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
     except concurrent.futures.TimeoutError:
-        brief = make_fallback_brief(reason="timeout", allowed_moves=allowed_moves)
+        brief = make_fallback_brief(reason="timeout", allowed_moves=allowed_moves, ledger=ledger,
+                                    player_action=player_action, recent_text=recent_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except ValueError:
-        brief = make_fallback_brief(reason="invalid_response", allowed_moves=allowed_moves)
+        brief = make_fallback_brief(reason="invalid_response", allowed_moves=allowed_moves, ledger=ledger,
+                                    player_action=player_action, recent_text=recent_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except Exception:
-        brief = make_fallback_brief(reason="analyst_error", allowed_moves=allowed_moves)
+        brief = make_fallback_brief(reason="analyst_error", allowed_moves=allowed_moves, ledger=ledger,
+                                    player_action=player_action, recent_text=recent_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
