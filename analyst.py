@@ -303,9 +303,11 @@ def make_fallback_brief(reason="fallback", allowed_moves=None, ledger=None, play
                         recent_text="", steering_text=""):
     """Built brief for a failed analyst call. Plays the due moves in code (B5, C3).
 
-    C3: keep_true is built from pinned and name-matched ledger entries, the due moves
-    are played, and the previous steering target is carried through unchanged so a
-    provider hiccup never loses the player's current objective.
+    C3: keep_true is built from pinned and name-matched ledger entries and the due moves
+    are played. The brief carries no steering key (D-28): the narrator already receives
+    steering in its own block, and this path never writes steering.json, so the previous
+    target survives untouched. `steering_text` is accepted for call-site compatibility
+    and deliberately unused.
     """
     reason = reason if reason in FALLBACK_REASONS else "analyst_error"
     brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
@@ -324,8 +326,6 @@ def make_fallback_brief(reason="fallback", allowed_moves=None, ledger=None, play
                        "note": str(m.get("note", "")).strip()[:200]})
     brief["plot_moves"] = played
     brief["keep_true"] = _clamp_keep_true([], ledger, player_action, recent_text)
-    # C3: the previous steering target survives a failed analyst call.
-    brief["steering"] = steering_text
     return brief
 
 
