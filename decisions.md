@@ -64,6 +64,9 @@ Alternatives considered: Free-form text brief; Markdown brief; schema versioned 
 
 Decision: OOC notes bypass `history.jsonl` and are stored in `notes.jsonl`. Notes become canon only on explicit player request. Legacy notes already in history and the system-prompt line about them stay untouched.
 
+D-27 records the `notes_routing` default flip to on (D2) and the recent-answers
+context block (D3).
+
 Alternatives considered: Keep notes in history with a tag; strip notes from context at build time; store notes in the ledger with `src="note"`.
 
 ---
@@ -205,7 +208,7 @@ Alternatives considered: Let the analyst write it (it runs before narration, so 
 
 Decision: `brief.narration.words` is the only word target. The default system prompt no longer states a number; when no brief exists a configured default applies. This supersedes D-07's statement that the default system_prompt keeps its "120-220 words" line unchanged.
 
-WP4 (E3) implements this: `DEFAULT_SYSTEM` states no count, `narrator_context.word_target()` resolves the target, and the assembled prompt carries exactly one "Word target:" line.
+WP4 (E3) implements this: `DEFAULT_SYSTEM` states no count, `narrator_context.word_target()` resolves the target, and the assembled prompt states the target exactly once. With a brief that is the "Word target:" line; with no brief and style enforcement on it is the style block's "Target length:" line, and the standalone line is suppressed so the same number is never stated twice.
 
 Alternatives considered: Keep the range in the system prompt and let the brief override it (two sources of truth, the conflict the handoff reports); drop the brief field and keep only the prompt (loses per-turn control).
 
@@ -219,7 +222,7 @@ Decision: Each beat carries a `hook` — at most 200 characters, a lead the play
 
 While a hook goes unanswered its level rises: subtle, then overt after two stalled turns, then offer after four. **This escalation overrides the overt cooldown** (the handoff's B3 requires this and asks for it to be recorded here). The level is derived from `stalled_turns` rather than stored per beat, so it resets automatically when the beat is completed or superseded.
 
-Playing a hook does not mark the beat done; only the record pass does (B6).
+Playing a hook does not mark the beat done; only the record pass does (B6). For the same reason a played hook does not reset `stalled_turns` — only a completed beat does, otherwise showing a hook would drop the escalation back to `subtle` while the beat was still pending.
 
 Alternatives considered: Store the escalation level on the beat (needs its own reset path and a new snapshot field); let the analyst choose `how` for beat moves (the scheduler owns pacing, per the existing clamp); expose beat text instead of a hook (violates I8).
 
@@ -260,4 +263,18 @@ Decision: Streaming makes silent regeneration impossible, so the narrator's repl
 
 Both flags are stored in `state.json` and exposed by `game_state()`, and the UI offers a one-click retry-shorter that regenerates with the budget multiplied by `SHORTER_RATIO` (0.7). The reduced budget is recorded as `word_budget` so the check applies to the retried reply too.
 
+**Status: the decision is taken but E4 is not yet implemented.** The current code still computes `overlong` from `style_words_max` with a hard-coded `1.5`, so it is permanently false at the default `style_words_max = 0`; `compute_shape_ok`, `shape_ok`, `word_budget` and the retry-shorter path do not exist yet. This entry describes the target, not the shipped behaviour.
+
 Alternatives considered: Regenerate silently when the shape is wrong (impossible mid-stream, and doubles cost); block the reply until it passes (breaks streaming); only check when `style_enabled` (the handoff reports this is why the check never fired).
+
+---
+
+## D-27  OOC notes default on and recent answers in context
+
+Decision: `notes_routing` defaults to `true` for every campaign (D2). The handoff reports that OOC answers were never visible to the narrator afterwards and that routing was off by default, so the player had to opt in to get an answer at all and the answer was then forgotten.
+
+The last `notes_in_context` (campaign, default 5) OOC answers are rendered by `narrator_context.render_notes()` into the volatile last-message area as things the player was told out of character — treat as true, never mention (D3). Canon promotion is unchanged: a note only becomes canon on explicit player request (D-06).
+
+The OOC prompt is grounded in the steering state (D4): `handle_ooc_note` accepts `steering_text` and renders it alongside the premise, summary and ledger, under a rule never to invent a fact and to offer a canon proposal when something is not established.
+
+Alternatives considered: Keep routing opt-in (the handoff reports this is why the path was invisible); replay every OOC exchange every turn (unbounded prompt growth); promote OOC answers to canon automatically (D-06 forbids it).
