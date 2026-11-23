@@ -109,6 +109,7 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
     if premise:
         parts.append("PREMISE (fixed canon):\n" + premise)
     target = word_target(brief)
+    style_states_target = False
     if cfg.style_enabled:
         style_parts = []
         preset = cfg.style_preset
@@ -125,6 +126,7 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
                 style_parts.append(f"Target length: at most {cfg.style_words_max} words per reply.")
             else:
                 style_parts.append(f"Target length: at least {cfg.style_words_min} words per reply.")
+            style_states_target = True
         if cfg.style_push > 0:
             style_parts.append(f"Style push: {cfg.style_push}/100.")
         if cfg.style_notes and cfg.style_notes.strip():
@@ -136,8 +138,10 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
         parts.append("STYLE:\n" + "\n\n".join(style_parts))
     if folded_count and summary:
         parts.append("STORY SO FAR (older play, already summarized; everything after it is verbatim below):\n" + summary)
-    # E3: exactly one word target in the assembled prompt.
-    parts.append(f"Word target: {target} words for this reply.")
+    # E3: exactly one word target in the assembled prompt. When the style block already
+    # stated it (no brief, style on), do not repeat the same number a second time.
+    if not style_states_target:
+        parts.append(f"Word target: {target} words for this reply.")
     tail = history[min(folded_count, len(history) - 1):]
     if tail and tail[0]["role"] == "assistant":         # only if history parity was ever disturbed
         tail = tail[1:]
