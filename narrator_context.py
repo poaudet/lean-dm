@@ -79,7 +79,31 @@ def brief_fields(brief):
     return "\n".join(lines)
 
 
-def assemble_context(history, brief=None, *, folded_count, premise, summary, canon, steering=""):
+def render_notes(notes, limit=None):
+    """D3: the last K OOC answers, as things the player was told out of character."""
+    if not isinstance(notes, list) or not notes:
+        return ""
+    if limit is None:
+        limit = cfg.notes_in_context
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 5
+    if not limit:
+        return ""
+    lines = []
+    for n in notes[-limit:]:
+        if not isinstance(n, dict):
+            continue
+        a = str(n.get("a", "")).strip()
+        if not a:
+            continue
+        lines.append(f"- You told the player (out of character): {a}")
+    return "\n".join(lines)
+
+
+def assemble_context(history, brief=None, *, folded_count, premise, summary, canon, steering="",
+                     notes=""):
     """Assemble a prompt using a snapshot of campaign state."""
     parts = [cfg.system_prompt]
     if premise:
@@ -120,7 +144,7 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
     msgs = merge_same_role(tail)
     has_player_action = bool(msgs and msgs[-1]["role"] == "user")
     guard = compute_style_guard(history) if cfg.style_guard and has_player_action else []
-    has_extra_instructions = bool(guard or brief or steering)
+    has_extra_instructions = bool(guard or brief or steering or notes)
     if canon and has_player_action:   # volatile part goes LAST to keep the prefix cacheable
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nCANON LEDGER — authoritative current state. If it conflicts with your recollection "
@@ -132,6 +156,9 @@ def assemble_context(history, brief=None, *, folded_count, premise, summary, can
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nCURRENT STEERING — where the story is pushing. Player-facing; "
                     "never mention this block.\n" + steering}
+    if notes and has_player_action:      # D3: OOC answers, also volatile (I3)
+        msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
+                    "\n\n---\nALREADY TOLD OUT OF CHARACTER — treat as true, never mention it:\n" + notes}
     if guard:
         msgs[-1] = {"role": "user", "content": msgs[-1]["content"] +
                     "\n\n---\nAVOID REPEATING:\n" + "\n".join(f"- {g}" for g in guard)}
