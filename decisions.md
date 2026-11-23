@@ -263,7 +263,9 @@ Decision: Streaming makes silent regeneration impossible, so the narrator's repl
 
 Both flags are stored in `state.json` and exposed by `game_state()`, and the UI offers a one-click retry-shorter that regenerates with the budget multiplied by `SHORTER_RATIO` (0.7). The reduced budget is recorded as `word_budget` so the check applies to the retried reply too.
 
-**Status: the decision is taken but E4 is not yet implemented.** The current code still computes `overlong` from `style_words_max` with a hard-coded `1.5`, so it is permanently false at the default `style_words_max = 0`; `compute_shape_ok`, `shape_ok`, `word_budget` and the retry-shorter path do not exist yet. This entry describes the target, not the shipped behaviour.
+**Status: the backend is shipped; the UI is not.** `dm.compute_shape_ok()` exists and is called after every reply, `overlong` is measured against the brief's budget times `overlong_ratio` (so it fires with `style_words_max = 0`), and `shape_ok`, `last_words` and `word_budget` are written to `state.json` and returned by `game_state()`. `dm._shorter_brief()` rebuilds the brief at `SHORTER_RATIO` and `POST /api/retry` accepts `{"shorter": true}`.
+
+What is still missing is the button: `web/app.js` and `web/index.html` do not yet show a "retry shorter" control when `overlong` is true or `shape_ok` is false. That is FIX3, tracked separately. Until it lands the capability is reachable only by calling the endpoint directly.
 
 Alternatives considered: Regenerate silently when the shape is wrong (impossible mid-stream, and doubles cost); block the reply until it passes (breaks streaming); only check when `style_enabled` (the handoff reports this is why the check never fired).
 
@@ -278,3 +280,15 @@ The last `notes_in_context` (campaign, default 5) OOC answers are rendered by `n
 The OOC prompt is grounded in the steering state (D4): `handle_ooc_note` accepts `steering_text` and renders it alongside the premise, summary and ledger, under a rule never to invent a fact and to offer a canon proposal when something is not established.
 
 Alternatives considered: Keep routing opt-in (the handoff reports this is why the path was invisible); replay every OOC exchange every turn (unbounded prompt growth); promote OOC answers to canon automatically (D-06 forbids it).
+
+---
+
+## D-28  Fallback brief carries no steering key; only pressure moves start the cooldown
+
+Decision: Two small corrections to the WP1–WP5 behaviour, recorded together because both are about state that was being written twice or written by the wrong actor.
+
+**The fallback brief carries no `steering` key.** `make_fallback_brief` used to copy the previous steering text into `brief["steering"]`. The narrator already receives steering in its own block (`narrator_context.assemble_context` takes `steering=` and renders it under `CURRENT STEERING`), so the brief carried it a second time and in a shape no normal brief has. Nothing read the key. It is removed, and the fallback brief now matches `BRIEF_SCHEMA` exactly. C3 still holds: the previous target survives because this path never writes `steering.json` — only the record pass does (D-21). `steering_text` stays in the signature so call sites are unchanged, and is deliberately unused.
+
+**Only pressure moves set `last_overt_turn`.** `apply_played_moves` used to set the overt cooldown whenever any played move had `how == "overt"`, including beat hooks. That contradicts D-23: hook escalation is derived from `stalled_turns` and deliberately overrides the cooldown, so a beat move must not start a cooldown that suppresses pressure moves. The check now ignores ids carrying the `beat.` prefix. Pressure steps and `<pid>.deadline` moves still set it.
+
+Alternatives considered: Keep the steering key and have the narrator read it (two sources for the same text, and a schema that differs between normal and fallback briefs); drop `steering_text` from the signature (touches every call site in `dm.py` for no behavioural gain); suppress the cooldown for beat moves by clearing `last_overt_turn` instead of not setting it (would erase a cooldown a pressure move legitimately started).

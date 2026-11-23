@@ -411,7 +411,10 @@ def apply_played_moves(arc, played_moves, turn):
         if f"{pid}.deadline" in played:
             p["status"] = "expired"
             touched.add(pid)
-    if "overt" in played.values():
+    # D-23: hook escalation overrides the overt cooldown, so a beat move must not start
+    # the cooldown for pressure moves. Only pressure moves set last_overt_turn (D-28).
+    if any(how == "overt" and not mid.startswith(BEAT_MOVE_PREFIX)
+           for mid, how in played.items()):
         rt["last_overt_turn"] = int(turn)
     return played, touched
 
