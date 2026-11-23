@@ -123,7 +123,12 @@ def _recent_text(history, exchanges=RECENT_EXCHANGES):
 
 
 def _clamp_keep_true(raw, ledger, player_action, recent_text):
-    """C2: ledger ids only, pinned entries named in play first, free text last."""
+    """C2: ledger ids only, pinned entries named in play first, free text last.
+
+    A reference that is not in the ledger is dropped, not promoted to free text:
+    the narrator must see authoritative state, never the analyst's paraphrase.
+    Free text is reserved for facts that have no ledger entry at all.
+    """
     pinned, chosen, seen = [], [], set()
     free_text = []
 
@@ -136,9 +141,12 @@ def _clamp_keep_true(raw, ledger, player_action, recent_text):
                 why = str(item.get("why", "")).strip()
             entry = _ledger_entry(ledger, ref)
             if entry is None:
-                text = str(ref or "").strip()
-                if text and len(free_text) < MAX_FREE_TEXT:
-                    free_text.append(text[:150])
+                # C2: an id that is not in the ledger is dropped. Only a plain
+                # string with no ledger resolution at all counts as free text.
+                if isinstance(ref, str) and not isinstance(item, dict):
+                    text = ref.strip()
+                    if text and len(free_text) < MAX_FREE_TEXT:
+                        free_text.append(text[:150])
                 continue
             eid = str(entry.get("id"))
             if eid in seen:
@@ -292,8 +300,13 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
 
 
 def make_fallback_brief(reason="fallback", allowed_moves=None, ledger=None, player_action="",
-                        recent_text=""):
-    """Built brief for a failed analyst call. Plays the due moves in code (B5, C3)."""
+                        recent_text="", steering_text=""):
+    """Built brief for a failed analyst call. Plays the due moves in code (B5, C3).
+
+    C3: keep_true is built from pinned and name-matched ledger entries, the due moves
+    are played, and the previous steering target is carried through unchanged so a
+    provider hiccup never loses the player's current objective.
+    """
     reason = reason if reason in FALLBACK_REASONS else "analyst_error"
     brief = _Brief(copy.deepcopy(BRIEF_SCHEMA),
                    diagnostics={"fallback_reason": reason})
@@ -311,6 +324,8 @@ def make_fallback_brief(reason="fallback", allowed_moves=None, ledger=None, play
                        "note": str(m.get("note", "")).strip()[:200]})
     brief["plot_moves"] = played
     brief["keep_true"] = _clamp_keep_true([], ledger, player_action, recent_text)
+    # C3: the previous steering target survives a failed analyst call.
+    brief["steering"] = steering_text
     return brief
 
 
@@ -570,17 +585,20 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         return brief, "analyst", model, ms
     except concurrent.futures.TimeoutError:
         brief = make_fallback_brief(reason="timeout", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
+                                    player_action=player_action, recent_text=recent_text,
+                                    steering_text=steering_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except ValueError:
         brief = make_fallback_brief(reason="invalid_response", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
+                                    player_action=player_action, recent_text=recent_text,
+                                    steering_text=steering_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
     except Exception:
         brief = make_fallback_brief(reason="analyst_error", allowed_moves=allowed_moves, ledger=ledger,
-                                    player_action=player_action, recent_text=recent_text)
+                                    player_action=player_action, recent_text=recent_text,
+                                    steering_text=steering_text)
         ms = int((time.time() - t0) * 1000)
         return brief, "fallback", model, ms
 
