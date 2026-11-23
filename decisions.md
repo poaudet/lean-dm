@@ -209,3 +209,27 @@ Decision: `brief.narration.words` is the only word target. The default system pr
 The prompt rewrite that removes the hard-coded range lands in WP4 (E3). Until then the two numbers still coexist, and this record documents the intended end state.
 
 Alternatives considered: Keep the range in the system prompt and let the brief override it (two sources of truth, the conflict the handoff reports); drop the brief field and keep only the prompt (loses per-turn control).
+
+---
+
+## D-23  Beat hooks and stall escalation
+
+Decision: Each beat carries a `hook` — at most 200 characters, a lead the player can perceive, never naming the antagonist or revealing the solution. `text` stays the private plan and is never shown. A beat without a hook never produces a move, so a planner that omits hooks degrades to pressure-only pacing rather than leaking plan text.
+
+`allowed_moves()` returns the next pending beat's hook as a move when no pressure move is due, or when `stalled_turns` reaches the difficulty threshold (story 2, standard 3, hard 5). The two-move cap and deadline-first ordering are unchanged, so a hook never displaces a deadline.
+
+While a hook goes unanswered its level rises: subtle, then overt after two stalled turns, then offer after four. **This escalation overrides the overt cooldown** (the handoff's B3 requires this and asks for it to be recorded here). The level is derived from `stalled_turns` rather than stored per beat, so it resets automatically when the beat is completed or superseded.
+
+Playing a hook does not mark the beat done; only the record pass does (B6).
+
+Alternatives considered: Store the escalation level on the beat (needs its own reset path and a new snapshot field); let the analyst choose `how` for beat moves (the scheduler owns pacing, per the existing clamp); expose beat text instead of a hook (violates I8).
+
+---
+
+## D-24  Mandatory moves and the deferred list
+
+Decision: Every move `allowed_moves()` returns is mandatory. The analyst plays it in `plot_moves` or lists it in `deferred` as `{id, reason}`. `clamp_brief` enforces this in code: a due move in neither list is appended with its scheduled `how` and `note`, and a move deferred `MAX_DEFERS` (2) consecutive turns is forced back in regardless of what the model returned.
+
+`make_fallback_brief` takes the allowed list and plays the due moves in code, so a timeout or 429 never drops them.
+
+Alternatives considered: Trust the model to honour the instruction (the handoff reports that nothing currently requires it); drop deferred moves entirely (loses the analyst's ability to hold a move for a scene that is mid-beat); let the fallback brief stay empty (silently loses pacing on every provider hiccup).
