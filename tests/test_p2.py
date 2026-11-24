@@ -26,6 +26,15 @@ SAMPLE_BRIEF_JSON = json.dumps({
 })
 
 
+def test_print_config_redacts_api_key(monkeypatch, capsys):
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "api_key": "test-secret-value"})
+    dm.print_config()
+    output = capsys.readouterr().out
+    assert "test-secret-value" not in output
+    assert "test-s" not in output
+    assert "key=***" in output
+
+
 # ---------------------------------------------------------------------------
 # 1. Analyst called before narrator
 # ---------------------------------------------------------------------------

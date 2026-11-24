@@ -125,7 +125,7 @@ def ensure_configured():
 
 
 def print_config():
-    key = cfg.api_key[:6] + "…" if len(cfg.api_key) > 6 else ("***" if cfg.api_key else "(none)")
+    key = "***" if cfg.api_key else "(none)"
     print(f"settings={SETTINGS_PATH}")
     print(f"endpoint={cfg.base_url}  key={key}  model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
     print(f"campaign='{CAMPAIGN}'  fold {cfg.ctx_budget_tok // 1000}k→{cfg.ctx_target_tok // 1000}k tok  "
