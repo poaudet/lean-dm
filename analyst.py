@@ -423,7 +423,7 @@ def _build_analyst_user_prompt(premise, summary, ledger_text, hooks, previous_br
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
                 ledger_text="", act_goal="", premise_text="", summary_text="",
                 previous_brief="", hooks="", steering="", defer_counts=None,
-                timeout_sec=None):
+                timeout_sec=None, budget_mult=1.0):
     """Run analyst model call with timeout and fallback.
 
     FIX2: The analyst prompt now includes pinned markers on the ledger (handled by
@@ -485,6 +485,9 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         if not parsed:
             raise ValueError("Unparseable JSON from analyst")
         brief = clamp_brief(parsed, allowed_ids, defer_counts)
+        # E4: apply budget multiplier to narration words
+        if budget_mult != 1.0 and "narration" in brief:
+            brief["narration"]["words"] = max(50, int(brief["narration"]["words"] * budget_mult))
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
     except concurrent.futures.TimeoutError:

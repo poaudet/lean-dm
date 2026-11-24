@@ -721,8 +721,11 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except OSError as e:
         logger.warning("Could not prune arc snapshots: %s", e)
 
-def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
-    """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
+def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False, shorter=False):
+    """Single turn engine shared by CLI, web turns, streaming turns, and retries.
+
+    If shorter is True, the analyst word budget is multiplied by 0.7 (E4 retry shorter).
+    """
     if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
         raise RuntimeError("turn already in progress")
     elif not lock_acquired:
@@ -765,6 +768,8 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                 allowed = get_allowed_moves()
                 guard_items = compute_style_guard(history) if cfg.style_guard else []
                 defer_counts = compute_defer_counts(ROOT)
+                # E4: retry shorter reduces the word budget by 0.7
+                budget_mult = 0.7 if shorter else 1.0
                 brief, source, model_used, ms = analyst.run_analyst(
                     ROOT, history, text, allowed, guard_items, chat_complete,
                     ledger_text=render_ledger(load_ledger()), act_goal=_act_goal(),
@@ -775,6 +780,7 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     steering="",
                     defer_counts=defer_counts,
                     timeout_sec=max(0.1, float(cfg.analyst_timeout_sec)),
+                    budget_mult=budget_mult,
                 )
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
@@ -809,7 +815,15 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
 
         words = len(dm.split())
         overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-        set_state(last_words=words, overlong=overlong)
+        # shape_ok: last sentence ends with '?' for question, non-empty closing line otherwise
+        end = st.get("narration_end", "decision") if (st := get_state()) else "decision"
+        stripped = dm.strip()
+        if end == "question":
+            shape_ok = stripped.endswith("?")
+        else:
+            shape_ok = bool(stripped and stripped.splitlines()[-1].strip())
+        word_budget = int((cfg.style_words_max or 140) * (0.7 if shorter else 1.0))
+        set_state(last_words=words, overlong=overlong, shape_ok=shape_ok, word_budget=word_budget)
 
         if cfg.arc_enabled:
             if stream:
@@ -863,6 +877,8 @@ def undo_turn():
         text = h[-2]["content"]
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
+        # Clear per-reply flags so they describe the last reply only
+        set_state(overlong=False, shape_ok=True, word_budget=0)
         return text
     finally:
         TURN_LOCK.release()
@@ -879,6 +895,8 @@ def _retry_brief(h, rerun_analyst):
     allowed = get_allowed_moves(h[:-2])
     guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
     defer_counts = compute_defer_counts(ROOT)
+    # E4: retry shorter reduces the word budget by 0.7
+    budget_mult = 0.7 if shorter else 1.0
     brief, source, model_used, ms = analyst.run_analyst(
         ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete,
         ledger_text=render_ledger(load_ledger()), act_goal=_act_goal(),
@@ -889,14 +907,18 @@ def _retry_brief(h, rerun_analyst):
         steering="",
         defer_counts=defer_counts,
         timeout_sec=max(0.1, float(cfg.analyst_timeout_sec)),
+        budget_mult=budget_mult,
     )
     analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
     return brief
 
-def retry_turn(stream=False, rerun_analyst=False):
-    """Regenerate the DM's last reply for the same player action."""
+def retry_turn(stream=False, rerun_analyst=False, shorter=False):
+    """Regenerate the DM's last reply for the same player action.
+
+    If shorter is True, the word budget is multiplied by 0.7 for the retried reply.
+    """
     result = None
-    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst):
+    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst, shorter=shorter):
         if stream and event.get("chunk"):
             print(event["chunk"], end="", flush=True)
         if event.get("done"):
@@ -941,7 +963,9 @@ def game_state():
         "job": dict(JOB),
         "ctx": label,
         "overlong": bool(st.get("overlong", False)),
+        "shape_ok": bool(st.get("shape_ok", True)),
         "last_words": _int(st.get("last_words", 0)),
+        "word_budget": _int(st.get("word_budget", 0)),
         "arc_chip": arc_chip,
         "can_undo": can_undo,
         "can_retry": can_undo,
@@ -1168,8 +1192,10 @@ def api_undo():
 
 @app.route("/api/retry", methods=["POST"])
 def api_retry():
+    body = request.get_json(silent=True) or {}
+    shorter = bool(body.get("shorter", False))
     try:
-        return jsonify({"dm": retry_turn()})
+        return jsonify({"dm": retry_turn(shorter=shorter)})
     except Exception as e:
         if str(e) == "turn already in progress":
             return jsonify({"error": str(e)}), 409
