@@ -262,10 +262,11 @@ class ApiError(RuntimeError):
 
 TRANSIENT = (requests.ConnectionError, requests.Timeout, ApiError)
 
-def _raw_post(payload, stream=False):
+def _raw_post(payload, stream=False, timeout_sec=None):
     url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    read_timeout = timeout_sec if timeout_sec is not None else cfg.timeout_sec
     r = requests.post(url, headers={"Authorization": f"Bearer {cfg.api_key}"}, json=payload,
-                      timeout=(10, cfg.timeout_sec), stream=stream)
+                      timeout=(10, read_timeout), stream=stream)
     if r.status_code >= 400:
         wait = None
         try:
@@ -318,10 +319,10 @@ def scribe_extra():
 def scribe_model():
     return cfg.scribe_model or cfg.model
 
-def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, timeout_sec=None, **extra):
     def call(m):
         def go():
-            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra})
+            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra}, timeout_sec=timeout_sec)
             try:
                 data = r.json()
             except ValueError:
@@ -664,6 +665,34 @@ def _record_kwargs(brief):
         "analyst_act_complete": bool(brief.get("act_complete", False)),
     }
 
+
+def compute_defer_counts(root):
+    from analyst import load_briefs
+    briefs = load_briefs(root)
+    ordered = sorted(briefs.items(), key=lambda kv: kv[0])
+    counts = {}
+    for msg_idx in reversed([mi for mi, _ in ordered]):
+        entry = briefs[msg_idx]
+        if entry.get("source") not in ("analyst", "fallback"):
+            continue
+        brief = entry.get("brief", {})
+        deferred = brief.get("deferred", [])
+        deferred_ids = set()
+        for item in deferred:
+            if isinstance(item, dict):
+                mid = str(item.get("id", "")).strip()
+            elif isinstance(item, str):
+                mid = item.strip()
+            else:
+                continue
+            if mid:
+                deferred_ids.add(mid)
+        new_counts = {}
+        for mid in deferred_ids:
+            new_counts[mid] = counts.get(mid, 0) + 1
+        counts = new_counts
+    return counts
+
 def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     """Auto-plan a missing arc, then run the record pass for a committed turn."""
     if not retry and arc.arc_is_corrupt(ROOT):
@@ -731,9 +760,17 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     yield {"stage": "analyzing"}
                 allowed = get_allowed_moves()
                 guard_items = compute_style_guard(history) if cfg.style_guard else []
+                defer_counts = compute_defer_counts(ROOT)
                 brief, source, model_used, ms = analyst.run_analyst(
                     ROOT, history, text, allowed, guard_items, chat_complete,
-                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal()
+                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal(),
+                    premise_text=read(PREMISE),
+                    summary_text=read(SUMMARY) if folded() else "",
+                    previous_brief=json.dumps(analyst.load_brief_for_msg(ROOT, len(history) - 1) or {}, ensure_ascii=False),
+                    hooks="",
+                    steering="",
+                    defer_counts=defer_counts,
+                    timeout_sec=max(0.1, float(cfg.analyst_timeout_sec)),
                 )
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
@@ -837,8 +874,17 @@ def _retry_brief(h, rerun_analyst):
             return brief
     allowed = get_allowed_moves(h[:-2])
     guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
+    defer_counts = compute_defer_counts(ROOT)
     brief, source, model_used, ms = analyst.run_analyst(
-        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
+        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete,
+        ledger_text=render_ledger(load_ledger()), act_goal=_act_goal(),
+        premise_text=read(PREMISE),
+        summary_text=read(SUMMARY) if folded() else "",
+        previous_brief=json.dumps(analyst.load_brief_for_msg(ROOT, player_idx - 1) or {}, ensure_ascii=False),
+        hooks="",
+        steering="",
+        defer_counts=defer_counts,
+        timeout_sec=max(0.1, float(cfg.analyst_timeout_sec)),
     )
     analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
     return brief

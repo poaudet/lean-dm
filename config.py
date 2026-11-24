@@ -84,6 +84,11 @@ FIELDS = [
     F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", scope="global", min=10),
     F("analyst_timeout_sec", "Analyst timeout (s)", "int", 25, "Reliability", "Timeout for analyst call in seconds.", scope="global", min=1),
     F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
+    F("analyst_summary_tok", "Analyst summary cap (tokens)", "int", 4000, "Analyst", "Max tokens of the latest summary chapter sent to the analyst.", scope="global", min=100),
+    F("analyst_prompt_cap", "Analyst prompt cap (chars)", "int", 6000, "Analyst", "Max total chars of the analyst prompt; oldest sections truncated first.", scope="global", min=500),
+    # ---- arc pacing
+    F("drift_turns", "Drift turns", "int", 4, "Arc", "Consecutive off-arc turns before a replan is triggered.", scope="campaign", min=1),
+    F("act_max_turns", "Act max turns", "int", 0, "Arc", "Max turns in an act before forced transition (0 = off).", scope="campaign", min=0),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app

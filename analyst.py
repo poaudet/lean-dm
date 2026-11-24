@@ -24,6 +24,7 @@ BRIEF_SCHEMA = {
     "assessment": "The player acts.",
     "outcome": "clean",
     "plot_moves": [],
+    "deferred": [],
     "keep_true": [],
     "narration": {"words": 140, "push": 0.6, "end": "decision"},
     "clarify": None,
@@ -35,6 +36,9 @@ VALID_OUTCOMES = ("clean", "partial", "complication", "setback")
 VALID_ENDS = ("decision", "question", "beat")
 VALID_HOWS = ("overt", "subtle", "offscreen")
 FALLBACK_REASONS = ("timeout", "invalid_response", "analyst_error")
+
+# A move may be deferred at most MAX_DEFERS consecutive turns before code forces it in.
+MAX_DEFERS = 2
 
 
 class _Brief(dict):
@@ -53,11 +57,13 @@ def parse_json_tolerantly(raw):
     return parsed if isinstance(parsed, dict) else None
 
 
-def clamp_brief(d, allowed_move_ids=None):
+def clamp_brief(d, allowed_move_ids=None, defer_counts=None):
     """Clamp and validate raw dictionary to strict brief schema.
 
     allowed_move_ids: None (no filter), a set of ids, or a dict id -> scheduled move. With a dict,
     scheduled `how` and `note` are authoritative.
+    defer_counts: dict id -> number of consecutive most-recent briefs that deferred it.
+    Moves deferred MAX_DEFERS times in a row are forced into plot_moves.
     """
     if not isinstance(d, dict):
         d = {}
@@ -79,6 +85,7 @@ def clamp_brief(d, allowed_move_ids=None):
     raw_moves = d.get("plot_moves")
     moves = []
     seen = set()
+    defer_counts = defer_counts or {}
     if isinstance(raw_moves, list):
         for m in raw_moves:
             if not isinstance(m, dict):
@@ -102,7 +109,41 @@ def clamp_brief(d, allowed_move_ids=None):
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
                 break
+
+    # deferred: enforce the defer cap. A move deferred MAX_DEFERS consecutive turns
+    # is forced into plot_moves instead of staying deferred.
+    raw_deferred = d.get("deferred")
+    deferred = []
+    seen_deferred = set()
+    if isinstance(raw_deferred, list):
+        for item in raw_deferred:
+            if isinstance(item, dict):
+                mid = str(item.get("id", "")).strip()
+                reason = str(item.get("reason", "")).strip()[:200]
+            elif isinstance(item, str):
+                mid = item.strip()
+                reason = ""
+            else:
+                continue
+            if not mid or mid in seen_deferred:
+                continue
+            if defer_counts.get(mid, 0) >= MAX_DEFERS:
+                # Defer cap reached: force into plot_moves if allowed and not already there
+                if (allowed_move_ids is None or mid in allowed_move_ids) and mid not in seen:
+                    sched = allowed_move_ids.get(mid) if isinstance(allowed_move_ids, dict) else None
+                    how = str(sched.get("how", "subtle")).strip().lower() if isinstance(sched, dict) else "subtle"
+                    if how not in VALID_HOWS:
+                        how = "subtle"
+                    note = str(sched.get("note", "")).strip()[:200] if isinstance(sched, dict) else ""
+                    seen.add(mid)
+                    moves.append({"id": mid, "how": how, "note": note})
+                    if len(moves) >= 2:
+                        continue
+                continue  # drop from deferred
+            seen_deferred.add(mid)
+            deferred.append({"id": mid, "reason": reason})
     out["plot_moves"] = moves
+    out["deferred"] = deferred
 
     # keep_true (<= 8 items)
     kt = d.get("keep_true")
@@ -152,6 +193,8 @@ def make_fallback_brief(reason="fallback"):
         "end": "decision",
     }
     brief["assessment"] = "Action proceeds."
+    # FIX6: the fallback brief carries no steering key; steering survives via the
+    # record pass / steering.json path, not the brief schema.
     return brief
 
 
@@ -297,6 +340,7 @@ ANALYST_SYSTEM = (
     '  "assessment": "one sentence: what the player attempts and how it lands in this scene",\n'
     '  "outcome": "clean|partial|complication|setback",\n'
     '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen", "note": "what player perceives"}],\n'
+    '  "deferred": [{"id": "move_id", "reason": "why deferred"}],\n'
     '  "keep_true": ["<=8 canon items at risk of contradiction"],\n'
     '  "narration": {"words": 140, "push": 0.7, "end": "decision|question|beat"},\n'
     '  "clarify": null,\n'
@@ -308,28 +352,116 @@ ANALYST_SYSTEM = (
     "- If intent is 'act': resolve per assessment/outcome.\n"
     "- 'clarify' only if intent is genuinely ambiguous (rarely).\n"
     "- Choose plot_moves ONLY from the allowed_moves provided. If none are allowed, return [].\n"
+    "- A move may be deferred at most MAX_DEFERS consecutive turns; after that code forces it in.\n"
 )
 
 
+def _truncate_to_cap(text, cap_chars):
+    """Truncate text to at most cap_chars characters, cutting from the end."""
+    if cap_chars is None or cap_chars <= 0 or len(text) <= cap_chars:
+        return text
+    return text[:cap_chars]
+
+
+def _build_analyst_user_prompt(premise, summary, ledger_text, hooks, previous_brief, steering,
+                               act_goal, cap_chars):
+    """Build the analyst user prompt with total size capped, truncated oldest-first.
+
+    Sections in authority order: premise, summary, ledger, previous brief.
+    Truncation removes oldest sections first (premise first, then summary, etc.).
+    """
+    sections = []
+    if premise:
+        sections.append(("PREMISE", premise))
+    if summary:
+        sections.append(("SUMMARY", summary))
+    if ledger_text:
+        sections.append(("CANON LEDGER", ledger_text))
+    if hooks:
+        sections.append(("PENDING HOOKS", hooks))
+    if previous_brief:
+        sections.append(("PREVIOUS BRIEF", previous_brief))
+    if steering:
+        sections.append(("STEERING", steering))
+    if act_goal:
+        sections.append(("CURRENT ACT GOAL", act_goal))
+
+    # Build full prompt, then truncate oldest-first if over cap.
+    parts = []
+    for name, body in sections:
+        parts.append(f"{name}:\n{body}")
+    full = "\n\n".join(parts)
+
+    if len(full) <= cap_chars:
+        return full
+
+    # Truncate oldest-first: drop entire sections starting from the oldest,
+    # then truncate within the oldest remaining section if still over cap.
+    remaining = list(sections)
+    while remaining and len("\n\n".join(f"{n}:\n{b}" for n, b in remaining)) > cap_chars:
+        remaining.pop(0)  # drop oldest section
+
+    if not remaining:
+        return ""
+
+    result = "\n\n".join(f"{n}:\n{b}" for n, b in remaining)
+    if len(result) > cap_chars:
+        # Truncate within the oldest remaining section
+        oldest_name, oldest_body = remaining[0]
+        # Keep the header, truncate the body
+        budget = cap_chars - sum(len(f"{n}:\n{b}") + 2 for n, b in remaining[1:]) - len(f"{oldest_name}:\n")
+        if budget > 0:
+            truncated_body = oldest_body[:budget]
+            result = f"{oldest_name}:\n{truncated_body}" + "\n\n" + "\n\n".join(
+                f"{n}:\n{b}" for n, b in remaining[1:]
+            )
+        else:
+            result = "\n\n".join(f"{n}:\n{b}" for n, b in remaining[1:])
+    return result
+
+
 def run_analyst(root, history, player_action, allowed_moves, style_guard_list, chat_fn,
-                ledger_text="", act_goal=""):
-    """Run analyst model call with timeout and fallback."""
+                ledger_text="", act_goal="", premise_text="", summary_text="",
+                previous_brief="", hooks="", steering="", defer_counts=None,
+                timeout_sec=None):
+    """Run analyst model call with timeout and fallback.
+
+    FIX2: The analyst prompt now includes pinned markers on the ledger (handled by
+    the caller rendering ledger_text with markers), the latest summary chapter
+    (capped by analyst_summary_tok), the pending hooks, the previous brief, and
+    the steering state. The total prompt is capped by analyst_prompt_cap and
+    truncated oldest-first (premise, summary, ledger, previous brief).
+
+    FIX4: timeout_sec bounds the analyst HTTP call. When provided, chat_fn is
+    called with timeout_sec=timeout_sec so the call cannot outlive the analyst
+    budget.
+    """
     model = cfg.analyst_model or cfg.scribe_model or cfg.model
     allowed_ids = {m["id"]: m for m in allowed_moves} if allowed_moves else {}
 
-    n_turns = cfg.analyst_context_turns
-    h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history
-    play_str = "\n".join(f"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for i, m in enumerate(h_tail))
+    # Cap the summary chapter by analyst_summary_tok (default 4000 tokens ≈ chars/4).
+    summary_cap_chars = int(cfg.analyst_summary_tok * cfg.chars_per_tok)
+    summary_capped = _truncate_to_cap(summary_text, summary_cap_chars)
 
-    user_prompt = (
-        f"DIFFICULTY: {cfg.difficulty}\n"
+    # Build the user prompt with total cap, truncated oldest-first.
+    cap_chars = int(cfg.analyst_prompt_cap)
+    user_prompt = _build_analyst_user_prompt(
+        premise=premise_text,
+        summary=summary_capped,
+        ledger_text=ledger_text,
+        hooks=hooks,
+        previous_brief=previous_brief,
+        steering=steering,
+        act_goal=act_goal,
+        cap_chars=cap_chars,
+    )
+
+    # Append fixed metadata that must always be present (not subject to truncation).
+    user_prompt += (
+        f"\n\nDIFFICULTY: {cfg.difficulty}\n"
         f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
         f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
         f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
-        + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
-        + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
-        + "\n"
-        f"RECENT PLAY:\n{play_str}\n\n"
         f"PLAYER ACTION:\n{player_action}\n\n"
         "Output ONLY the JSON brief."
     )
@@ -340,18 +472,19 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
     ]
 
     t0 = time.time()
-    timeout = max(0.1, float(cfg.analyst_timeout_sec))
+    timeout = max(0.1, float(timeout_sec or cfg.analyst_timeout_sec))
 
     # No `with` block: its exit calls shutdown(wait=True) and would sit there until the
     # model call finishes, which defeats the timeout (D-14).
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
+        future = executor.submit(chat_fn, messages, model=model, track=False, retries=0,
+                                 fallback=False, timeout_sec=timeout)
         raw = future.result(timeout=timeout)
         parsed = parse_json_tolerantly(raw)
         if not parsed:
             raise ValueError("Unparseable JSON from analyst")
-        brief = clamp_brief(parsed, allowed_ids)
+        brief = clamp_brief(parsed, allowed_ids, defer_counts)
         ms = int((time.time() - t0) * 1000)
         return brief, "analyst", model, ms
     except concurrent.futures.TimeoutError:
