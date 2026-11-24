@@ -10,6 +10,7 @@ Doctrine:
 import json
 import logging
 
+import steering
 from config import cfg
 from storage import append_jsonl, atomic_write, parse_json_response, replace_lines
 
@@ -63,6 +64,20 @@ MAX_BEATS = 5
 MAX_PRESSURES = 2
 MIN_DEADLINE_GAP = 30  # minutes above last step
 MAX_DEADLINE_MINUTES = 14400  # 10 days
+
+# B2: turns without progress before a beat hook is pushed even while a pressure is due.
+# Initial values, to be tuned after playtest.
+STALL_THRESHOLD = {
+    "story": 2,
+    "standard": 3,
+    "hard": 5,
+}
+
+# B3: turns a hook stays at one level before escalating (subtle -> overt -> offer).
+HOOK_ESCALATION = 2
+
+# Beat moves carry this prefix so they never collide with a pressure step id.
+BEAT_MOVE_PREFIX = "beat."
 
 
 def arc_path(root):
@@ -139,8 +154,8 @@ def prune_arc_snapshots(root, below):
             f.unlink(missing_ok=True)
 
 
-# Files that make up the mutable arc runtime state (used to roll back a failed retry).
-_RUNTIME_FILES = ("arc.json", "records.jsonl", "arc_log.jsonl")
+# Files that make up the mutable runtime state (used to roll back a failed retry).
+_RUNTIME_FILES = ("arc.json", "records.jsonl", "arc_log.jsonl", "steering.json")
 
 
 def backup_state(root):
@@ -247,12 +262,39 @@ def get_arc_chip(arc):
 # Scheduling: pure function allowed_moves()
 # ---------------------------------------------------------------------------
 
+def pending_beat(arc):
+    """The next pending beat of the active act, or None. Pure, no I/O (B2)."""
+    if not arc or not isinstance(arc, dict):
+        return None
+    act_n = arc.get("act", 1)
+    for a in arc.get("acts") or []:
+        if not isinstance(a, dict) or a.get("n") != act_n:
+            continue
+        for b in a.get("beats") or []:
+            if isinstance(b, dict) and b.get("status") == "pending":
+                return b
+    return None
+
+
+def hook_level(stalled_turns):
+    """B3: a hook rises subtle -> overt -> offer while it goes unanswered."""
+    try:
+        n = int(stalled_turns)
+    except (TypeError, ValueError):
+        n = 0
+    if n >= 2 * HOOK_ESCALATION:
+        return "offer"
+    if n >= HOOK_ESCALATION:
+        return "overt"
+    return "subtle"
+
+
 def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stalled_turns=0):
     """Calculate due plot moves for the current turn.
 
     Pure function: no I/O, no LLM calls.
-    Returns: list of dicts: [{"id": step_id, "how": "overt|subtle", "note": text, "pressure_id": pid}]
-    Hard cap: <= 2 plot moves returned.
+    Returns: list of dicts: [{"id": step_id, "how": "overt|subtle|offer", "note": text, "pressure_id": pid}]
+    Hard cap: <= 2 plot moves returned. Deadlines first, then the beat hook (B2).
     Superseded and blocked beats never produce moves.
     """
     if not arc or not isinstance(arc, dict) or arc.get("terminal"):
@@ -319,6 +361,20 @@ def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stal
             "pressure_id": "rescue",
         })
 
+    # B2: the next pending beat's hook, once the stall threshold is reached (or at once
+    # when no pressure move is due). B3: its level rises while it goes unanswered, and
+    # that escalation overrides the overt cooldown.
+    beat = pending_beat(arc)
+    if beat and beat.get("hook") and len(results) < 2:
+        threshold = STALL_THRESHOLD.get(diff, 3)
+        if not results or stalled_turns >= threshold:
+            results.append({
+                "id": f"{BEAT_MOVE_PREFIX}{beat.get('id')}",
+                "how": hook_level(stalled_turns),
+                "note": str(beat["hook"])[:200],
+                "pressure_id": "beat",
+            })
+
     return results[:2]
 
 
@@ -357,8 +413,9 @@ def apply_delay(p, difficulty):
 def apply_played_moves(arc, played_moves, turn):
     """Apply the moves the brief played this turn to runtime state.
 
-    Marks played steps done, expires a pressure whose deadline move was played, and records
-    last_overt_turn. Returns (played {id: how}, touched pressure ids).
+    Marks played pressure steps done, expires a pressure whose deadline move was played, and
+    records last_overt_turn. A played beat hook is NOT marked done (B6): only the record pass
+    completes a beat. Returns (played {id: how}, touched pressure ids).
     Only pressure moves set last_overt_turn (D-23: hook escalation overrides overt cooldown).
     """
     rt = arc.setdefault("runtime", {})
@@ -376,10 +433,10 @@ def apply_played_moves(arc, played_moves, turn):
         if f"{pid}.deadline" in played:
             p["status"] = "expired"
             touched.add(pid)
-    # Only pressure moves start the overt cooldown; beat hooks do not (D-23).
-    if "overt" in played.values() and any(
-        pid in touched for pid in {m.get("pressure_id") for m in played_moves or [] if m.get("pressure_id")}
-    ):
+    # D-23: hook escalation overrides the overt cooldown, so a beat move must not start
+    # the cooldown for pressure moves. Only pressure moves set last_overt_turn (D-28).
+    if any(how == "overt" and not mid.startswith(BEAT_MOVE_PREFIX)
+           for mid, how in played.items()):
         rt["last_overt_turn"] = int(turn)
     return played, touched
 
@@ -400,9 +457,9 @@ PLANNER_SYSTEM = (
     '  "acts": [\n'
     '    {"n": 1, "status": "active", "goal": "Establish stakes and confront immediate obstacle",\n'
     '     "beats": [\n'
-    '       {"id": "a1b1", "text": "Opening discovery", "status": "pending"},\n'
-    '       {"id": "a1b2", "text": "Escalation", "status": "pending"},\n'
-    '       {"id": "a1b3", "text": "Act climax", "status": "pending"}\n'
+    '       {"id": "a1b1", "text": "Opening discovery", "hook": "A lead the player can see", "status": "pending"},\n'
+    '       {"id": "a1b2", "text": "Escalation", "hook": "A lead the player can see", "status": "pending"},\n'
+    '       {"id": "a1b3", "text": "Act climax", "hook": "A lead the player can see", "status": "pending"}\n'
     '     ], "outcomes": []},\n'
     '    {"n": 2, "status": "planned", "goal": "Rising action and deepening stakes", "beats": [], "outcomes": []},\n'
     '    {"n": 3, "status": "planned", "goal": "Climax and resolution", "beats": [], "outcomes": []}\n'
@@ -420,7 +477,9 @@ PLANNER_SYSTEM = (
     "- Act 1 has 3-5 concrete dramatic beats.\n"
     "- Acts 2 and 3 have goals outlined, but empty beats (D-04: planned later based on outcomes).\n"
     "- 1-2 pressures with in-game minute timings.\n"
-    "- Hooks must be spoiler-safe: never name the antagonist or reveal the solution.\n"
+    "- Every beat needs a 'hook': at most 200 chars, a lead the PLAYER can perceive.\n"
+    "- A hook must never name the antagonist or reveal the solution. It is shown to the player.\n"
+    "- 'text' is the private plan and is never shown to the player.\n"
     "- Return ONLY the valid JSON object."
 )
 
@@ -442,6 +501,7 @@ def normalize_beats(beats, act_n=1):
         b = dict(b)
         b["id"] = str(b.get("id") or f"a{act_n}b{i}")
         b["text"] = str(b.get("text") or "")
+        b["hook"] = str(b.get("hook") or "")[:200]
         b["status"] = b.get("status") if b.get("status") in ("pending", "done", "superseded", "blocked") else "pending"
         out.append(b)
     return out
@@ -619,7 +679,7 @@ def plan_replan_arc(arc, outcomes, history, chat_fn):
         f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
         f"ACT {act_n} GOAL: {active_act.get('goal', '')}\n\n"
         "Provide 3-5 sequential dramatic beats for this act as a JSON list:\n"
-        '[{"id": "a' + str(act_n) + 'b1", "text": "...", "status": "pending"}, ...]\n'
+        '[{"id": "a' + str(act_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
         "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
     )
 
@@ -661,7 +721,7 @@ def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
         f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
         f"ACT {next_n} GOAL: {next_act.get('goal', '')}\n\n"
         "Provide 3-5 sequential dramatic beats for Act " + str(next_n) + " as a JSON list:\n"
-        '[{"id": "a' + str(next_n) + 'b1", "text": "...", "status": "pending"}, ...]\n'
+        '[{"id": "a' + str(next_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
         "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
     )
     try:
@@ -674,7 +734,8 @@ def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
             return beats
     except Exception as e:
         logger.warning("next-act beat planning failed: %s", e)
-    return [{"id": f"a{next_n}b1", "text": "Navigate emerging complications", "status": "pending"}]
+    return [{"id": f"a{next_n}b1", "text": "Navigate emerging complications",
+             "hook": "An opening the player can act on", "status": "pending"}]
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +754,10 @@ RECORD_PROMPT = (
     '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>,\n'
     '  "central_question_resolved": <bool: whether play resolved the campaign central question>,\n'
     '  "on_arc": <bool: true if this exchange advanced the hidden arc plot, false if off-arc>,\n'
-    '  "matched_beats": [<list of beat ids from the active act that this exchange addressed>]\n'
+    '  "matched_beats": [<list of beat ids from the active act that this exchange addressed>],\n'
+    '  "objective": "<string: the player-facing goal right now, at most 160 chars>",\n'
+    '  "open_question": "<string: the decision currently facing the player, at most 160 chars>",\n'
+    '  "progress": <bool: true if a beat was completed, the objective changed, or the open question was resolved>\n'
     "}"
 )
 
@@ -721,56 +785,77 @@ def _act_max_turns():
 
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
                     intent="act", history=None, analyst_act_complete=False):
-    """Execute record pass over the newest turn, updating clock, beats, pressures.
+    """Execute record pass over the newest turn, updating clock, beats, pressures and steering.
 
     played_moves / intent come from the analyst brief (empty / "act" when it is off).
-
     WP6 additions:
     - on_arc and matched_beats are read from the record result and stored in arc.runtime.
     - After drift_turns consecutive off-arc turns, a replan is triggered.
     - After act_max_turns turns in an act, a forced transition occurs.
+    Runs when the arc or the steering state is enabled; one model call covers both (A2).
     """
     arc = load_arc(root)
-    if not arc:
+    steering_on = bool(cfg.steering_enabled)
+    if not arc and not steering_on:
         return
 
     # Snapshot BEFORE updating (I4)
-    snapshot_arc(root, msg_idx)
+    if arc:
+        snapshot_arc(root, msg_idx)
+    if steering_on:
+        steering.snapshot_steering(root, msg_idx)
 
     if intent == "ask":
-        append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
-                             "pressures": [], "act_complete": False,
-                             "on_arc": False, "matched_beats": [],
-                             "words": len(dm_reply.split())})
+        # D5: an ask costs no time and leaves the open question untouched.
+        if arc:
+            append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
+                                 "pressures": [], "act_complete": False,
+                                 "on_arc": False, "matched_beats": [],
+                                 "words": len(dm_reply.split())})
         return
 
     model = cfg.scribe_model or cfg.model
-    act_n = arc.get("act", 1)
-    active_act = next((a for a in arc.get("acts", []) if a.get("n") == act_n), {})
+    act_n = arc.get("act", 1) if arc else 1
+    active_act = next((a for a in arc.get("acts", []) if a.get("n") == act_n), {}) if arc else {}
+    previous = steering.load_steering(root) if steering_on else None
 
-    prompt = (
-        f"CURRENT ARC STATUS:\n"
-        f"Act {act_n}: {active_act.get('goal', '')}\n"
-        f"Central question: {arc.get('central_question', '')}\n"
-        f"Pending beats: {json.dumps([b for b in active_act.get('beats', []) if b.get('status') == 'pending'], ensure_ascii=False)}\n"
-        f"Active pressures: {json.dumps(arc.get('pressures', []), ensure_ascii=False)}\n\n"
+    blocks = []
+    if arc:
+        blocks.append(
+            f"CURRENT ARC STATUS:\n"
+            f"Act {act_n}: {active_act.get('goal', '')}\n"
+            f"Central question: {arc.get('central_question', '')}\n"
+            f"Pending beats: {json.dumps([b for b in active_act.get('beats', []) if b.get('status') == 'pending'], ensure_ascii=False)}\n"
+            f"Active pressures: {json.dumps(arc.get('pressures', []), ensure_ascii=False)}\n"
+        )
+    if steering_on:
+        prev = previous or {}
+        blocks.append(
+            "CURRENT STEERING (player-facing):\n"
+            f"Objective: {prev.get('objective') or '(none yet)'}\n"
+            f"Open question: {prev.get('open_question') or '(none yet)'}\n"
+        )
+    blocks.append(
         f"LATEST EXCHANGE:\n"
         f"PLAYER: {player_action}\n"
         f"DM: {dm_reply}\n\n"
         f"{RECORD_PROMPT}"
     )
+    prompt = "\n".join(blocks)
 
     messages = [
         {"role": "system", "content": "You are the continuity recorder for a text RPG. Output only JSON."},
         {"role": "user", "content": prompt},
     ]
 
+    failed = False
     try:
         raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
         res = parse_json_response(raw)
         if not isinstance(res, dict):
             raise ValueError("record response did not contain a JSON object")
     except Exception:
+        failed = True
         # Fallback record
         res = {
             "elapsed_minutes": 5,
@@ -780,6 +865,14 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
             "on_arc": True,
             "matched_beats": [],
         }
+
+    if steering_on:
+        state = (steering.stalled_steering(previous, msg_idx) if failed
+                 else steering.clamp_steering(res, previous, msg_idx, source="record"))
+        steering.save_steering(root, state)
+
+    if not arc:
+        return
 
     # Update clock
     elapsed = _clamp_elapsed(res.get("elapsed_minutes"))
@@ -796,7 +889,9 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     turn = (int(msg_idx) - 1) // 2 + 1
     played, touched = apply_played_moves(arc, played_moves, turn)
     rt = arc.setdefault("runtime", {})
-    if beats_done or played:
+    # B6: only a completed beat resets the stall counter. Playing a beat hook does not
+    # complete the beat, so it must not clear the escalation either (B3).
+    if beats_done:
         rt["stalled_turns"] = 0
     elif intent in ("act", "steer"):
         rt["stalled_turns"] = int(rt.get("stalled_turns", 0)) + 1
@@ -1013,13 +1108,15 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
     )
 
 
-def fill_empty_pressures(arc, chat_fn):
+def fill_empty_pressures(root, arc):
     """WP6 F5: When a pressure has no pending steps and its deadline is more than
     EMPTY_PRESSURE_MINUTES_AWAY minutes away, append up to EMPTY_PRESSURE_MAX_STEPS
     future steps. Logged as a revision.
 
     Returns the (possibly updated) arc.
     """
+    if not arc:
+        return arc
     changed = False
     clock_minutes = arc.get("clock", {}).get("minutes", 0)
     for p in arc.get("pressures", []):

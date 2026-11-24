@@ -19,6 +19,8 @@ class Campaign:
         self.ledger = self.root / "ledger.json"
         self.audit = self.root / "audit.md"
         self.state = self.root / "state.json"
+        self.steering = self.root / "steering.json"
+        self.steering_snap = self.root / "steering_snap"
         self.turn_lock = threading.Lock()
         self.maintenance_lock = threading.Lock()
         self.state_lock = threading.Lock()
