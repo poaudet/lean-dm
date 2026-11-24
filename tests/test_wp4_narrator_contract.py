@@ -147,8 +147,15 @@ def test_shape_ok_false_for_an_empty_reply():
 def test_overlong_uses_the_brief_budget_not_style_words_max(monkeypatch, tmp_path):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
-    _cfg(monkeypatch, style_words_max=0, overlong_ratio=1.5)
-    monkeypatch.setattr(dm, "chat_complete", lambda *a, **k: "word " * 200)
+    _cfg(monkeypatch, style_words_max=0, overlong_ratio=1.5,
+         analyst_enabled=True, analyst_model="test-analyst")
+
+    def chat(messages, model=None, **kw):
+        if model == "test-analyst":
+            return json.dumps(_brief(words=120))
+        return "word " * 200
+
+    monkeypatch.setattr(dm, "chat_complete", chat)
     dm.player_turn("Go.")
     st = dm.game_state()
     assert st["overlong"] is True
