@@ -384,6 +384,14 @@ function refresh(full = true) {
       btnRetry.title = s.retry_blocked_reason || '';
     }
 
+    // Retry shorter button: show when overlong or shape not ok
+    const btnRetryShorter = $('btn-retry-shorter');
+    if (btnRetryShorter) {
+      const show = s.overlong || s.shape_ok === false;
+      btnRetryShorter.style.display = show ? 'inline-block' : 'none';
+      btnRetryShorter.title = show ? 'Retry with a shorter reply (0.7x budget)' : '';
+    }
+
     const j = s.job;
     $('job').textContent = j && j.running ? ('⏳ ' + j.name + '…') : (j && j.name ? (j.name + ': ' + j.msg) : '');
     updateMeter(s);
@@ -539,6 +547,20 @@ function retry() {
   }).catch(() => { w.textContent = '[network error]'; }).finally(() => { busy = false; });
 }
 
+function retryShorter() {
+  if (busy) return;
+  busy = true;
+  const w = addMsg('dm', '…');
+  fetch('/api/retry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ shorter: true })
+  }).then(r => r.json()).then(d => {
+    if (d.error) w.textContent = '[error: ' + d.error + ']';
+    else refresh();
+  }).catch(() => { w.textContent = '[network error]'; }).finally(() => { busy = false; });
+}
+
 function act(path) {
   fetch(path, { method: 'POST' }).then(r => r.json()).then(d => {
     if (d.error) toast(d.error, 'err');
@@ -569,6 +591,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (!button) return;
     const actions = {
       undo, retry, send, stop: stopTurn,
+      'retry-shorter': retryShorter,
       'save-premise': savePremise, 'save-style': saveStyleNotes,
       rebuild: () => act('/api/rebuild'), audit: () => act('/api/audit'),
       'insert-ooc': insertOOC, 'make-canon': () => makeCanon(button.dataset.id),

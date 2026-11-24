@@ -45,6 +45,26 @@ DELAY_MINUTES = {
     "hard": 0,
 }
 
+# Max consecutive off-arc turns before a replan is triggered (overridden by
+# cfg.drift_turns, default 4).
+DRIFT_TURNS_DEFAULT = 4
+
+# Max turns in an act before forced transition (0 = off; overridden by
+# cfg.act_max_turns).
+ACT_MAX_TURNS_DEFAULT = 0
+
+# A pressure with no pending steps and a deadline more than this many minutes
+# away may get up to this many future steps appended.
+EMPTY_PRESSURE_MINUTES_AWAY = 120
+EMPTY_PRESSURE_MAX_STEPS = 2
+
+# Planner validation limits
+MIN_BEATS = 3
+MAX_BEATS = 5
+MAX_PRESSURES = 2
+MIN_DEADLINE_GAP = 30  # minutes above last step
+MAX_DEADLINE_MINUTES = 14400  # 10 days
+
 # B2: turns without progress before a beat hook is pushed even while a pressure is due.
 # Initial values, to be tuned after playtest.
 STALL_THRESHOLD = {
@@ -275,6 +295,7 @@ def allowed_moves(arc, difficulty="standard", turn=1, last_overt_turn=None, stal
     Pure function: no I/O, no LLM calls.
     Returns: list of dicts: [{"id": step_id, "how": "overt|subtle|offer", "note": text, "pressure_id": pid}]
     Hard cap: <= 2 plot moves returned. Deadlines first, then the beat hook (B2).
+    Superseded and blocked beats never produce moves.
     """
     if not arc or not isinstance(arc, dict) or arc.get("terminal"):
         return []
@@ -395,6 +416,7 @@ def apply_played_moves(arc, played_moves, turn):
     Marks played pressure steps done, expires a pressure whose deadline move was played, and
     records last_overt_turn. A played beat hook is NOT marked done (B6): only the record pass
     completes a beat. Returns (played {id: how}, touched pressure ids).
+    Only pressure moves set last_overt_turn (D-23: hook escalation overrides overt cooldown).
     """
     rt = arc.setdefault("runtime", {})
     played = {}
@@ -480,7 +502,7 @@ def normalize_beats(beats, act_n=1):
         b["id"] = str(b.get("id") or f"a{act_n}b{i}")
         b["text"] = str(b.get("text") or "")
         b["hook"] = str(b.get("hook") or "")[:200]
-        b["status"] = b.get("status") if b.get("status") in ("pending", "done") else "pending"
+        b["status"] = b.get("status") if b.get("status") in ("pending", "done", "superseded", "blocked") else "pending"
         out.append(b)
     return out
 
@@ -528,6 +550,78 @@ def normalize_arc(arc):
     return arc
 
 
+def validate_arc(arc):
+    """Validate an arc plan (initial, replan, or next-act beats).
+
+    Returns (ok, reason). On failure the caller should retry once, then keep
+    the previous arc (or the single fallback beat for a next act).
+
+    Rules:
+    - ids unique across acts
+    - at_minutes integers, non-negative, ascending per pressure
+    - at most MAX_PRESSURES pressures
+    - MIN_BEATS..MAX_BEATS beats per act, each with a hook (non-empty text)
+    - deadline_minutes at least MIN_DEADLINE_GAP above the last step and at most MAX_DEADLINE_MINUTES
+    - effective_deadline_minutes at most original * DEADLINE_MAX_STRETCH[difficulty]
+    """
+    if not isinstance(arc, dict):
+        return False, "arc is not an object"
+
+    # Collect all beat ids across acts for uniqueness
+    all_beat_ids = set()
+    for a in _dicts(arc.get("acts")):
+        beats = a.get("beats", [])
+        if not isinstance(beats, list) or len(beats) < MIN_BEATS or len(beats) > MAX_BEATS:
+            return False, f"act {a.get('n')} has {len(beats) if isinstance(beats, list) else 0} beats, need {MIN_BEATS}-{MAX_BEATS}"
+        for b in _dicts(beats):
+            bid = str(b.get("id", "")).strip()
+            if not bid:
+                return False, f"act {a.get('n')} beat missing id"
+            if bid in all_beat_ids:
+                return False, f"duplicate beat id {bid}"
+            all_beat_ids.add(bid)
+            if not str(b.get("text", "")).strip():
+                return False, f"beat {bid} has empty hook text"
+
+    pressures = _dicts(arc.get("pressures"))
+    if len(pressures) > MAX_PRESSURES:
+        return False, f"{len(pressures)} pressures, max {MAX_PRESSURES}"
+
+    diff = _norm_diff(cfg.difficulty)
+    max_stretch = DEADLINE_MAX_STRETCH.get(diff, 1.5)
+
+    for p in pressures:
+        pid = str(p.get("id", "")).strip()
+        steps = _dicts(p.get("steps"))
+        prev_at = -1
+        for s in steps:
+            at = _num(s.get("at_minutes"), None)
+            if at is None or at < 0:
+                return False, f"pressure {pid} step has invalid at_minutes"
+            if at <= prev_at:
+                return False, f"pressure {pid} steps not ascending"
+            prev_at = at
+
+        dl = p.get("deadline_minutes")
+        eff_dl = p.get("effective_deadline_minutes", dl)
+        if dl is not None:
+            dl = _num(dl, None)
+            if dl is None:
+                return False, f"pressure {pid} invalid deadline_minutes"
+            if prev_at >= 0 and dl < prev_at + MIN_DEADLINE_GAP:
+                return False, f"pressure {pid} deadline too close to last step"
+            if dl > MAX_DEADLINE_MINUTES:
+                return False, f"pressure {pid} deadline exceeds {MAX_DEADLINE_MINUTES}"
+        if eff_dl is not None:
+            eff_dl = _num(eff_dl, None)
+            if eff_dl is None:
+                return False, f"pressure {pid} invalid effective_deadline_minutes"
+            if dl is not None and eff_dl > dl * max_stretch:
+                return False, f"pressure {pid} effective_deadline exceeds stretch cap"
+
+    return True, ""
+
+
 def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     """Generate initial arc.json via planner model."""
     model = cfg.planner_model or cfg.scribe_model or cfg.model
@@ -553,6 +647,9 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     if not isinstance(arc, dict):
         raise ValueError("planner response did not contain a JSON object")
     arc = normalize_arc(arc)
+    ok, reason = validate_arc(arc)
+    if not ok:
+        raise ValueError(f"invalid initial arc: {reason}")
     if not arc.get("central_question") or not arc["acts"]:
         raise ValueError("Invalid arc structure generated by planner")
     arc["version"] = 1
@@ -560,6 +657,85 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     arc["act"] = 1
     arc["clock"] = {"minutes": 0}
     return arc
+
+
+def plan_replan_arc(arc, outcomes, history, chat_fn):
+    """Replan the pending beats of the active act from outcomes so far.
+
+    Old pending beats become superseded; new beats get new unique ids.
+    Returns the updated arc dict, or None on failure (caller keeps old arc).
+    """
+    model = cfg.planner_model or cfg.scribe_model or cfg.model
+    act_n = arc.get("act", 1)
+    active_act = next((a for a in arc.get("acts", []) if a.get("n") == act_n), {})
+
+    # Mark old pending beats as superseded
+    for b in active_act.get("beats", []):
+        if b.get("status") == "pending":
+            b["status"] = "superseded"
+
+    prompt = (
+        f"ACT {act_n} RESOLVED OUTCOMES:\n{json.dumps(outcomes, ensure_ascii=False)}\n\n"
+        f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
+        f"ACT {act_n} GOAL: {active_act.get('goal', '')}\n\n"
+        "Provide 3-5 sequential dramatic beats for this act as a JSON list:\n"
+        '[{"id": "a' + str(act_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
+        "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
+    )
+
+    try:
+        raw = chat_fn([
+            {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
+            {"role": "user", "content": prompt},
+        ], model=model, track=False, retries=1, fallback=True)
+        beats = normalize_beats(parse_json_response(raw), act_n)
+        if not beats:
+            return None
+        # Validate the new beats against the arc structure
+        test_arc = dict(arc)
+        test_arc["acts"] = [
+            {**a, "beats": beats if a.get("n") == act_n else a.get("beats", [])}
+            for a in test_arc.get("acts", [])
+        ]
+        ok, reason = validate_arc(test_arc)
+        if not ok:
+            logger.warning("replan validation failed: %s", reason)
+            return None
+        active_act["beats"] = beats
+        arc["revision"] = arc.get("revision", 0) + 1
+        return arc
+    except Exception as e:
+        logger.warning("replan failed: %s", e)
+        return None
+
+
+def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
+    """Generate beats for the next act from outcomes.
+
+    Returns a list of beats, or a single fallback beat on failure.
+    """
+    model = cfg.planner_model or cfg.scribe_model or cfg.model
+    next_act = next((a for a in arc.get("acts", []) if a.get("n") == next_n), {})
+    prompt = (
+        f"ACT {next_n - 1} RESOLVED OUTCOMES:\n{json.dumps(outcomes, ensure_ascii=False)}\n\n"
+        f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
+        f"ACT {next_n} GOAL: {next_act.get('goal', '')}\n\n"
+        "Provide 3-5 sequential dramatic beats for Act " + str(next_n) + " as a JSON list:\n"
+        '[{"id": "a' + str(next_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
+        "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
+    )
+    try:
+        raw = chat_fn([
+            {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
+            {"role": "user", "content": prompt},
+        ], model=model, track=False, retries=1, fallback=True)
+        beats = normalize_beats(parse_json_response(raw), next_n)
+        if beats:
+            return beats
+    except Exception as e:
+        logger.warning("next-act beat planning failed: %s", e)
+    return [{"id": f"a{next_n}b1", "text": "Navigate emerging complications",
+             "hook": "An opening the player can act on", "status": "pending"}]
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +753,8 @@ RECORD_PROMPT = (
     '  ],\n'
     '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>,\n'
     '  "central_question_resolved": <bool: whether play resolved the campaign central question>,\n'
+    '  "on_arc": <bool: true if this exchange advanced the hidden arc plot, false if off-arc>,\n'
+    '  "matched_beats": [<list of beat ids from the active act that this exchange addressed>],\n'
     '  "objective": "<string: the player-facing goal right now, at most 160 chars>",\n'
     '  "open_question": "<string: the decision currently facing the player, at most 160 chars>",\n'
     '  "progress": <bool: true if a beat was completed, the objective changed, or the open question was resolved>\n'
@@ -597,11 +775,23 @@ def _is_last_act(arc, act_n):
     return act_n >= max((_num(a.get("n")) for a in _dicts(arc.get("acts"))), default=act_n)
 
 
+def _drift_turns():
+    return int(cfg.drift_turns) if hasattr(cfg, "drift_turns") else DRIFT_TURNS_DEFAULT
+
+
+def _act_max_turns():
+    return int(cfg.act_max_turns) if hasattr(cfg, "act_max_turns") else ACT_MAX_TURNS_DEFAULT
+
+
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
                     intent="act", history=None, analyst_act_complete=False):
     """Execute record pass over the newest turn, updating clock, beats, pressures and steering.
 
     played_moves / intent come from the analyst brief (empty / "act" when it is off).
+    WP6 additions:
+    - on_arc and matched_beats are read from the record result and stored in arc.runtime.
+    - After drift_turns consecutive off-arc turns, a replan is triggered.
+    - After act_max_turns turns in an act, a forced transition occurs.
     Runs when the arc or the steering state is enabled; one model call covers both (A2).
     """
     arc = load_arc(root)
@@ -620,6 +810,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
         if arc:
             append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
                                  "pressures": [], "act_complete": False,
+                                 "on_arc": False, "matched_beats": [],
                                  "words": len(dm_reply.split())})
         return
 
@@ -671,6 +862,8 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
             "beats_done": [],
             "pressures": [],
             "act_complete": False,
+            "on_arc": True,
+            "matched_beats": [],
         }
 
     if steering_on:
@@ -702,6 +895,19 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
         rt["stalled_turns"] = 0
     elif intent in ("act", "steer"):
         rt["stalled_turns"] = int(rt.get("stalled_turns", 0)) + 1
+
+    # Track on_arc / matched_beats and drift counter (WP6 F2)
+    on_arc = bool(res.get("on_arc", True))
+    matched_beats = res.get("matched_beats", [])
+    if not isinstance(matched_beats, list):
+        matched_beats = []
+    rt["on_arc"] = on_arc
+    rt["matched_beats"] = [str(b) for b in matched_beats]
+
+    if on_arc:
+        rt["off_arc_turns"] = 0
+    else:
+        rt["off_arc_turns"] = int(rt.get("off_arc_turns", 0)) + 1
 
     # Update pressures & deadline bending (D-09)
     diff = cfg.difficulty
@@ -751,9 +957,63 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
         "beats_done": beats_done,
         "pressures": pressure_effects,
         "act_complete": act_complete,
+        "on_arc": on_arc,
+        "matched_beats": [str(b) for b in matched_beats],
         "words": words,
     }
     append_record(root, record)
+
+    # WP6 F3: Act cap - forced transition when act_max_turns reached
+    act_max = _act_max_turns()
+    started_msg = int(active_act.get("started_msg", 0) or 0)
+    turns_in_act = turn - (started_msg // 2 + 1) + 1 if started_msg else turn
+    if act_max > 0 and turns_in_act >= act_max and active_act.get("status") == "active":
+        logger.info("Act %d reached max turns %d; forcing transition", act_n, act_max)
+        transition_act(root, act_n, chat_fn, msg_idx=msg_idx,
+                       history=history, central_question_resolved=central_question_resolved,
+                       forced=True)
+        return
+
+    # WP6 F2: Drift and replan
+    drift_turns = _drift_turns()
+    if drift_turns > 0 and intent != "ask" and int(rt.get("off_arc_turns", 0)) >= drift_turns:
+        logger.info("Drift threshold reached (%d off-arc turns); triggering replan", drift_turns)
+        # Collect outcomes from this act's records
+        records = load_records(root)
+        start_msg = max(0, int(active_act.get("started_msg", 0)))
+        act_records = [r for r in records if start_msg <= int(r.get("msg", -1)) <= int(msg_idx)]
+        outcomes = [
+            f"{r.get('elapsed_minutes', 0)} min; beats: {', '.join(r.get('beats_done', [])) or 'none'}; "
+            f"pressures: {json.dumps(r.get('pressures', []), ensure_ascii=False)}"
+            for r in act_records[-12:]
+        ]
+        if not outcomes:
+            outcomes = ["The act is ongoing; no detailed record available."]
+        new_arc = plan_replan_arc(arc, outcomes, history, chat_fn)
+        if new_arc is not None:
+            arc = new_arc
+            save_arc(root, arc)
+            append_arc_log(
+                root,
+                rev=arc.get("revision", 0),
+                at_msg=int(msg_idx),
+                act=act_n,
+                kind="replan",
+                diff={"off_arc_turns": rt.get("off_arc_turns")},
+                reason=f"Replan after {rt.get('off_arc_turns')} consecutive off-arc turns",
+            )
+            rt["off_arc_turns"] = 0
+        else:
+            logger.warning("Replan failed; keeping previous arc (I6)")
+            append_arc_log(
+                root,
+                rev=arc.get("revision", 0),
+                at_msg=int(msg_idx),
+                act=act_n,
+                kind="replan_failed",
+                diff={"off_arc_turns": rt.get("off_arc_turns")},
+                reason=f"Replan failed after {rt.get('off_arc_turns')} consecutive off-arc turns",
+            )
 
     # If act complete, trigger act transition
     if act_complete and active_act.get("status") == "active":
@@ -762,7 +1022,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
 
 
 def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
-                   central_question_resolved=False):
+                   central_question_resolved=False, forced=False):
     """Handle act boundary transition and revision logging.
 
     msg_idx is the history index of the turn that closed the act. arc_log entries are
@@ -823,28 +1083,8 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
 
         # Generate beats for next act if empty
         if not next_act.get("beats"):
-            model = cfg.planner_model or cfg.scribe_model or cfg.model
-            prompt = (
-                f"ACT {act_n} RESOLVED OUTCOMES:\n{json.dumps(outcomes, ensure_ascii=False)}\n\n"
-                f"CENTRAL QUESTION: {arc.get('central_question')}\n"
-                f"ACT {next_n} GOAL: {next_act.get('goal', '')}\n\n"
-                "Provide 3-5 sequential dramatic beats for Act " + str(next_n) + " as a JSON list:\n"
-                '[{"id": "a' + str(next_n) + 'b1", "text": "...", "hook": "a lead the player can see", '
-                '"status": "pending"}, ...]\n'
-                "Each hook is at most 200 chars, is shown to the player, and never names the "
-                "antagonist or reveals the solution."
-            )
-            try:
-                raw = chat_fn([
-                    {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
-                    {"role": "user", "content": prompt},
-                ], model=model, track=False, retries=1, fallback=True)
-                beats = normalize_beats(parse_json_response(raw), next_n)
-                if beats:
-                    next_act["beats"] = beats
-            except Exception:
-                next_act["beats"] = [{"id": f"a{next_n}b1", "text": "Navigate emerging complications",
-                                      "hook": "An opening the player can act on", "status": "pending"}]
+            beats = plan_next_act_beats(arc, next_n, outcomes, chat_fn)
+            next_act["beats"] = beats
     else:
         arc["terminal"] = bool(central_question_resolved)
         arc["central_question_resolved"] = central_question_resolved
@@ -852,12 +1092,65 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
     arc["revision"] = arc.get("revision", 0) + 1
     save_arc(root, arc)
 
+    kind = "act_boundary_forced" if forced else "act_boundary"
+    reason = f"Act {act_n} resolved and transitioned to Act {arc.get('act')}"
+    if forced:
+        reason = f"Act {act_n} hit max-turn cap; forced transition to Act {arc.get('act')}"
+
     append_arc_log(
         root,
         rev=arc["revision"],
         at_msg=int(msg_idx) if msg_idx is not None else len(records),
         act=act_n,
-        kind="act_boundary",
-        diff={"resolved_act": act_n, "new_act": arc.get("act")},
-        reason=f"Act {act_n} resolved and transitioned to Act {arc.get('act')}",
+        kind=kind,
+        diff={"resolved_act": act_n, "new_act": arc.get("act"), "forced": forced},
+        reason=reason,
     )
+
+
+def fill_empty_pressures(root, arc):
+    """WP6 F5: When a pressure has no pending steps and its deadline is more than
+    EMPTY_PRESSURE_MINUTES_AWAY minutes away, append up to EMPTY_PRESSURE_MAX_STEPS
+    future steps. Logged as a revision.
+
+    Returns the (possibly updated) arc.
+    """
+    if not arc:
+        return arc
+    changed = False
+    clock_minutes = arc.get("clock", {}).get("minutes", 0)
+    for p in arc.get("pressures", []):
+        if p.get("status") != "active":
+            continue
+        pending = [s for s in p.get("steps", []) if s.get("status") == "pending"]
+        if pending:
+            continue
+        dl = p.get("effective_deadline_minutes", p.get("deadline_minutes"))
+        if dl is None or dl - clock_minutes <= EMPTY_PRESSURE_MINUTES_AWAY:
+            continue
+        # Append up to EMPTY_PRESSURE_MAX_STEPS future steps
+        last_at = max((_num(s.get("at_minutes"), 0) for s in p.get("steps", [])), default=clock_minutes)
+        for i in range(EMPTY_PRESSURE_MAX_STEPS):
+            new_at = last_at + (i + 1) * 60
+            p.setdefault("steps", []).append({
+                "id": f"{p.get('id')}.s{len(p.get('steps', [])) + 1}",
+                "at_minutes": new_at,
+                "effect": f"Pressure {p.get('id')} continues to escalate",
+                "status": "pending",
+            })
+            last_at = new_at
+        changed = True
+
+    if changed:
+        arc["revision"] = arc.get("revision", 0) + 1
+        save_arc(root, arc)
+        append_arc_log(
+            root,
+            rev=arc["revision"],
+            at_msg=arc.get("clock", {}).get("minutes", 0),
+            act=arc.get("act", 1),
+            kind="pressure_revision",
+            diff={"filled_empty_pressures": True},
+            reason="Appended future steps to pressures with no pending steps",
+        )
+    return arc

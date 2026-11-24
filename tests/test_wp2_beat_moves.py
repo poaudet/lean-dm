@@ -31,6 +31,25 @@ def test_beat_without_hook_never_produces_a_move():
     assert arc.allowed_moves(a, "standard", 1) == []
 
 
+def test_normalization_preserves_hook_and_superseded_status():
+    beats = arc.normalize_beats([{"id": "a1b1", "text": "old", "hook": "lead",
+                                  "status": "superseded"}])
+    assert beats[0]["hook"] == "lead"
+    assert beats[0]["status"] == "superseded"
+    assert arc.allowed_moves(_arc(acts=[{"n": 1, "beats": beats}]), "standard", 1) == []
+
+
+def test_fill_empty_pressure_persists_revision(tmp_path):
+    a = _arc(pressures=[{"id": "p1", "status": "active", "steps": [],
+                         "deadline_minutes": 900, "effective_deadline_minutes": 900}])
+    arc.save_arc(tmp_path, a)
+    arc.fill_empty_pressures(tmp_path, a)
+    saved = arc.load_arc(tmp_path)
+    assert len(saved["pressures"][0]["steps"]) == 2
+    assert saved["revision"] == 1
+    assert (tmp_path / "arc_log.jsonl").exists()
+
+
 def test_beat_move_appears_when_no_pressure_is_due():
     moves = arc.allowed_moves(_arc(), "standard", 1)
     assert [m["id"] for m in moves] == ["beat.a1b1"]

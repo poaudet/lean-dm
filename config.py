@@ -117,10 +117,13 @@ FIELDS = [
     F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
     F("analyst_retries", "Analyst retries", "int", 1, "Reliability",
       "Extra analyst attempts on 429/5xx, inside the remaining timeout budget.", scope="global", min=0, max=3),
-    F("analyst_summary_tok", "Analyst summary budget (tokens)", "int", 4000, "Reliability",
-      "Latest summary chapter text sent to the analyst, truncated oldest-first.", scope="global", min=200),
+    F("analyst_summary_tok", "Analyst summary cap (tokens)", "int", 4000, "Analyst", "Max tokens of the latest summary chapter sent to the analyst.", scope="global", min=100),
+    F("analyst_prompt_cap", "Analyst prompt cap (chars)", "int", 6000, "Analyst", "Max total chars of the analyst prompt; oldest sections truncated first.", scope="global", min=500),
     F("overlong_ratio", "Overlong ratio", "float", 1.5, "Reliability",
       "A reply counts as overlong above this multiple of the word target.", scope="global", min=1.0, max=5.0),
+    # ---- arc pacing
+    F("drift_turns", "Drift turns", "int", 4, "Arc", "Consecutive off-arc turns before a replan is triggered.", scope="campaign", min=1),
+    F("act_max_turns", "Act max turns", "int", 0, "Arc", "Max turns in an act before forced transition (0 = off).", scope="campaign", min=0),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app

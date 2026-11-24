@@ -174,6 +174,28 @@ def test_zero_retries_means_one_attempt(monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+def test_retry_forwards_remaining_timeout(monkeypatch, tmp_path):
+    _cfg(monkeypatch, analyst_retries=1, analyst_timeout_sec=25)
+    timeouts = []
+
+    def chat(messages, model=None, **kw):
+        timeouts.append(kw["timeout"])
+        if len(timeouts) == 1:
+            raise Retryable("HTTP 429")
+        return json.dumps(BRIEF)
+
+    _, source, _, _ = analyst.run_analyst(tmp_path, [], "I move.", [], [], chat)
+    assert source == "analyst"
+    assert len(timeouts) == 2
+    assert 0 < timeouts[1] <= timeouts[0] <= 25
+
+
+def test_configured_prompt_cap_limits_context_blocks(monkeypatch):
+    _cfg(monkeypatch, analyst_prompt_cap=1000)
+    blocks = analyst._cap_blocks([("premise", "a" * 5000), ("summary", "b" * 5000)], 12000)
+    assert sum(len(text) for _, text in blocks) <= 1000
+
+
 # ---------------------------------------------------------------------------
 # C1 - the analyst sees the campaign state
 # ---------------------------------------------------------------------------

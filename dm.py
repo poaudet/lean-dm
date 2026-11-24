@@ -58,9 +58,8 @@ from ledger import KINDS as KINDS
 from ledger import _lst as _lst
 from ledger import apply_ledger_ops, render_ledger
 from ledger import slug as slug
-from narrator_context import assemble_context
+from narrator_context import assemble_context, render_notes, shorter_words, word_target
 from narrator_context import merge_same_role as merge_same_role
-from narrator_context import render_notes, shorter_words, word_target
 from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
 from style_guard import compute_style_guard
 
@@ -126,7 +125,7 @@ def ensure_configured():
 
 
 def print_config():
-    key = cfg.api_key[:6] + "…" if len(cfg.api_key) > 6 else ("***" if cfg.api_key else "(none)")
+    key = "***" if cfg.api_key else "(none)"
     print(f"settings={SETTINGS_PATH}")
     print(f"endpoint={cfg.base_url}  key={key}  model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
     print(f"campaign='{CAMPAIGN}'  fold {cfg.ctx_budget_tok // 1000}k→{cfg.ctx_target_tok // 1000}k tok  "
@@ -748,6 +747,34 @@ def _record_kwargs(brief):
         "analyst_act_complete": bool(brief.get("act_complete", False)),
     }
 
+
+def compute_defer_counts(root):
+    from analyst import load_briefs
+    briefs = load_briefs(root)
+    ordered = sorted(briefs.items(), key=lambda kv: kv[0])
+    counts = {}
+    for msg_idx in reversed([mi for mi, _ in ordered]):
+        entry = briefs[msg_idx]
+        if entry.get("source") not in ("analyst", "fallback"):
+            continue
+        brief = entry.get("brief", {})
+        deferred = brief.get("deferred", [])
+        deferred_ids = set()
+        for item in deferred:
+            if isinstance(item, dict):
+                mid = str(item.get("id", "")).strip()
+            elif isinstance(item, str):
+                mid = item.strip()
+            else:
+                continue
+            if mid:
+                deferred_ids.add(mid)
+        new_counts = {}
+        for mid in deferred_ids:
+            new_counts[mid] = counts.get(mid, 0) + 1
+        counts = new_counts
+    return counts
+
 def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     """Auto-plan a missing arc, then run the record pass for a committed turn."""
     if cfg.arc_enabled and not retry and arc.arc_is_corrupt(ROOT):
@@ -768,15 +795,21 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
     try:
+        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT))
+    except Exception as e:
+        logger.warning("Could not fill empty pressures: %s", e)
+    try:
         below = max(folded(), ledgered())
         arc.prune_arc_snapshots(ROOT, below)
         steering.prune_steering_snapshots(ROOT, below)
     except OSError as e:
         logger.warning("Could not prune snapshots: %s", e)
 
-def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False,
-             shorter=False):
-    """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
+def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False, shorter=False):
+    """Single turn engine shared by CLI, web turns, streaming turns, and retries.
+
+    If shorter is True, the analyst word budget is multiplied by 0.7 (E4 retry shorter).
+    """
     if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
         raise RuntimeError("turn already in progress")
     elif not lock_acquired:
@@ -836,6 +869,8 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     ledger=ledger,
                     defer_counts=_defer_counts(),
                 )
+                if shorter:
+                    brief = _shorter_brief(brief)
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
             user = {"role": "user", "content": text}
@@ -935,6 +970,8 @@ def undo_turn():
         text = h[-2]["content"]
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
+        # Clear per-reply flags so they describe the last reply only
+        set_state(overlong=False, shape_ok=True, word_budget=0)
         return text
     finally:
         TURN_LOCK.release()
@@ -966,10 +1003,12 @@ def _retry_brief(h, rerun_analyst):
     return brief
 
 def retry_turn(stream=False, rerun_analyst=False, shorter=False):
-    """Regenerate the DM's last reply for the same player action."""
+    """Regenerate the DM's last reply for the same player action.
+
+    If shorter is True, the word budget is multiplied by 0.7 for the retried reply.
+    """
     result = None
-    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst,
-                          shorter=shorter):
+    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst, shorter=shorter):
         if stream and event.get("chunk"):
             print(event["chunk"], end="", flush=True)
         if event.get("done"):
@@ -1014,7 +1053,7 @@ def game_state():
         "job": dict(JOB),
         "ctx": label,
         "overlong": bool(st.get("overlong", False)),
-        "shape_ok": bool(st.get("shape_ok", False)),
+        "shape_ok": bool(st.get("shape_ok", True)),
         "last_words": _int(st.get("last_words", 0)),
         "word_budget": _int(st.get("word_budget", 0)),
         "arc_chip": arc_chip,
@@ -1245,8 +1284,9 @@ def api_undo():
 @app.route("/api/retry", methods=["POST"])
 def api_retry():
     body = request.get_json(silent=True) or {}
+    shorter = bool(body.get("shorter", False))
     try:
-        return jsonify({"dm": retry_turn(shorter=bool(body.get("shorter")))})
+        return jsonify({"dm": retry_turn(shorter=shorter)})
     except Exception as e:
         if str(e) == "turn already in progress":
             return jsonify({"error": str(e)}), 409

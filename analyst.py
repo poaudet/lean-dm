@@ -139,11 +139,9 @@ def _clamp_keep_true(raw, ledger, player_action, recent_text):
 
     if isinstance(raw, list):
         for item in raw:
-            why = ""
             ref = item
             if isinstance(item, dict):
                 ref = item.get("id") or item.get("name")
-                why = str(item.get("why", "")).strip()
             entry = _ledger_entry(ledger, ref)
             if entry is None:
                 # C2: an id that is not in the ledger is dropped. Only a plain
@@ -224,6 +222,7 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
     raw_moves = d.get("plot_moves")
     moves = []
     seen = set()
+    defer_counts = defer_counts or {}
     if isinstance(raw_moves, list):
         for m in raw_moves:
             if not isinstance(m, dict):
@@ -244,7 +243,6 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
             moves.append({"id": mid, "how": how, "note": note})
             if len(moves) >= 2:
                 break
-
     # B4: every due move is mandatory. One in neither plot_moves nor deferred is added
     # with its scheduled how/note; one deferred MAX_DEFERS times in a row is forced in.
     if isinstance(allowed_move_ids, dict):
@@ -541,7 +539,8 @@ def _cap_blocks(blocks, budget_tok):
     `blocks` is ordered oldest-first. Each block is trimmed from the front, because the
     newest text is the part the analyst needs. Blocks already empty are skipped.
     """
-    limit = max(500, int(budget_tok)) * max(0.5, float(cfg.chars_per_tok))
+    limit = min(int(cfg.analyst_prompt_cap),
+                max(500, int(budget_tok)) * max(0.5, float(cfg.chars_per_tok)))
     out = list(blocks)
     for idx in range(len(out)):
         total = sum(len(t) for _, t in out)
@@ -630,7 +629,8 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         # model call finishes, which defeats the timeout (D-14).
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0, fallback=False)
+            future = executor.submit(chat_fn, messages, model=model, track=False, retries=0,
+                                     fallback=False, timeout=remaining)
             return future.result(timeout=remaining)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
