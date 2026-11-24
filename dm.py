@@ -713,6 +713,10 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
     try:
+        arc.fill_empty_pressures(arc.load_arc(ROOT), chat_complete)
+    except Exception as e:
+        logger.warning("Could not fill empty pressures: %s", e)
+    try:
         arc.prune_arc_snapshots(ROOT, max(folded(), ledgered()))
     except OSError as e:
         logger.warning("Could not prune arc snapshots: %s", e)
