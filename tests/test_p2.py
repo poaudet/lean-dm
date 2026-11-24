@@ -335,3 +335,93 @@ def test_retry_reuses_brief_and_retry_bang_reruns(monkeypatch, tmp_path):
     # retry! (rerun_analyst=True) should re-run analyst (D-11)
     dm.retry_turn(rerun_analyst=True)
     assert len(analyst_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# FIX5 (WP5 tests): D3, D5, D6
+# ---------------------------------------------------------------------------
+
+def test_ooc_note_in_next_narrator_prompt(monkeypatch, tmp_path):
+    """FIX5(a): after a // note, the next narrator prompt contains its answer in the volatile block (D3)."""
+    root = tmp_path / "campaigns" / dm.CAMPAIGN
+    _init(root)
+
+    monkeypatch.setattr(dm.cfg, "_vals", {
+        **dm.cfg._vals,
+        "notes_routing": True,
+        "analyst_enabled": False,
+        "api_key": "test",
+        "model": "test-model",
+        "ledger_enabled": False,
+    })
+
+    seen_prompts = []
+
+    def fake_chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+        seen_prompts.append(messages[-1]["content"])
+        return "OOC answer noted."
+
+    monkeypatch.setattr(dm, "chat_complete", fake_chat_complete)
+
+    # Send an OOC note
+    dm.player_turn("// what is the secret?")
+    # Now send a regular turn; the OOC answer should appear in the narrator prompt
+    dm.player_turn("I look around.")
+
+    # The second call (narrator) should include the OOC answer in the volatile block
+    narrator_prompt = seen_prompts[-1]
+    assert "OOC answer noted" in narrator_prompt or "what is the secret" in narrator_prompt
+
+
+def test_clamp_brief_intent_ask_returns_empty_moves():
+    """FIX5(b): clamp_brief with intent=ask returns empty plot_moves and deferred even when moves are due (D5)."""
+    raw = {
+        "intent": "ask",
+        "assessment": "Player asks a question.",
+        "outcome": "clean",
+        "plot_moves": [{"id": "p1.s1", "how": "overt", "note": "should be dropped"}],
+        "deferred": [{"id": "p1.s2", "reason": "should be dropped"}],
+        "keep_true": [],
+        "narration": {"words": 100, "push": 0.5, "end": "question"},
+        "clarify": None,
+        "act_complete": False,
+    }
+    allowed = {"p1.s1": {"id": "p1.s1", "how": "overt", "note": "due"}}
+    out = analyst.clamp_brief(raw, allowed)
+    assert out["intent"] == "ask"
+    assert out["plot_moves"] == []
+    assert out["deferred"] == []
+
+
+def test_api_turn_ooc_writes_nothing_to_history(monkeypatch, tmp_path):
+    """FIX5(c): /api/turn returns an OOC answer once and writes nothing to history (D6)."""
+    root = tmp_path / "campaigns" / dm.CAMPAIGN
+    _init(root)
+
+    monkeypatch.setattr(dm.cfg, "_vals", {
+        **dm.cfg._vals,
+        "notes_routing": True,
+        "analyst_enabled": False,
+        "api_key": "test",
+        "model": "test-model",
+        "ledger_enabled": False,
+    })
+
+    def fake_chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+        return "The answer is 42."
+
+    monkeypatch.setattr(dm, "chat_complete", fake_chat_complete)
+
+    with dm.app.test_client() as client:
+        res = client.post("/api/turn", json={"text": "// what is the answer?"})
+        assert res.status_code == 200
+        data = res.get_json()
+        assert data["dm"] == "The answer is 42."
+
+    # History must be completely empty
+    history = dm.load_history()
+    assert len(history) == 0
+
+    # notes.jsonl must have the note
+    notes = analyst.load_notes(root)
+    assert len(notes) == 1
