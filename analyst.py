@@ -17,6 +17,7 @@ import time
 import uuid
 
 from config import cfg
+from ledger import KINDS as LEDGER_KINDS
 from storage import append_jsonl, parse_json_response, replace_lines
 
 BRIEF_SCHEMA = {
@@ -45,6 +46,10 @@ MAX_DEFERRED = 8
 MAX_KEEP_TRUE = 8
 MAX_FREE_TEXT = 3
 RECENT_EXCHANGES = 3
+
+# C1: the analyst prompt is capped in total. The oldest blocks shrink first, because the
+# newest play is what the analyst actually needs in order to judge this turn.
+ANALYST_PROMPT_TOK = 12000
 
 
 class _Brief(dict):
@@ -502,6 +507,54 @@ def _truncate_tok(text, budget):
     return text[-limit:]
 
 
+def analyst_ledger_text(ledger):
+    """C1: the analyst's own copy of the canon ledger, with pinned entries marked.
+
+    `ledger.render_ledger()` is the narrator-facing render and stays byte-identical, so
+    the player never sees a pin marker. The analyst gets a separate copy because it must
+    know which entries it is not allowed to contradict.
+    """
+    if not isinstance(ledger, list) or not ledger:
+        return ""
+    order = {k: i for i, k in enumerate(LEDGER_KINDS)}
+    act = sorted((e for e in ledger if isinstance(e, dict) and e.get("status") != "closed"),
+                 key=lambda e: (order.get(e.get("kind"), 99), str(e.get("name", ""))))
+    closed = sorted((e for e in ledger if isinstance(e, dict) and e.get("status") == "closed"),
+                    key=lambda e: e.get("msg") or 0)
+    closed = closed[-cfg.ledger_closed_max:] if cfg.ledger_closed_max else []
+    lines, cur = [], None
+    for e in act:
+        if e.get("kind") != cur:
+            cur = e.get("kind")
+            lines.append(f"[{str(cur).upper()}]")
+        mark = " [pinned]" if e.get("pinned") else ""
+        lines.append(f"- {e.get('name')}: {e.get('state')}{mark}")
+    if closed:
+        lines.append("[PAST / RESOLVED \u2014 do not revive]")
+        lines += [f"- {e.get('name')}: {e.get('state')}" for e in closed]
+    return "\n".join(lines)
+
+
+def _cap_blocks(blocks, budget_tok):
+    """C1: shrink the oldest blocks until the total fits, keeping each block's tail.
+
+    `blocks` is ordered oldest-first. Each block is trimmed from the front, because the
+    newest text is the part the analyst needs. Blocks already empty are skipped.
+    """
+    limit = max(500, int(budget_tok)) * max(0.5, float(cfg.chars_per_tok))
+    out = list(blocks)
+    for idx in range(len(out)):
+        total = sum(len(t) for _, t in out)
+        if total <= limit:
+            break
+        name, text = out[idx]
+        if not text:
+            continue
+        keep = max(200, len(text) - int(total - limit))
+        out[idx] = (name, text[-keep:] if keep < len(text) else text)
+    return out
+
+
 def _is_retryable(exc):
     """C4: retry once on 429/5xx, mirroring dm.ApiError.retry."""
     if isinstance(exc, concurrent.futures.TimeoutError):
@@ -524,17 +577,34 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
     h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history
     play_str = "\n".join(f"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for i, m in enumerate(h_tail))
 
+    # C1: the analyst sees its own pin-marked ledger copy, and the whole prompt is
+    # capped oldest-first so an oversized premise or summary cannot crowd out this turn.
+    canon = analyst_ledger_text(ledger) or ledger_text
+    prev_json = json.dumps(previous_brief, ensure_ascii=False) if previous_brief else ""
+    capped = _cap_blocks(
+        [("premise", premise),
+         ("summary", _truncate_tok(summary, cfg.analyst_summary_tok)),
+         ("ledger", canon),
+         ("previous_brief", prev_json)],
+        ANALYST_PROMPT_TOK,
+    )
+    premise_txt, summary_txt, canon_txt, prev_json = (text for _, text in capped)
+    # A truncated JSON object would be unparseable, so the previous brief is dropped
+    # whole rather than cut in half.
+    if prev_json and not prev_json.rstrip().endswith("}"):
+        prev_json = ""
+
     user_prompt = (
         f"DIFFICULTY: {cfg.difficulty}\n"
         f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
         f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
         f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
-        + (f"PREMISE:\n{premise}\n" if premise else "")
+        + (f"PREMISE:\n{premise_txt}\n" if premise_txt else "")
         + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
-        + (f"STORY SO FAR:\n{_truncate_tok(summary, cfg.analyst_summary_tok)}\n" if summary else "")
+        + (f"STORY SO FAR:\n{summary_txt}\n" if summary_txt else "")
         + (f"PENDING HOOKS: {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
-        + (f"PREVIOUS BRIEF: {json.dumps(previous_brief, ensure_ascii=False)}\n" if previous_brief else "")
-        + (f"CANON LEDGER:\n{ledger_text}\n" if ledger_text else "")
+        + (f"PREVIOUS BRIEF: {prev_json}\n" if prev_json else "")
+        + (f"CANON LEDGER:\n{canon_txt}\n" if canon_txt else "")
         + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
         + "\n"
         f"RECENT PLAY:\n{play_str}\n\n"
