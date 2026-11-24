@@ -266,10 +266,14 @@ class ApiError(RuntimeError):
 
 TRANSIENT = (requests.ConnectionError, requests.Timeout, ApiError)
 
-def _raw_post(payload, stream=False):
+def _raw_post(payload, stream=False, timeout=None):
     url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    # FIX4: an explicit timeout bounds the call itself. Without it the analyst thread
+    # would keep its HTTP request alive for cfg.timeout_sec (600 s) after the analyst
+    # timeout had already fired and returned a fallback brief.
+    read_timeout = timeout if timeout is not None else cfg.timeout_sec
     r = requests.post(url, headers={"Authorization": f"Bearer {cfg.api_key}"}, json=payload,
-                      timeout=(10, cfg.timeout_sec), stream=stream)
+                      timeout=(10, read_timeout), stream=stream)
     if r.status_code >= 400:
         wait = None
         try:
@@ -322,10 +326,17 @@ def scribe_extra():
 def scribe_model():
     return cfg.scribe_model or cfg.model
 
-def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True,
+                  timeout=None, **extra):
+    """FIX4: `timeout` is a named parameter, not part of **extra.
+
+    Anything in **extra is splatted into the request payload, so a timeout passed
+    that way would be sent to the provider as an unknown field.
+    """
     def call(m):
         def go():
-            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra})
+            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra},
+                          timeout=timeout)
             try:
                 data = r.json()
             except ValueError:
@@ -687,6 +698,27 @@ def _act_goal():
     act = next((a for a in arc_state.get("acts", []) if a.get("n") == arc_state.get("act", 1)), {})
     return str(act.get("goal") or "")
 
+def _defer_counts():
+    """B4: consecutive most-recent briefs that defer each move id.
+
+    Only the unbroken run at the tail counts: a brief that does not defer a move
+    ends its streak. Undo truncates briefs.jsonl, so the count rolls back with it.
+    """
+    briefs = analyst.load_briefs(ROOT)
+    if not briefs:
+        return {}
+    counts, active = {}, None
+    for idx in sorted(briefs, reverse=True):
+        deferred = (briefs[idx].get("brief") or {}).get("deferred") or []
+        ids = {str(d.get("id")) for d in deferred if isinstance(d, dict) and d.get("id")}
+        active = ids if active is None else (active & ids)
+        if not active:
+            break
+        for mid in active:
+            counts[mid] = counts.get(mid, 0) + 1
+    return counts
+
+
 def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
         return []
@@ -802,6 +834,7 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     hooks=_pending_hooks(arc.load_arc(ROOT)) if cfg.arc_enabled else None,
                     previous_brief=analyst.load_brief_for_msg(ROOT, len(history) - 2),
                     ledger=ledger,
+                    defer_counts=_defer_counts(),
                 )
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
 
@@ -927,6 +960,7 @@ def _retry_brief(h, rerun_analyst):
         hooks=_pending_hooks(arc.load_arc(ROOT)) if cfg.arc_enabled else None,
         previous_brief=analyst.load_brief_for_msg(ROOT, player_idx - 2),
         ledger=ledger,
+        defer_counts=_defer_counts(),
     )
     analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
     return brief
@@ -1138,7 +1172,7 @@ def api_turn():
         return jsonify({"error": str(e)}), 502
 
 class ThinkFilter:
-    """Hide … text from a live stream, tolerating tags split across chunks."""
+    """Hide reasoning text from a live stream, tolerating tags split across chunks."""
     def __init__(self):
         self.buf, self.hidden = "", False
 
@@ -1146,7 +1180,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "" if self.hidden else ""
+            tag = "</think>" if self.hidden else "<think>"
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:
