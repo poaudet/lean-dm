@@ -540,6 +540,14 @@ def normalize_arc(arc):
                     del p[key]
                 else:
                     p[key] = n
+        # A6: clamp effective_deadline_minutes to original * DEADLINE_MAX_STRETCH
+        dl = p.get("deadline_minutes")
+        eff_dl = p.get("effective_deadline_minutes")
+        if dl is not None and eff_dl is not None:
+            max_stretch = DEADLINE_MAX_STRETCH.get(_norm_diff(cfg.difficulty), 1.5)
+            cap = int(dl * max_stretch)
+            if eff_dl > cap:
+                p["effective_deadline_minutes"] = cap
         pressures.append(p)
     arc["pressures"] = pressures
     clock = arc.get("clock")
