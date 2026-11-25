@@ -1228,7 +1228,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</thinking>" if self.hidden else "<thinking>"
+            tag = "" if self.hidden else ""
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:
