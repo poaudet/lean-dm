@@ -1,109 +1,137 @@
-# Lean-DM: Steering Requirements v2 (remaining work for Copilot)
+# Lean-DM: Remaining Work
 
-Project: lean-dm · Owner: P-O · Audience: Copilot (implementing agent) · Status: ready for implementation · updated 24 November 2026
+This file tracks only the outstanding issues identified in the independent review of `handoff/steering-requirements-wp1` at `db39edc`. The steering handoff packages and prompt/documentation work already merged are not repeated here. Treat the items below as review findings to verify and resolve; do not assume a proposed fix is correct until its behavior is covered by tests.
 
-This document is self-contained. It was written after reviewing the repo files shared on 24 November 2026, after FIX1 to FIX4, FIX6, WP6 and most of WP7 landed against the first steering handoff (November 2026). Requirement IDs (A1 to G3) are kept so they match decisions.md. Everything Copilot needs is below: the context, the invariants, the current state, what each remaining item must do, and how to test it.
+## High priority
 
-## Context and invariants
+### 1. Prevent hidden arc information from entering player-visible steering (I8)
 
-lean-dm is a chat-based RPG dungeon master (Python, Flask, terminal and web UI). Files are the source of truth and context is assembled by code. The goal of this work: after every reply the player can tell what is being asked of them and where the story is pushing, without asking out-of-character questions.
+**Relevant code:** `arc.py` record context around lines 918–925; `steering.py` `clamp_steering()`; `dm.py` state/API responses and the Now panel.
 
-**Moving parts.** The analyst (`analyst.py`) writes a JSON director's brief before each reply. The hidden arc (`arc.py`) holds acts, beats and timed pressures. The record pass runs after each reply and updates the arc clock and the steering state. The narrator prompt is built in `narrator_context.py`. The OOC path answers `//` messages outside history. The ledger (`ledger.py`) is keyed canon state. `decisions.md` holds the decision records (D-NN).
+The record model receives private arc details, including beat text and IDs, pressure information, and antagonist details. `clamp_steering()` currently normalizes and truncates strings but does not establish that `objective`, `open_question`, or `active_hook` are safe to show to the player. A model response can therefore copy hidden arc content into persisted steering and the Now panel.
 
-**Already built (do not regress):**
+**Remaining work:** Add deterministic validation/sanitization at the boundary before steering is persisted. Do not rely on the model prompt to keep secrets. Review other paths where pressure/deadline notes enter narrator context for the same leak class.
 
-- Steering: `steering.json` (objective, open question, live lead), written only by the record pass, snapshotted for undo and retry, shown in the Now panel and `/now`.
-- Beat hooks and moves: each beat has a player-visible hook; `allowed_moves()` returns due moves; hooks escalate subtle, overt, offer while unanswered; every due move is mandatory (played or deferred); the fallback brief plays them.
-- Analyst inputs: ledger, premise, summary, previous brief, hooks and steering; `keep_true` resolved from ledger ids with pinned entries added; one retry on 429 or 5xx.
-- Narrator contract: three-part reply, brief fields defined in the prompt, one word target from the brief, post-check flags `overlong` and `shape_ok` in state, retry with a 0.7 budget through `/api/retry` with `{"shorter": true}`.
-- OOC: only `//`, `ooc`, `ooc:` and `note to dm:`; routing on by default; the last five answers go to the narrator; an ask intent plays no moves.
-- Earlier defects: (1) the rerun-analyst retry path now passes the ledger and act goal; (2) the default system prompt no longer states its own word count; (3) the analyst request was not bounded by its timeout (fixed: the request timeout now follows the analyst budget).
+**Acceptance:** Add sentinel tests that deliberately return hidden beat text/IDs, pressure IDs/details, and antagonist names in record output. Assert none reach `steering.json`, state/API responses, or player-facing UI data. Keep legitimate spoiler-safe steering intact.
 
-**Invariants (hold for every change):**
+## Medium priority
 
-- I3: volatile additions (ledger, guard, brief, steering, notes) go only in the last user message. Everything before it stays append-only so prefix caching works.
-- I6: fallback never blocks play. Any new LLM call that fails degrades to code-built defaults.
-- I8: the hidden arc never appears in history, premise, summary, ledger, audit, steering.json, any API or UI response, or default logs. Beat text, beat ids, pressure ids and antagonist data stay out of player-facing surfaces. Hooks are spoiler-safe: they never name the antagonist or reveal the solution.
-- D-09: difficulty bending is runtime state (`effective_deadline_minutes`), not a plan revision.
-- D-10: the UI shows only the non-spoiler arc chip and the Now panel.
-- State pointers are written last, and all model output is clamped and validated in code.
-- /undo and /retry roll back every piece of state, including anything new.
-- Pinned ledger entries are never modified by automatic passes.
+### 2. Allow the record pass to clear a resolved open question
 
-**Prompt format.** Static rules go in the system message, variable data in the user message. Sections: ROLE (one sentence); INPUTS (each block in authority order; on conflict the ledger beats the summary, which beats recent play); TASK; OUTPUT (the exact shape; for JSON one schema with types, enums and limits, then "Output only the JSON object, no code fences, no commentary"); RULES (numbered, testable, numbers from the brief or settings, never hard-coded twice); WHEN UNSURE (the safe default); EXAMPLES (one good, one bad). Keep each prompt under about 400 words.
+**Relevant code:** `steering.py`, `clamp_steering()` (currently around line 119).
 
-## 1. Status by requirement
+An explicit empty or null `open_question` currently falls back to the previous value, so a resolved question can remain visible indefinitely.
 
-| Package | IDs | Status |
-| --- | --- | --- |
-| WP1 Steering | A1 to A6 | Covered |
-| WP2 Arc to narrator | B1 to B6 | Covered (the defer cap is now wired) |
-| WP3 Analyst | C1 to C4 | Covered (pin markers, prompt cap, bounded request) |
-| WP4 Narrator | E1 to E6 | Covered, with one bug: A4 below |
-| WP5 OOC | D1 to D6 | Covered |
-| Earlier gaps | FIX1 to FIX4, FIX6, WP0 | Done |
-| WP6 Arc sync | F1 to F5 | Code present, **bugs**: A1, A2, A3, A5, A6 |
-| WP7 Canon naming | G1, G2 | Code present, **bugs**: B1, B2 |
-| WP7 | G3 | **Open**: B4 |
-| Prompt rewrites | analyst, record, ledger, planner | **Open** |
-| Docs and housekeeping |  | **Open** |
-| Tests |  | Not reviewed: the test files were not in the review set |
+**Remaining work:** Distinguish an omitted field (preserve the previous value) from an explicitly supplied empty/null value (clear it), consistent with the record-output contract.
 
-Settings: every planned setting exists, including `drift_turns` and `act_max_turns`. The README settings table does not list the two new ones yet.
+**Acceptance:** Test that omission preserves the previous question and explicit empty/null clears it.
 
-## 2. How to work from this document
+### 3. Strictly validate record booleans and beat IDs
 
-1. Rules: no new dependencies, tests use a fake `chat_fn`, no behavior change outside the requirements, record conflicts in `decisions.md`.
-2. One branch and one PR per package, in the order below. Each PR lists requirement IDs covered and tests added, and ships alone with the suite green.
-3. The invariants in the Context section above apply to every change; they are also in `.github/copilot-instructions.md`. Pinned ledger entries are never touched by automatic passes. /undo and /retry must roll back every new piece of state.
-4. Rewrite prompts you touch in the prompt format described above (ROLE, INPUTS, TASK, OUTPUT, RULES, WHEN UNSURE, EXAMPLES), under about 400 words each.
+**Relevant code:** `arc.py` record normalization and `run_record_pass()` (around lines 978–1006 and 1035–1036); `analyst.py` brief clamping (around line 288); `steering.py` progress handling.
 
-## 3. WP-A: Fix the bugs in WP6 and the retry-shorter flag
+Truthiness conversions such as `bool("false")` treat invalid string values as true. In addition, arbitrary non-empty `beats_done` values can reset stalled-turn counters, and `matched_beats` is not consistently restricted to IDs in the active act.
 
-Found by reading the code. Each item names where it happens, what goes wrong, the fix and the acceptance test.
+**Remaining work:** Validate booleans as actual booleans (or an explicitly documented accepted representation); reject or safely default malformed values. Filter matched/completed beat IDs against the active act. Reset drift/stall counters only when a newly completed, valid beat is recorded.
 
-**A1 Plan validation rejects the planner's own plan.** `validate_arc` requires three to five beats in every act, but the planner schema plans acts 2 and 3 with empty beats (they are generated when the act starts). As written, `plan_initial_arc` and every replan fail validation, so an arc cannot be created. Fix: apply the three-to-five limit only to the active act and to any act that already has beats, counting only beats that are not superseded; an act with no beats is valid while its status is `planned`. Also check the beat `hook` is non-empty (today the check tests `text` while its message says hook). Accept: an arc with empty acts 2 and 3 validates; an active act with two beats, or a beat without a hook, does not.
+**Acceptance:** Cover string booleans, malformed values, unknown IDs, IDs from another act, duplicate IDs, and a valid newly completed beat. Assert invalid output cannot trigger act transitions or reset drift counters.
 
-**A2 A replan never resets the off-arc counter.** In `run_record_pass` the reset `rt["off_arc_turns"] = 0` runs after `save_arc`, so it is not saved, and the replan fires again on every following off-arc turn. Fix: reset the counter before saving, on success and on failure (a failing planner is then retried every `drift_turns` turns, not every turn), and record the choice in `decisions.md`. Accept: after a replan the saved arc shows zero off-arc turns.
+### 4. Make `clarify` intent non-advancing
 
-**A3 A replan drops the old beats.** `plan_replan_arc` replaces the act's beat list, so superseded beats disappear; superseded and blocked beats must never be deleted (F1). New ids such as `a1b1` can also collide with ids already used in `records.jsonl`. The function also marks the old beats superseded in place before calling the planner, so a failed call leaves them marked. Fix: keep the old beats as `superseded`, append the new ones, give new ids that are unique across the whole arc (include the revision, for example `a1r2b1`), and restore the previous statuses if the planner call or the validation fails. Accept: after a replan the old beats are present as superseded and every id is unique; after a failed replan the beats are exactly as before.
+**Relevant code:** `analyst.py` `clamp_brief()` (around lines 283–294); `arc.py` `run_record_pass()` (around lines 904–911).
 
-**A4 Retry shorter shows after every reply when the analyst is off.** `compute_shape_ok` returns False when there is no requested `end`, and `web/app.js` shows the button when `shape_ok === false`. With the analyst off (the default) there is no brief, so the button never goes away. Fix: with no requested end there is nothing to check, so return True; keep the overlong check as it is. Update D-26, which states the opposite. Accept: no button after a normal reply without a brief; the button still appears when the reply is overlong, or when `end=question` and the reply does not close on a question.
+The `ask` intent suppresses moves, but `clarify` does not. A clarify brief can therefore retain due moves and the record pass can continue to advance the story/clock, despite the requirement that clarification asks one short in-character question and advances nothing.
 
-**A5 `fill_empty_pressures` logs the wrong unit.** It writes `at_msg` as clock minutes, but `truncate_arc_log` compares `at_msg` with message indexes, so undo cannot remove the entry correctly. Fix: pass `msg_idx` from the record pass and log that. Accept: undoing the turn removes the `pressure_revision` entry.
+**Remaining work:** Define and implement the interaction between `clarify`, mandatory due moves, and clock advancement. Preserve mandatory-move guarantees for ordinary turns, but make the clarify behavior explicit and consistent across analyst and record passes.
 
-**A6 Three F4 gaps.** (a) When validation fails, call the planner once more, then keep the previous arc and log it (initial plan, replan and next act). (b) Validate the beats from `plan_next_act_beats` (three to five, hooks present, ids unique) and fall back to the single beat when they fail. (c) Clamp `effective_deadline_minutes` to the original deadline times the difficulty stretch (`DEADLINE_MAX_STRETCH`) in `normalize_arc`, so an old or hand-edited arc cannot exceed it. Accept: a test for each.
+**Acceptance:** With due moves present, a clarify turn asks one short in-character question, plays/defer no story moves, and does not advance story time or arc progress. Add a separate test for the chosen behavior when mandatory pressure deadlines coincide with clarify.
 
-## 4. WP-B: Finish WP7 (canon naming)
+### 5. Keep auto-filled pressure steps within the deadline
 
-**B1 Merge keeps the merged name.** When `merge` removes the source entry, its own name (lowercased) must become an alias of the target, together with its aliases, still capped at six and never equal to the target's name. Today only the aliases move, so the merged-away name is lost and the scribe recreates it on the next pass. Accept: merging `the-smith` into `bran` leaves `bran` with the alias `the smith`; pinned entries on either side are still skipped.
+**Relevant code:** `arc.py`, `fill_empty_pressures()` (around lines 1240–1251).
 
-**B2 Aliases in lookups.** `analyst._ledger_entry` (the `keep_true` references) and `_mentioned` (pinned entries named in recent play) match id and name only. Use `ledger.resolve_ledger_ref`, which also matches aliases, and let `_mentioned` test aliases too. Accept: a pinned entry named only by an alias in recent play is kept in `keep_true`.
+The function checks whether a pressure is sufficiently far from its deadline before filling it, but generated steps can still be scheduled after the deadline. The current incremental offset can also push later generated steps farther out than intended.
 
-**B3 Ledger prompt.** `LEDGER_PROMPT` in `dm.py` must tell the scribe: when the play uses a different name for an existing entry, add it to `aliases` instead of creating a new entry; report duplicates already in the ledger with `"merge": [{"from": id, "into": id}]`; never alter pinned entries; at most six aliases per entry. Accept: the prompt text contains these rules, and `apply_ledger_ops` accepts the `merge` key.
+**Remaining work:** Calculate future step times against the effective deadline and the required minimum spacing. Do not create unreachable steps beyond the deadline; define a safe fallback when there is insufficient room for another step.
 
-**B4 Audit (G3).** Add an ALIAS COLLISIONS section to the audit prompt: entries that probably describe the same thing, with a suggested merge, and any name or alias used by two entries. Accept: the audit prompt sent to a fake `chat_fn` contains the section.
+**Acceptance:** Add tests near the deadline, including a case with a current clock of 160 and deadline of 300, and assert every generated step is reachable and respects spacing.
 
-## 5. WP-C: Prompt rewrites
+### 6. Enforce the analyst prompt cap across the complete assembled prompt
 
-Rewrite in the prompt format described above, and keep each under about 400 words:
+**Relevant code:** `analyst.py`, `_cap_blocks()` and prompt assembly (around lines 577–604).
 
-- **Analyst (`ANALYST_SYSTEM`):** inputs in authority order, the pin marker, mandatory moves and `deferred`, `keep_true` as ledger ids (aliases allowed), the ask rule, the escalation levels.
-- **Record (`RECORD_PROMPT` and its system message):** limits for `elapsed_minutes`, `on_arc`, `matched_beats`, `objective`, `open_question` and `progress`.
-- **Ledger (`LEDGER_PROMPT`):** with B3.
-- **Planner (`PLANNER_SYSTEM`, replan and next-act prompts):** id rules (unique across the arc), the F4 limits, empty beats for acts 2 and 3, and the spoiler-safe hook rule.
-- **Test:** key strings and numbers appear exactly once in the assembled narrator prompt (the word target is tested already; add the field definitions and the shape rule).
+The current cap applies to selected context blocks, but the final prompt also adds recent play, act goal, steering, hooks, allowed moves, style guard, and the player action. The assembled prompt can exceed `analyst_prompt_cap`.
 
-## 6. WP-D: Docs and housekeeping
+**Remaining work:** Apply the configured cap to the complete assembled prompt. Trim lower-priority/older context first while preserving the current player action and required structural instructions. Keep truncation deterministic.
 
-- **decisions.md:** commit the reconciliation table (every requirement marked Covered, Partial or Open). Rewrite D-26 as shipped, with the A4 change. Add records for WP6 (beat states, drift and replan, act cap, planner validation limits, superseded beats kept), for the A2 reset choice and for WP7 (aliases, merge rule). Supersede earlier records, never edit them.
-- **README.md:** add `drift_turns` and `act_max_turns` to the settings table, and WP6 and WP7 to the features. Add `steering.py` to the `ruff check` list in the README and in `.github/workflows/ci.yml`.
-- **Cleanup:** delete the stray empty file `.gitkeep-wp1-tmp` and the unused `compute_defer_counts` in `dm.py` (the live function is `_defer_counts`).
-- **Playtest script** (`docs/playtest.md`): five turns with steering on, checking the Now panel against the closing line; one `//` note; one undo; one retry; one retry shorter. With the arc on, add a scripted off-arc run that triggers exactly one replan.
+**Acceptance:** Test a deliberately oversized combination of recent play, hooks, moves, and player input. Assert the final assembled prompt stays within the configured cap and preserves the current action and required instructions.
 
-## 7. Definition of done
+### 7. Give the planner explicit numeric constraints
 
-- A1 to A6 and B1 to B4 merged, each with a test using a fake `chat_fn`. The existing tests were not reviewed here: run them and update any that encode the old behavior (A4 and the validation rules).
-- The WP-C prompts rewritten, with the exactly-once prompt test.
-- No arc content in any player-facing output: extend the sentinel leak test to superseded beats, `on_arc`, the drift counter and replan log entries.
-- `decisions.md`, README, CI and the playtest script updated; the full suite and `ruff` green.
+**Relevant code:** `arc.py`, `PLANNER_SYSTEM` and planner input assembly (around lines 453–467).
+
+The planner is told to respect supplied limits, but the prompt does not clearly supply the numeric constraints enforced by validation, including the 30-minute step gap, 14,400-minute maximum, and difficulty stretch cap. The pressure-step schema also needs explicit integer/non-negative requirements.
+
+**Remaining work:** Put the actual configured constants and field constraints into planner instructions/inputs, using shared constants rather than duplicating magic numbers. Cover initial planning, replanning, and next-act planning consistently.
+
+**Acceptance:** Fake-chat prompt tests assert the effective numeric limits and schema constraints are present in each planner prompt. Validation remains authoritative if model output violates them.
+
+### 8. Define behavior when the analyst is disabled but the arc is enabled
+
+**Relevant code:** `dm.py`, `get_allowed_moves()` call path (around lines 837–856); configuration and UI settings.
+
+Arc and analyst flags are independently configurable, but due arc moves are currently fetched only inside the analyst-enabled branch. With `arc_enabled=true` and `analyst_enabled=false`, scheduled beat/pressure moves may not be injected.
+
+**Remaining work:** Choose and implement one explicit contract: either enforce the dependency in configuration/UI/docs, or build a code-generated brief that still injects mandatory arc moves when the analyst is disabled. Keep the two flags' documented semantics aligned with runtime behavior.
+
+**Acceptance:** Test all four combinations of arc/analyst enabled and disabled, especially arc on + analyst off with due moves.
+
+### 9. Resolve the hidden-arc export/API policy
+
+**Relevant code:** `dm.py`, `/api/export/campaign.zip?include_arc=1` (around lines 1351–1364); README export documentation.
+
+The export endpoint can include `arc.json`, arc logs, records, briefs, and snapshots. This is an apparent exception to I8's rule that hidden arc data must not appear in API responses. The README documents the feature, but the authorization/owner-only policy and its relationship to I8 need to be explicit.
+
+**Remaining work:** Decide whether this is an approved owner-only backup exception or whether hidden arc data must be removed from the API export. Document the decision and enforce the appropriate authorization boundary; do not silently weaken I8.
+
+**Acceptance:** Add endpoint tests for authorized and unauthorized callers and for both `include_arc` modes. Document the approved policy in `decisions.md` and the README.
+
+## Low priority / contract clarification
+
+### 10. Clarify how `active_hook` is populated
+
+**Relevant code:** `steering.py`; `RECORD_PROMPT` in `arc.py`; steering state and UI fields.
+
+`active_hook` exists in steering state and player-facing fields, but the record output schema does not request it and no deterministic derivation currently appears to populate it. It is therefore likely to remain null.
+
+**Remaining work:** Decide whether `active_hook` is required. If required, define its source and populate it safely; otherwise remove/deprecate the unused field and update the contract/docs.
+
+**Acceptance:** A test proves the selected contract: either a spoiler-safe active hook is populated when one exists, or the field is intentionally absent/deprecated.
+
+### 11. Add examples to the OOC prompt if the shared prompt contract still requires them
+
+**Relevant code:** OOC system prompt in `dm.py`.
+
+The OOC prompt does not have an `EXAMPLES` section, unlike the shared prompt format described in the original handoff.
+
+**Remaining work:** Confirm whether that format is mandatory for every prompt. If so, add one concise good/bad example without changing OOC routing semantics.
+
+**Acceptance:** A prompt-structure test checks the agreed sections, including examples if the contract remains universal.
+
+## Repository health and verification still outstanding
+
+These are validation gaps, not claims that the implementation is broken:
+
+- Browser tests are skipped because Chrome/Chromium is not installed in the reviewed environment. Run them in an environment with a supported browser before release.
+- No line or branch coverage percentage is currently available: `coverage`/`pytest-cov` is not installed or configured. Decide whether to add coverage tooling, then establish a baseline and focus on the steering/arc/analyst paths above.
+- The documented manual playtest has not been run. Execute `docs/playtest.md`, including the scripted off-arc/replan scenario, and record the result.
+- Strict mypy was run only for `campaign.py`, `storage.py`, and `style_guard.py`; broader typing coverage remains unverified.
+- CI's Docker image build passed, but no live container/service healthcheck was performed. Run a deployment-level smoke/healthcheck in the target environment.
+
+## Working rules for remaining items
+
+- Keep changes focused; add regression tests for each behavior before or with its fix.
+- Preserve the hidden-arc boundary, append-only prompt-prefix behavior, fallback-on-LLM-failure behavior, and full `/undo` and `/retry` rollback semantics.
+- Do not add dependencies or change dependency versions without approval.
+- Update `decisions.md` when a finding requires a product/contract choice, especially clarify semantics and arc export authorization.
+- Run the relevant tests, the full test suite, Ruff, and the applicable type checks. Report browser/manual/deployment checks separately when the environment cannot run them.
