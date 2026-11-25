@@ -126,7 +126,7 @@ input:focus, textarea:focus, select:focus {
 }
 .chip.active { border-color: var(--accent); }
 
-/* Now panel (A6): player-facing steering only */
+/* Now panel: compact steering summary plus collapsed arc debug details. */
 .now-panel {
   margin: 0 16px 8px;
   padding: 8px 12px;
@@ -143,6 +143,9 @@ input:focus, textarea:focus, select:focus {
   font-size: 0.85em;
   letter-spacing: 0.04em;
 }
+#arc-debug-panel { margin-top: 8px; }
+#arc-debug-panel summary { cursor: pointer; color: var(--accent-light); }
+#arc-debug-data { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 #log {
   flex: 1;

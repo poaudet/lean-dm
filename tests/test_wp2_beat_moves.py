@@ -136,7 +136,7 @@ def test_playing_a_beat_hook_does_not_complete_the_beat(tmp_path):
     assert state["runtime"]["stalled_turns"] == 1
 
 
-def test_beat_text_never_reaches_a_player_facing_payload(tmp_path):
+def test_beat_text_stays_out_of_compact_steering_and_record_log(tmp_path):
     arc.save_arc(tmp_path, _arc())
     rec = json.dumps({"elapsed_minutes": 5, "beats_done": [], "pressures": [], "act_complete": False})
     arc.run_record_pass(tmp_path, "x", "y", 1, lambda m, **k: rec)

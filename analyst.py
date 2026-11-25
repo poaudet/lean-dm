@@ -285,12 +285,13 @@ def clamp_brief(d, allowed_move_ids=None, defer_counts=None, ledger=None,
     out["clarify"] = str(clarify).strip()[:200] if clarify else None
 
     # act_complete
-    out["act_complete"] = bool(d.get("act_complete", False))
+    out["act_complete"] = d.get("act_complete") is True
 
-    # D5: an ask advances nothing, so no move is played and none is deferred.
-    if out["intent"] == "ask":
+    # Ask and clarify turns do not consume, play, or defer scheduled story moves.
+    if out["intent"] == "ask" or out["clarify"]:
         out["plot_moves"] = []
         out["deferred"] = []
+        out["act_complete"] = False
     return out
 
 
@@ -528,24 +529,43 @@ def analyst_ledger_text(ledger):
 
 
 def _cap_blocks(blocks, budget_tok):
-    """C1: shrink the oldest blocks until the total fits, keeping each block's tail.
+    """Cap the complete assembled analyst prompt, trimming oldest context first.
 
-    `blocks` is ordered oldest-first. Each block is trimmed from the front, because the
-    newest text is the part the analyst needs. Blocks already empty are skipped.
+    Blocks are ordered oldest-first. A block may be `(name, text)` or
+    `(name, text, protected)`; protected blocks (the current action and required
+    output instruction) are never trimmed.
     """
-    limit = min(int(cfg.analyst_prompt_cap),
-                max(500, int(budget_tok)) * max(0.5, float(cfg.chars_per_tok)))
-    out = list(blocks)
-    for idx in range(len(out)):
-        total = sum(len(t) for _, t in out)
-        if total <= limit:
+    limit = int(min(int(cfg.analyst_prompt_cap),
+                    max(500, int(budget_tok)) * max(0.5, float(cfg.chars_per_tok))))
+    out = [(item[0], item[1], bool(item[2]) if len(item) > 2 else False) for item in blocks]
+
+    def total_size():
+        return sum(len(name) + (len(body) + 1 if body else 0) + 2
+                   for name, body, protected in out if body or protected)
+
+    for idx, (name, body, protected) in enumerate(out):
+        excess = total_size() - limit
+        if excess <= 0:
             break
-        name, text = out[idx]
-        if not text:
+        if protected or not body:
             continue
-        keep = max(200, len(text) - int(total - limit))
-        out[idx] = (name, text[-keep:] if keep < len(text) else text)
-    return out
+        # Keep the newest tail of the three authoritative context sources when possible.
+        minimum = min(200, len(body)) if idx < 3 else 0
+        keep = max(minimum, len(body) - excess)
+        out[idx] = (name, body[-keep:] if keep else "", protected)
+
+    # Tight caps can require trimming the authoritative tails below their preferred 200 chars.
+    for idx, (name, body, protected) in enumerate(out):
+        excess = total_size() - limit
+        if excess <= 0:
+            break
+        if protected or not body:
+            continue
+        keep = max(0, len(body) - excess)
+        out[idx] = (name, body[-keep:] if keep else "", protected)
+
+    # If protected content alone exceeds the configured cap, keep it intact.
+    return [(name, body) for name, body, _ in out]
 
 
 def _is_retryable(exc):
@@ -568,42 +588,43 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
 
     n_turns = cfg.analyst_context_turns
     h_tail = history[-2 * n_turns:] if len(history) > 2 * n_turns else history
-    play_str = "\n".join(f"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for i, m in enumerate(h_tail))
 
-    # C1: the analyst sees its own pin-marked ledger copy, and the whole prompt is
-    # capped oldest-first so an oversized premise or summary cannot crowd out this turn.
+    # C1: cap every assembled context section, not only the premise/summary/ledger.
     canon = analyst_ledger_text(ledger) or ledger_text
     prev_json = json.dumps(previous_brief, ensure_ascii=False) if previous_brief else ""
-    capped = _cap_blocks(
-        [("premise", premise),
-         ("summary", _truncate_tok(summary, cfg.analyst_summary_tok)),
-         ("ledger", canon),
-         ("previous_brief", prev_json)],
-        ANALYST_PROMPT_TOK,
+    play_str = "\n".join(f"[{i}] {'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}"
+                          for i, m in enumerate(h_tail))
+    sections = [
+        ("CANON LEDGER (authoritative; [pinned] entries are immutable):", canon),
+        ("PREMISE (fixed setup):", premise),
+        ("STORY SO FAR (subordinate to ledger and premise):",
+         _truncate_tok(summary, cfg.analyst_summary_tok)),
+        ("PREVIOUS BRIEF (context only):", prev_json),
+        ("RECENT PLAY (subordinate to ledger and summary):", play_str),
+        ("CURRENT ACT GOAL:", act_goal),
+        ("CURRENT STEERING (player-facing):", steering_text),
+        ("PENDING HOOKS (player-perceivable):",
+         json.dumps(hooks, ensure_ascii=False) if hooks else ""),
+        ("ALLOWED PLOT MOVES (mandatory unless deferred):",
+         json.dumps(allowed_moves or [], ensure_ascii=False)),
+        ("DIFFICULTY:", cfg.difficulty),
+        ("STYLE KNOBS:",
+         f"preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}"),
+        ("STYLE GUARD (avoid):", json.dumps(style_guard_list or [], ensure_ascii=False)),
+        ("PLAYER ACTION:", player_action, True),
+        ("Output ONLY the JSON brief.", "", True),
+    ]
+    capped = _cap_blocks(sections, ANALYST_PROMPT_TOK)
+    # The player action is protected; a previous brief is discarded whole if any part was trimmed.
+    previous = next((body for name, body in capped if name.startswith("PREVIOUS BRIEF")), "")
+    if previous and previous != prev_json:
+        capped = [(name, "" if name.startswith("PREVIOUS BRIEF") else body)
+                  for name, body in capped]
+    user_prompt = "\n\n".join(
+        f"{name}\n{body}" if body else name
+        for name, body in capped
+        if body or name.startswith("PLAYER ACTION:") or name.startswith("Output ONLY")
     )
-    premise_txt, summary_txt, canon_txt, prev_json = (text for _, text in capped)
-    # A truncated JSON object would be unparseable, so the previous brief is dropped
-    # whole rather than cut in half.
-    if prev_json and not prev_json.rstrip().endswith("}"):
-        prev_json = ""
-
-    user_prompt = (
-        (f"CANON LEDGER (authoritative; [pinned] entries are immutable):\n{canon_txt}\n" if canon_txt else "")
-        + (f"PREMISE (fixed setup):\n{premise_txt}\n" if premise_txt else "")
-        + (f"STORY SO FAR (subordinate to ledger):\n{summary_txt}\n" if summary_txt else "")
-        + (f"RECENT PLAY (subordinate to ledger and summary):\n{play_str}\n" if play_str else "")
-        + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
-        + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
-        + (f"PREVIOUS BRIEF (context only): {prev_json}\n" if prev_json else "")
-        + (f"PENDING HOOKS (player-perceivable): {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
-        + f"ALLOWED PLOT MOVES (mandatory unless deferred): {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
-        + f"DIFFICULTY: {cfg.difficulty}\n"
-        + f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
-        + f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n\n"
-        f"PLAYER ACTION:\n{player_action}\n\n"
-        "Output ONLY the JSON brief."
-    )
-
     messages = [
         {"role": "system", "content": ANALYST_SYSTEM},
         {"role": "user", "content": user_prompt},
@@ -693,7 +714,8 @@ OOC_SYSTEM = (
     "3. Use the canonical names from the ledger.\n"
     "4. Do not hint at anything the player has not been shown.\n"
     "\n"
-    "WHEN UNSURE: say it is not established, and offer a canon proposal."
+    "WHEN UNSURE: say it is not established, and offer a canon proposal.\n"
+    "EXAMPLES: Good: 'The ledger does not establish her surname.' Bad: inventing a surname as fact."
 )
 
 

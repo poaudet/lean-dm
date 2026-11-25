@@ -79,7 +79,7 @@ def test_record_prompt_declares_all_bounds(monkeypatch, tmp_path):
     arc.run_record_pass(tmp_path, "I search.", "You find dust.", 1, chat)
     for section in ("ROLE:", "INPUTS:", "TASK:", "OUTPUT:", "RULES:", "WHEN UNSURE:", "EXAMPLES:"):
         assert section in seen["system"]
-    for field in ("elapsed_minutes", "on_arc", "matched_beats", "objective", "open_question", "progress"):
+    for field in ("elapsed_minutes", "on_arc", "matched_beats", "objective", "open_question", "active_hook", "progress"):
         assert field in seen["user"]
     assert "1-120" in seen["user"]
     assert "160 characters" in seen["user"]

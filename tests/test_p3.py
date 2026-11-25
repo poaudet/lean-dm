@@ -1,8 +1,8 @@
 """tests/test_p3.py — Hidden arc, clock, difficulty scheduling, and record pass tests."""
 import json
-import pytest
-import dm
+
 import arc
+import dm
 
 
 def _init(root):
@@ -120,10 +120,10 @@ def test_act_boundary_accepted_writes_arc_log(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 4. Arc leak test: Sentinel strings never leak into history, premise, chapters, ledger, audit, or API (A9)
+# 4. Arc debug visibility: internals stay out of narrative files but are inspectable by the player.
 # ---------------------------------------------------------------------------
 
-def test_arc_leak_no_arc_in_history(monkeypatch, tmp_path):
+def test_arc_debug_is_visible_but_not_written_into_narrative_files(monkeypatch, tmp_path):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
 
@@ -199,15 +199,14 @@ def test_arc_leak_no_arc_in_history(monkeypatch, tmp_path):
     for s in sentinels:
         assert s not in ledger_text
 
-    # Check /api/state response via test client
+    # The full arc is intentionally available through the explicit debug payload.
     with dm.app.test_client() as client:
         res = client.get("/api/state")
-        state_json = json.dumps(res.get_json())
-        for s in sentinels:
-            assert s not in state_json
-        # Only non-spoiler arc_chip should be in state
         data = res.get_json()
         assert "Act 1" in data.get("arc_chip", "")
+        debug_json = json.dumps(data.get("arc_debug"))
+        for s in sentinels:
+            assert s in debug_json
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,8 @@
-"""arc.py — Hidden arc, clock, difficulty scheduling, and record pass.
+"""arc.py — Arc planning, clock, difficulty scheduling, and record pass.
 
 Doctrine:
-- I8: The hidden arc never appears in history, premise, chapters, ledger, audit,
-  any API/UI response, or default logs.
+- The full arc is inspectable through the explicit debug state payload.
 - D-09: Difficulty bending is runtime state (effective_deadline_minutes), not a plan revision.
-- D-10: UI never shows arc or plot moves; only a non-spoiler chip ("Act 1 · active").
 - Pure scheduling function allowed_moves() is unit-tested without LLM calls.
 """
 import json
@@ -62,7 +60,8 @@ EMPTY_PRESSURE_MAX_STEPS = 2
 MIN_BEATS = 3
 MAX_BEATS = 5
 MAX_PRESSURES = 2
-MIN_DEADLINE_GAP = 30  # minutes above last step
+MIN_STEP_GAP = 30  # minimum spacing between pressure steps
+MIN_DEADLINE_GAP = 30  # minimum time from the final step to the deadline
 MAX_DEADLINE_MINUTES = 14400  # 10 days
 
 # B2: turns without progress before a beat hook is pushed even while a pressure is due.
@@ -459,24 +458,38 @@ PLANNER_SYSTEM = (
     "2. Replans and next-act plans contain 3-5 beats. Every beat has a non-empty hook of at most 200 characters.\n"
     "3. Beat ids must be unique across the entire arc, including superseded beats. Use act and revision in ids, e.g. a2r3b1. "
     "Never reuse an id listed in EXISTING BEAT IDS.\n"
-    "4. Hook is a player-perceivable lead, never the antagonist's name, private beat text, or the solution. "
-    "The hook may appear to the player; beat text may not.\n"
+    "4. Hook is a player-perceivable lead, never the antagonist's name or the solution. "
+    "The full beat text remains available in Arc debug, not as a narrated hook.\n"
     "5. Use 1-2 pressures with ascending in-game minute timings. A deadline follows the final step and respects the supplied limits.\n"
     "6. Preserve outcomes already resolved; plan forward rather than rewriting past events.\n"
     "WHEN UNSURE: Prefer a simple, playable hook and preserve the established canon.\n"
     "EXAMPLES: Good id: a2r3b1 with hook 'A courier leaves a marked parcel'. Bad hook: naming the hidden antagonist or revealing who sent it."
 )
 
+def _planner_constraints():
+    """Shared numeric/schema constraints supplied to initial, replan and next-act planners."""
+    difficulty = _norm_diff(cfg.difficulty)
+    stretch = DEADLINE_MAX_STRETCH.get(difficulty, 1.5)
+    return (
+        "EFFECTIVE PLANNER CONSTRAINTS (validation is authoritative):\n"
+        f"- Every step at_minutes is a JSON integer >= 0; steps are ascending and at least {MIN_STEP_GAP} minutes apart.\n"
+        f"- deadline_minutes is an integer >= 0, at least {MIN_DEADLINE_GAP} minutes after the final step, "
+        f"and no greater than {MAX_DEADLINE_MINUTES}.\n"
+        f"- effective_deadline_minutes is an integer >= 0 and no greater than the original deadline "
+        f"times {stretch} for {difficulty} difficulty.\n"
+    )
+
+
 BEAT_PLANNER_SYSTEM = (
     "ROLE: You are the hidden beat planner for a text RPG.\n"
     "INPUTS: The user message supplies resolved outcomes, the act goal, central question and every existing beat id.\n"
     "TASK: Plan 3-5 sequential beats for the requested act without rewriting resolved events.\n"
-    "OUTPUT: Return only a JSON array of objects with id (string), text (private string), hook (string) and status "
+    "OUTPUT: Return only a JSON array of objects with id (string), text (full beat detail), hook (string) and status "
     "(pending).\n"
     "RULES: Every id is unique across the whole arc, including superseded beats; include act and revision, e.g. "
     "a2r3b1, and never reuse an id in the supplied list. Every hook is non-empty and at most 200 characters. "
-    "Hooks are player-perceivable, spoiler-safe leads: never name the antagonist or reveal the solution. Text is "
-    "private planning material and must never be copied into a hook.\n"
+    "Hooks are player-perceivable leads: never name the antagonist or reveal the solution. Full beat text is "
+    "inspectable in Arc debug, but must never be copied into a hook.\n"
     "WHEN UNSURE: Choose a modest, concrete lead and preserve established outcomes.\n"
     "EXAMPLES: Good hook: 'A courier leaves a marked parcel'. Bad hook: naming the hidden antagonist or revealing who sent it."
 )
@@ -565,12 +578,12 @@ def validate_arc(arc):
 
     Rules:
     - ids unique across acts
-    - at_minutes integers, non-negative, ascending per pressure
+    - at_minutes integers, non-negative, ascending and at least MIN_STEP_GAP apart per pressure
     - at most MAX_PRESSURES pressures
     - MIN_BEATS..MAX_BEATS beats on the active act and on any act that already
       has beats (counting only non-superseded beats); an act with no beats and
       status `planned` is valid
-    - every beat needs a non-empty hook (spoiler-safe, shown to the player)
+    - every beat needs a non-empty player-perceivable hook; full beat text is available in Arc debug
     - deadline_minutes at least MIN_DEADLINE_GAP above the last step and at most MAX_DEADLINE_MINUTES
     - effective_deadline_minutes at most original * DEADLINE_MAX_STRETCH[difficulty]
     """
@@ -614,8 +627,8 @@ def validate_arc(arc):
             at = _num(s.get("at_minutes"), None)
             if at is None or at < 0:
                 return False, f"pressure {pid} step has invalid at_minutes"
-            if at <= prev_at:
-                return False, f"pressure {pid} steps not ascending"
+            if prev_at >= 0 and at - prev_at < MIN_STEP_GAP:
+                return False, f"pressure {pid} steps must be at least {MIN_STEP_GAP} minutes apart"
             prev_at = at
 
         dl = p.get("deadline_minutes")
@@ -638,6 +651,32 @@ def validate_arc(arc):
     return True, ""
 
 
+def _validate_planner_time_schema(raw):
+    """Reject non-integer/negative planner timings before normalize_arc coerces them."""
+    if not isinstance(raw, dict):
+        return False, "planner response is not an object"
+    pressures = raw.get("pressures", [])
+    if not isinstance(pressures, list):
+        return False, "pressures must be an array"
+    for pressure in pressures:
+        if not isinstance(pressure, dict):
+            return False, "pressure entries must be objects"
+        steps = pressure.get("steps", [])
+        if not isinstance(steps, list):
+            return False, "pressure steps must be an array"
+        for step in steps:
+            if not isinstance(step, dict):
+                return False, "pressure steps must be objects"
+            at = step.get("at_minutes")
+            if type(at) is not int or at < 0:
+                return False, "step at_minutes must be a non-negative JSON integer"
+        for key in ("deadline_minutes", "effective_deadline_minutes"):
+            value = pressure.get(key)
+            if value is not None and (type(value) is not int or value < 0):
+                return False, f"{key} must be a non-negative JSON integer"
+    return True, ""
+
+
 def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
     """Generate an initial arc, retrying once when the planner output is invalid."""
     model = cfg.planner_model or cfg.scribe_model or cfg.model
@@ -651,7 +690,7 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
         "Draft the initial arc structure."
     )
     messages = [
-        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "system", "content": PLANNER_SYSTEM + "\n" + _planner_constraints()},
         {"role": "user", "content": prompt},
     ]
     last_error = None
@@ -661,6 +700,9 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
             arc = parse_json_response(raw)
             if not isinstance(arc, dict):
                 raise ValueError("planner response did not contain a JSON object")
+            numeric_ok, numeric_reason = _validate_planner_time_schema(arc)
+            if not numeric_ok:
+                raise ValueError(numeric_reason)
             arc = normalize_arc(arc)
             ok, reason = validate_arc(arc)
             if not ok:
@@ -746,7 +788,7 @@ def plan_replan_arc(arc, outcomes, history, chat_fn):
     for attempt in range(2):
         try:
             raw = chat_fn([
-                {"role": "system", "content": BEAT_PLANNER_SYSTEM},
+                {"role": "system", "content": BEAT_PLANNER_SYSTEM + "\n" + _planner_constraints()},
                 {"role": "user", "content": prompt},
             ], model=model, track=False, retries=1, fallback=True)
             new_beats = normalize_beats(parse_json_response(raw), act_n)
@@ -797,7 +839,7 @@ def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
     for attempt in range(2):
         try:
             raw = chat_fn([
-                {"role": "system", "content": BEAT_PLANNER_SYSTEM},
+                {"role": "system", "content": BEAT_PLANNER_SYSTEM + "\n" + _planner_constraints()},
                 {"role": "user", "content": prompt},
             ], model=model, track=False, retries=1, fallback=True)
             beats = normalize_beats(parse_json_response(raw), next_n)
@@ -828,11 +870,12 @@ RECORD_SYSTEM = (
     "You are the continuity recorder for a text RPG.\n"
     "ROLE: Evaluate the committed exchange and update only supported state.\n"
     "INPUTS: CURRENT ARC STATUS and CURRENT STEERING describe state before this exchange. LATEST EXCHANGE is the "
-    "only new evidence. Keep hidden arc details private; objective and open_question are player-facing.\n"
+    "only new evidence. The full arc is available in the debug state; objective and open_question are steering summaries.\n"
     "TASK: Record only consequences supported by the exchange, without inventing events or changing canon.\n"
     "OUTPUT: Return only the JSON object defined in the user message.\n"
     "RULES: Use only supplied active-act beat and pressure ids. elapsed_minutes is an integer from 1 to 120. "
-    "objective and open_question are each at most 160 characters. matched_beats contains only active-act ids "
+    "objective and open_question are each at most 160 characters; active_hook is at most 200 characters. "
+    "matched_beats contains only active-act ids "
     "addressed by this exchange. progress is true only for a completed beat, changed objective, or resolved open question.\n"
     "WHEN UNSURE: Set booleans false, use empty arrays, and preserve the previous steering text.\n"
     "EXAMPLES: Good: matched_beats lists a supplied id. Bad: inventing a beat id or putting arc names in objective."
@@ -850,12 +893,19 @@ RECORD_PROMPT = (
     '  "matched_beats": array of active-act beat ids addressed by this exchange,\n'
     '  "objective": string, maximum 160 characters,\n'
     '  "open_question": string, maximum 160 characters,\n'
+    '  "active_hook": optional current player-perceivable lead, string or null, maximum 200 characters,\n'
     '  "progress": boolean\n'
     "}\n"
     "LIMITS: Do not include unknown ids. elapsed_minutes must be 1-120. objective/open_question must be concise, "
-    "player-facing text and no more than 160 characters each. progress is true only if a beat completed, the "
+    "player-facing text and no more than 160 characters each; active_hook is at most 200 characters. "
+    "progress is true only if a beat completed, the "
     "objective changed, or the open question was resolved."
 )
+
+
+def _strict_bool(value, default=False):
+    """Accept JSON booleans only; truthy strings/numbers are malformed."""
+    return value if isinstance(value, bool) else default
 
 
 def _clamp_elapsed(value, default=5, lo=1, hi=120):
@@ -880,7 +930,7 @@ def _act_max_turns():
 
 
 def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_moves=None,
-                    intent="act", history=None, analyst_act_complete=False):
+                    intent="act", history=None, analyst_act_complete=False, clarify=False):
     """Execute record pass over the newest turn, updating clock, beats, pressures and steering.
 
     played_moves / intent come from the analyst brief (empty / "act" when it is off).
@@ -901,8 +951,8 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     if steering_on:
         steering.snapshot_steering(root, msg_idx)
 
-    if intent == "ask":
-        # D5: an ask costs no time and leaves the open question untouched.
+    if intent == "ask" or clarify:
+        # Ask/clarify turns leave the clock, arc progress, steering and due moves untouched.
         if arc:
             append_record(root, {"msg": int(msg_idx), "elapsed_minutes": 0, "beats_done": [],
                                  "pressures": [], "act_complete": False,
@@ -975,11 +1025,17 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     arc.setdefault("clock", {})["minutes"] = arc["clock"].get("minutes", 0) + elapsed
 
     # Update beats
+    active_beat_ids = {str(b.get("id")) for b in active_act.get("beats", []) if b.get("id")}
     beats_raw = res.get("beats_done")
-    beats_done = [str(x) for x in beats_raw] if isinstance(beats_raw, list) else []
-    for b in active_act.get("beats", []):
-        if b.get("id") in beats_done and b.get("status") == "pending":
-            b["status"] = "done"
+    requested_done = beats_raw if isinstance(beats_raw, list) else []
+    beats_done = []
+    for value in requested_done:
+        if not isinstance(value, str) or value not in active_beat_ids or value in beats_done:
+            continue
+        beat = next((b for b in active_act.get("beats", []) if b.get("id") == value), None)
+        if beat and beat.get("status") == "pending":
+            beat["status"] = "done"
+            beats_done.append(value)
 
     # Moves the brief played this turn + stall counter (runtime state; arc_snap restores it on undo)
     turn = (int(msg_idx) - 1) // 2 + 1
@@ -993,12 +1049,15 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
         rt["stalled_turns"] = int(rt.get("stalled_turns", 0)) + 1
 
     # Track on_arc / matched_beats and drift counter (WP6 F2)
-    on_arc = bool(res.get("on_arc", True))
-    matched_beats = res.get("matched_beats", [])
-    if not isinstance(matched_beats, list):
-        matched_beats = []
+    on_arc = _strict_bool(res.get("on_arc"), True)
+    matched_raw = res.get("matched_beats", [])
+    matched_beats = []
+    if isinstance(matched_raw, list):
+        for value in matched_raw:
+            if isinstance(value, str) and value in active_beat_ids and value not in matched_beats:
+                matched_beats.append(value)
     rt["on_arc"] = on_arc
-    rt["matched_beats"] = [str(b) for b in matched_beats]
+    rt["matched_beats"] = matched_beats
 
     if on_arc:
         rt["off_arc_turns"] = 0
@@ -1008,12 +1067,20 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     # Update pressures & deadline bending (D-09)
     diff = cfg.difficulty
     pressure_effects = res.get("pressures", [])
+    active_pressure_ids = {str(p.get("id")) for p in arc.get("pressures", [])
+                           if p.get("id") and p.get("status") == "active"}
     if isinstance(pressure_effects, list):
+        seen_pressure_effects = set()
         for pe in pressure_effects:
             if not isinstance(pe, dict):
                 continue
             pid = pe.get("id")
             effect = str(pe.get("effect", "none")).lower()
+            if not isinstance(pid, str) or pid not in active_pressure_ids or pid in seen_pressure_effects:
+                continue
+            if effect not in {"advanced", "delayed", "countered", "cancelled", "none"}:
+                continue
+            seen_pressure_effects.add(pid)
             p = next((p for p in arc.get("pressures", []) if p.get("id") == pid), None)
             if not p:
                 continue
@@ -1032,8 +1099,8 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
             elif effect == "cancelled":
                 p["status"] = "cancelled"
 
-    act_complete = bool(res.get("act_complete", False) or analyst_act_complete)
-    central_question_resolved = bool(res.get("central_question_resolved", False))
+    act_complete = _strict_bool(res.get("act_complete")) or analyst_act_complete is True
+    central_question_resolved = _strict_bool(res.get("central_question_resolved"))
     # Check if all beats in active act are done
     pending_beats = [b for b in active_act.get("beats", []) if b.get("status") == "pending"]
     if not pending_beats and active_act.get("beats"):
@@ -1239,10 +1306,16 @@ def fill_empty_pressures(root, arc, msg_idx=None):
         dl = p.get("effective_deadline_minutes", p.get("deadline_minutes"))
         if dl is None or dl - clock_minutes <= EMPTY_PRESSURE_MINUTES_AWAY:
             continue
-        # Append up to EMPTY_PRESSURE_MAX_STEPS future steps
-        last_at = max((_num(s.get("at_minutes"), 0) for s in p.get("steps", [])), default=clock_minutes)
-        for i in range(EMPTY_PRESSURE_MAX_STEPS):
-            new_at = last_at + (i + 1) * 60
+        # New steps are spaced 60 minutes apart and leave the required gap before deadline.
+        last_at = max(
+            clock_minutes,
+            max((_num(s.get("at_minutes"), 0) for s in p.get("steps", [])), default=clock_minutes),
+        )
+        added = 0
+        for _ in range(EMPTY_PRESSURE_MAX_STEPS):
+            new_at = last_at + 60
+            if new_at + MIN_DEADLINE_GAP > dl:
+                break
             p.setdefault("steps", []).append({
                 "id": f"{p.get('id')}.s{len(p.get('steps', [])) + 1}",
                 "at_minutes": new_at,
@@ -1250,7 +1323,8 @@ def fill_empty_pressures(root, arc, msg_idx=None):
                 "status": "pending",
             })
             last_at = new_at
-        changed = True
+            added += 1
+        changed = changed or added > 0
 
     if changed:
         arc["revision"] = arc.get("revision", 0) + 1

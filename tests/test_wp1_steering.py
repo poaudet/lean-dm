@@ -85,7 +85,7 @@ def test_one_record_call_covers_arc_and_steering(monkeypatch, tmp_path):
     assert steering.load_steering(root)["objective"] == "Find the witness before dawn"
 
 
-def test_steering_file_never_contains_arc_content(monkeypatch, tmp_path):
+def test_steering_file_keeps_compact_summary_separate_from_arc(monkeypatch, tmp_path):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
     dm.arc.save_arc(root, json.loads(json.dumps(ARC)))
