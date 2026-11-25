@@ -415,10 +415,10 @@ def parse_json_obj(raw):
 
 LEDGER_PROMPT = (
     "Update the canon ledger from the new play. Return ONLY JSON: "
-    '{"upsert": [entry...], "close": [ids], "delete": [ids]}.\n'
+    '{"upsert": [entry...], "close": [ids], "delete": [ids], "merge": [{"from": id, "into": id}...]}.\n'
     'entry = {"id": stable-lowercase-slug, "kind": "player|person|place|item|promise|clock|rule|thread", '
-    '"name": "...", "state": "one line: the CURRENT truth", "src": "player|dm|note", '
-    '"msg": index of the message where it last changed}\n'
+    '"name": "...", "state": "one line: the CURRENT truth", "aliases": ["optional alternate names"], '
+    '"src": "player|dm|note", "msg": index of the message where it last changed}\n'
     "Rules:\n"
     "- One entry per entity/thing. Reuse the existing id to update it; never create a second entry for the same thing.\n"
     "- Durable canon only: who/where/what-state, exact counts, days, deadlines, ownership, promises, debts, injuries, "
@@ -429,6 +429,10 @@ LEDGER_PROMPT = (
     "them and set src to 'note'.\n"
     "- If the DM contradicts an established value without the story changing it, keep the established value and add "
     "'(DM said X at [n])' to the state.\n"
+    "- If the play uses a different name for an existing entry, add it to that entry's 'aliases' instead of creating "
+    "a new entry (max 6 aliases per entry).\n"
+    "- Report duplicate entries already in the ledger with 'merge': [{'from': id, 'into': id}] so they can be merged.\n"
+    "- Never alter pinned entries.\n"
     "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
 
 def ledger_pass(upto=None):
@@ -1221,7 +1225,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</think>" if self.hidden else "         "
+            tag = "</thinking>" if self.hidden else "<thinking>"
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:
