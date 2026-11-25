@@ -753,7 +753,8 @@ def _record_kwargs(brief):
     return {
         "played_moves": brief.get("plot_moves") or [],
         "intent": brief.get("intent", "act"),
-        "analyst_act_complete": bool(brief.get("act_complete", False)),
+        "analyst_act_complete": brief.get("act_complete") is True,
+        "clarify": bool(brief.get("clarify")),
     }
 
 
@@ -776,10 +777,11 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
                             history=played_history, **_record_kwargs(brief))
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
-    try:
-        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT), msg_idx)
-    except Exception as e:
-        logger.warning("Could not fill empty pressures: %s", e)
+    if not (brief and (brief.get("intent") == "ask" or brief.get("clarify"))):
+        try:
+            arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT), msg_idx)
+        except Exception as e:
+            logger.warning("Could not fill empty pressures: %s", e)
     try:
         below = max(folded(), ledgered())
         arc.prune_arc_snapshots(ROOT, below)
@@ -854,6 +856,13 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                 if shorter:
                     brief = _shorter_brief(brief)
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+            elif cfg.arc_enabled:
+                # Arc scheduling remains active without the optional analyst model.
+                allowed = get_allowed_moves()
+                if allowed:
+                    brief = analyst.make_fallback_brief(
+                        allowed_moves=allowed, ledger=load_ledger(), player_action=text,
+                    )
 
             user = {"role": "user", "content": text}
             msg_idx = len(history) + 1
@@ -961,6 +970,12 @@ def undo_turn():
 def _retry_brief(h, rerun_analyst):
     """Director's brief for retrying the last exchange: reuse the stored one unless asked to re-run."""
     if not cfg.analyst_enabled:
+        if cfg.arc_enabled:
+            allowed = get_allowed_moves(h[:-2])
+            if allowed:
+                return analyst.make_fallback_brief(
+                    allowed_moves=allowed, ledger=load_ledger(), player_action=h[-2]["content"],
+                )
         return None
     player_idx = len(h) - 2
     if not rerun_analyst:
@@ -1004,7 +1019,8 @@ def game_state():
         est = est_tokens(build_context(history + [{"role": "user", "content": "x"}]))
         label = f"next prompt ≈{est / 1000:.1f}k tok"
     st = get_state()
-    arc_chip = arc.get_arc_chip(arc.load_arc(ROOT)) if cfg.arc_enabled else None
+    arc_state = arc.load_arc(ROOT) if cfg.arc_enabled else None
+    arc_chip = arc.get_arc_chip(arc_state) if arc_state else None
 
     # Undo / retry status
     can_undo = True
@@ -1039,6 +1055,7 @@ def game_state():
         "last_words": _int(st.get("last_words", 0)),
         "word_budget": _int(st.get("word_budget", 0)),
         "arc_chip": arc_chip,
+        "arc_debug": arc_state,
         "can_undo": can_undo,
         "can_retry": can_undo,
         "undo_blocked_reason": undo_reason,

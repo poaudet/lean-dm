@@ -4,15 +4,11 @@ This file tracks only the outstanding issues identified in the independent revie
 
 ## High priority
 
-### 1. Prevent hidden arc information from entering player-visible steering (I8)
+### 1. Arc visibility and debug access (resolved by D-33)
 
-**Relevant code:** `arc.py` record context around lines 918–925; `steering.py` `clamp_steering()`; `dm.py` state/API responses and the Now panel.
+The product decision is that arc data is not sensitive: players may inspect it, and the collapsed Arc debug panel plus `/api/state` payload are intentional. Do not add sanitization or owner-only access controls to hide arc data. Steering remains a separate compact summary for prompt/UI clarity, not a secrecy boundary.
 
-The record model receives private arc details, including beat text and IDs, pressure information, and antagonist details. `clamp_steering()` currently normalizes and truncates strings but does not establish that `objective`, `open_question`, or `active_hook` are safe to show to the player. A model response can therefore copy hidden arc content into persisted steering and the Now panel.
-
-**Remaining work:** Add deterministic validation/sanitization at the boundary before steering is persisted. Do not rely on the model prompt to keep secrets. Review other paths where pressure/deadline notes enter narrator context for the same leak class.
-
-**Acceptance:** Add sentinel tests that deliberately return hidden beat text/IDs, pressure IDs/details, and antagonist names in record output. Assert none reach `steering.json`, state/API responses, or player-facing UI data. Keep legitimate spoiler-safe steering intact.
+**Acceptance:** `arc_debug` exposes the full active arc when enabled, the UI renders it in a collapsed spoiler-labelled panel, and it is absent when arc management is disabled.
 
 ## Medium priority
 
@@ -86,37 +82,25 @@ Arc and analyst flags are independently configurable, but due arc moves are curr
 
 **Acceptance:** Test all four combinations of arc/analyst enabled and disabled, especially arc on + analyst off with due moves.
 
-### 9. Resolve the hidden-arc export/API policy
+### 9. Arc export policy (resolved by D-33)
 
-**Relevant code:** `dm.py`, `/api/export/campaign.zip?include_arc=1` (around lines 1351–1364); README export documentation.
+`/api/export/campaign.zip` intentionally omits arc internals by default and includes them with `?include_arc=1`. Arc data is not sensitive, so no additional owner-only authorization is required; the app's existing global authentication configuration remains in force.
 
-The export endpoint can include `arc.json`, arc logs, records, briefs, and snapshots. This is an apparent exception to I8's rule that hidden arc data must not appear in API responses. The README documents the feature, but the authorization/owner-only policy and its relationship to I8 need to be explicit.
-
-**Remaining work:** Decide whether this is an approved owner-only backup exception or whether hidden arc data must be removed from the API export. Document the decision and enforce the appropriate authorization boundary; do not silently weaken I8.
-
-**Acceptance:** Add endpoint tests for authorized and unauthorized callers and for both `include_arc` modes. Document the approved policy in `decisions.md` and the README.
+**Acceptance:** Keep regression coverage for both export modes and document the opt-in flag in the README.
 
 ## Low priority / contract clarification
 
-### 10. Clarify how `active_hook` is populated
+### 10. Populate the optional active hook (resolved)
 
-**Relevant code:** `steering.py`; `RECORD_PROMPT` in `arc.py`; steering state and UI fields.
+The record output schema now requests `active_hook` as an optional current player-perceivable lead, bounded to 200 characters. `clamp_steering()` persists it when supplied and clears it on explicit null/empty.
 
-`active_hook` exists in steering state and player-facing fields, but the record output schema does not request it and no deterministic derivation currently appears to populate it. It is therefore likely to remain null.
+**Acceptance:** Record prompt and steering clamp tests cover the field.
 
-**Remaining work:** Decide whether `active_hook` is required. If required, define its source and populate it safely; otherwise remove/deprecate the unused field and update the contract/docs.
+### 11. OOC prompt examples (resolved)
 
-**Acceptance:** A test proves the selected contract: either a spoiler-safe active hook is populated when one exists, or the field is intentionally absent/deprecated.
+`OOC_SYSTEM` now includes one concise good/bad example and follows the shared prompt section contract.
 
-### 11. Add examples to the OOC prompt if the shared prompt contract still requires them
-
-**Relevant code:** OOC system prompt in `dm.py`.
-
-The OOC prompt does not have an `EXAMPLES` section, unlike the shared prompt format described in the original handoff.
-
-**Remaining work:** Confirm whether that format is mandatory for every prompt. If so, add one concise good/bad example without changing OOC routing semantics.
-
-**Acceptance:** A prompt-structure test checks the agreed sections, including examples if the contract remains universal.
+**Acceptance:** Prompt-structure test checks the `EXAMPLES` section.
 
 ## Repository health and verification still outstanding
 
@@ -131,7 +115,7 @@ These are validation gaps, not claims that the implementation is broken:
 ## Working rules for remaining items
 
 - Keep changes focused; add regression tests for each behavior before or with its fix.
-- Preserve the hidden-arc boundary, append-only prompt-prefix behavior, fallback-on-LLM-failure behavior, and full `/undo` and `/retry` rollback semantics.
+- Preserve the explicit arc-debug/export contract, append-only prompt-prefix behavior, fallback-on-LLM-failure behavior, and full `/undo` and `/retry` rollback semantics.
 - Do not add dependencies or change dependency versions without approval.
-- Update `decisions.md` when a finding requires a product/contract choice, especially clarify semantics and arc export authorization.
+- Update `decisions.md` when a finding requires a product/contract choice, especially clarify semantics and arc visibility/export behavior.
 - Run the relevant tests, the full test suite, Ruff, and the applicable type checks. Report browser/manual/deployment checks separately when the environment cannot run them.

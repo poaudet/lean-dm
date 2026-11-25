@@ -47,8 +47,14 @@
   </div>
 
   <div id="now-panel" class="now-panel" style="display:none">
-    <div class="now-row"><span class="now-label">Objective</span><span id="now-objective"></span></div>
-    <div class="now-row"><span class="now-label">Open question</span><span id="now-question"></span></div>
+    <div id="steering-fields">
+      <div class="now-row"><span class="now-label">Objective</span><span id="now-objective"></span></div>
+      <div class="now-row"><span class="now-label">Open question</span><span id="now-question"></span></div>
+    </div>
+    <details id="arc-debug-panel" hidden>
+      <summary>Arc debug (spoilers)</summary>
+      <pre id="arc-debug-data"></pre>
+    </details>
   </div>
 
   <div id="log" role="log" aria-live="polite"></div>
