@@ -113,9 +113,10 @@ def test_act_boundary_accepted_writes_arc_log(monkeypatch, tmp_path):
     assert log_file.exists()
     lines = log_file.read_text(encoding="utf-8").splitlines()
     assert len(lines) >= 1
-    entry = json.loads(lines[-1])
-    assert entry["kind"] == "act_boundary"
+    entries = [json.loads(line) for line in lines]
+    entry = next(item for item in entries if item["kind"] == "act_boundary")
     assert entry["act"] == 1
+    assert any(item["kind"] == "next_act_fallback" for item in entries)
 
 
 # ---------------------------------------------------------------------------

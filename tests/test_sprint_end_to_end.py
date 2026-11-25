@@ -13,7 +13,7 @@ class LocalModel:
         self.narrations = 0
         self.mid_records = 0
 
-    def __call__(self, payload, stream=False):
+    def __call__(self, payload, stream=False, timeout=None):
         self.calls.append(payload)
         model = payload["model"]
         system = payload["messages"][0]["content"]
@@ -27,14 +27,15 @@ class LocalModel:
         elif model == "narrator":
             self.narrations += 1
             content = f"Narration {self.narrations}: the story continues."
-        elif "master story planner" in system:
+        elif "hidden story-arc planner" in system:
             content = json.dumps({
                 "central_question": "Can the witness be saved?",
                 "acts": [
                     {"n": 1, "status": "active", "goal": "Find the witness",
                      "beats": [
-                         {"id": "a1b1", "text": "Find a clue", "status": "pending"},
-                         {"id": "a1b2", "text": "Find the witness", "status": "pending"},
+                         {"id": "a1b1", "text": "Find a clue", "hook": "A torn map appears", "status": "pending"},
+                         {"id": "a1b2", "text": "Find the witness", "hook": "A lantern flashes twice", "status": "pending"},
+                         {"id": "a1b3", "text": "Find the safe route", "hook": "A side gate stands open", "status": "pending"},
                      ], "outcomes": []},
                     {"n": 2, "status": "planned", "goal": "Escape", "beats": [], "outcomes": []},
                     {"n": 3, "status": "planned", "goal": "Save the witness", "beats": [], "outcomes": []},
@@ -53,11 +54,11 @@ class LocalModel:
                 elapsed = (10, 12, 7)[self.mid_records - 1]
                 beats = ["a1b1"]
             elif "PLAYER: Find the witness" in prompt:
-                beats = ["a1b2"]
+                beats = ["a1b2", "a1b3"]
             elif "PLAYER: Escape the hunters" in prompt:
-                beats = ["a2b1"]
+                beats = ["a2r2b1", "a2r2b2", "a2r2b3"]
             elif "PLAYER: Confront the hunters" in prompt:
-                beats = ["a3b1"]
+                beats = ["a3r3b1", "a3r3b2", "a3r3b3"]
             elif "PLAYER: Secure the witness" in prompt:
                 resolved = True
             content = json.dumps({"elapsed_minutes": elapsed, "beats_done": beats,
@@ -66,10 +67,14 @@ class LocalModel:
         elif "Summarize factual play outcomes" in system:
             act_n = int(prompt.split("ACT ", 1)[1][0])
             content = json.dumps([f"Act {act_n} outcome from play"])
-        elif "story planner" in system:
-            act_n = 2 if "ACT 2 GOAL" in prompt else 3
-            content = json.dumps([{"id": f"a{act_n}b1", "text": "Next obstacle",
-                                   "status": "pending"}])
+        elif "hidden beat planner" in system:
+            act_n = 2 if "NEXT ACT: 2" in prompt else 3
+            revision = 2 if act_n == 2 else 3
+            content = json.dumps([
+                {"id": f"a{act_n}r{revision}b{i}", "text": f"Next obstacle {i}",
+                 "hook": f"A visible opening {i}", "status": "pending"}
+                for i in range(1, 4)
+            ])
         else:
             raise AssertionError(f"Unexpected local model call: {model}: {system[:80]}")
         return LocalResponse(content, stream)
@@ -181,13 +186,13 @@ def test_three_act_stream_undo_retry_and_terminal(monkeypatch, isolated_campaign
         assert state["act"] == 2
         assert [a["status"] for a in state["acts"]] == ["resolved", "active", "planned"]
         assert state["acts"][0]["outcomes"] == ["Act 1 outcome from play"]
-        assert state["acts"][1]["beats"][0]["id"] == "a2b1"
+        assert state["acts"][1]["beats"][0]["id"].startswith("a2r")
 
         turn(client, "Escape the hunters")
         state = arc.load_arc(root)
         assert state["act"] == 3
         assert [a["status"] for a in state["acts"]] == ["resolved", "resolved", "active"]
-        assert state["acts"][2]["beats"][0]["id"] == "a3b1"
+        assert state["acts"][2]["beats"][0]["id"].startswith("a3r")
 
         turn(client, "Confront the hunters")
         state = arc.load_arc(root)
@@ -204,7 +209,8 @@ def test_three_act_stream_undo_retry_and_terminal(monkeypatch, isolated_campaign
         assert state["clock"]["minutes"] == 32
         assert [r["msg"] for r in arc.load_records(root)] == [1, 3, 5, 7, 9, 11]
         log = [json.loads(line) for line in arc.arc_log_path(root).read_text().splitlines()]
-        assert [(entry["act"], entry["at_msg"]) for entry in log] == [(1, 5), (2, 7), (3, 11)]
+        boundaries = [entry for entry in log if entry["kind"] == "act_boundary"]
+        assert [(entry["act"], entry["at_msg"]) for entry in boundaries] == [(1, 5), (2, 7), (3, 11)]
         assert all(entry["source"] == "analyst" for entry in analyst.load_briefs(root).values())
         summaries = [c["messages"][-1]["content"] for c in local.calls
                      if "Summarize factual play outcomes" in c["messages"][0]["content"]]

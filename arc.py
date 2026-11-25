@@ -446,42 +446,41 @@ def apply_played_moves(arc, played_moves, turn):
 # ---------------------------------------------------------------------------
 
 PLANNER_SYSTEM = (
-    "You are the master story planner and narrative architect of a text RPG.\n"
-    "Create a dramatic arc structure in JSON following this exact schema:\n"
-    "{\n"
-    '  "version": 1,\n'
-    '  "revision": 0,\n'
-    '  "central_question": "Will the protagonist achieve their driving goal despite the odds?",\n'
-    '  "act": 1,\n'
-    '  "clock": {"minutes": 0},\n'
-    '  "acts": [\n'
-    '    {"n": 1, "status": "active", "goal": "Establish stakes and confront immediate obstacle",\n'
-    '     "beats": [\n'
-    '       {"id": "a1b1", "text": "Opening discovery", "hook": "A lead the player can see", "status": "pending"},\n'
-    '       {"id": "a1b2", "text": "Escalation", "hook": "A lead the player can see", "status": "pending"},\n'
-    '       {"id": "a1b3", "text": "Act climax", "hook": "A lead the player can see", "status": "pending"}\n'
-    '     ], "outcomes": []},\n'
-    '    {"n": 2, "status": "planned", "goal": "Rising action and deepening stakes", "beats": [], "outcomes": []},\n'
-    '    {"n": 3, "status": "planned", "goal": "Climax and resolution", "beats": [], "outcomes": []}\n'
-    '  ],\n'
-    '  "pressures": [\n'
-    '    {"id": "p1", "antagonist": "Primary Antagonist", "goal": "Their agenda", "status": "active",\n'
-    '     "steps": [\n'
-    '       {"id": "p1.s1", "at_minutes": 60, "effect": "First overt move", "status": "pending"},\n'
-    '       {"id": "p1.s2", "at_minutes": 180, "effect": "Second move", "status": "pending"}\n'
-    '     ],\n'
-    '     "deadline_minutes": 720, "effective_deadline_minutes": 720}\n'
-    '  ]\n'
-    "}\n"
-    "Rules:\n"
-    "- Act 1 has 3-5 concrete dramatic beats.\n"
-    "- Acts 2 and 3 have goals outlined, but empty beats (D-04: planned later based on outcomes).\n"
-    "- 1-2 pressures with in-game minute timings.\n"
-    "- Every beat needs a 'hook': at most 200 chars, a lead the PLAYER can perceive.\n"
-    "- A hook must never name the antagonist or reveal the solution. It is shown to the player.\n"
-    "- 'text' is the private plan and is never shown to the player.\n"
-    "- Return ONLY the valid JSON object."
+    "ROLE: You are the hidden story-arc planner for a text RPG.\n"
+    "INPUTS: PREMISE, STORY SO FAR, CANON LEDGER and recent play are authoritative story context. "
+    "For a replan or next act, use the supplied outcomes and existing beat ids.\n"
+    "TASK: Build or revise a three-act dramatic plan that can adapt to player choices.\n"
+    "OUTPUT: Return only a JSON object with version (integer), revision (integer), central_question (string), "
+    "act (integer), clock ({minutes: integer}), acts (array), and pressures (array). Each act has n, status, "
+    "goal, beats and outcomes. Each beat has id, text, hook and status. Each pressure has id, antagonist, goal, "
+    "status, steps, deadline_minutes and effective_deadline_minutes.\n"
+    "RULES:\n"
+    "1. The initial active Act 1 has 3-5 beats. Planned Acts 2 and 3 have goals and beats=[]; they are generated at transition.\n"
+    "2. Replans and next-act plans contain 3-5 beats. Every beat has a non-empty hook of at most 200 characters.\n"
+    "3. Beat ids must be unique across the entire arc, including superseded beats. Use act and revision in ids, e.g. a2r3b1. "
+    "Never reuse an id listed in EXISTING BEAT IDS.\n"
+    "4. Hook is a player-perceivable lead, never the antagonist's name, private beat text, or the solution. "
+    "The hook may appear to the player; beat text may not.\n"
+    "5. Use 1-2 pressures with ascending in-game minute timings. A deadline follows the final step and respects the supplied limits.\n"
+    "6. Preserve outcomes already resolved; plan forward rather than rewriting past events.\n"
+    "WHEN UNSURE: Prefer a simple, playable hook and preserve the established canon.\n"
+    "EXAMPLES: Good id: a2r3b1 with hook 'A courier leaves a marked parcel'. Bad hook: naming the hidden antagonist or revealing who sent it."
 )
+
+BEAT_PLANNER_SYSTEM = (
+    "ROLE: You are the hidden beat planner for a text RPG.\n"
+    "INPUTS: The user message supplies resolved outcomes, the act goal, central question and every existing beat id.\n"
+    "TASK: Plan 3-5 sequential beats for the requested act without rewriting resolved events.\n"
+    "OUTPUT: Return only a JSON array of objects with id (string), text (private string), hook (string) and status "
+    "(pending).\n"
+    "RULES: Every id is unique across the whole arc, including superseded beats; include act and revision, e.g. "
+    "a2r3b1, and never reuse an id in the supplied list. Every hook is non-empty and at most 200 characters. "
+    "Hooks are player-perceivable, spoiler-safe leads: never name the antagonist or reveal the solution. Text is "
+    "private planning material and must never be copied into a hook.\n"
+    "WHEN UNSURE: Choose a modest, concrete lead and preserve established outcomes.\n"
+    "EXAMPLES: Good hook: 'A courier leaves a marked parcel'. Bad hook: naming the hidden antagonist or revealing who sent it."
+)
+
 
 
 def _num(value, default=0):
@@ -640,11 +639,10 @@ def validate_arc(arc):
 
 
 def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
-    """Generate initial arc.json via planner model."""
+    """Generate an initial arc, retrying once when the planner output is invalid."""
     model = cfg.planner_model or cfg.scribe_model or cfg.model
     h_tail = history[-20:] if len(history) > 20 else history
     play_str = "\n".join(f"{'PLAYER' if m['role'] == 'user' else 'DM'}: {m['content']}" for m in h_tail)
-
     prompt = (
         f"PREMISE:\n{premise}\n\n"
         f"STORY SO FAR:\n{summary or '(new story)'}\n\n"
@@ -652,28 +650,33 @@ def plan_initial_arc(premise, summary, ledger_str, history, chat_fn):
         f"RECENT PLAY:\n{play_str or '(opening)'}\n\n"
         "Draft the initial arc structure."
     )
-
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM},
         {"role": "user", "content": prompt},
     ]
-
-    raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
-    # Parse tolerantly
-    arc = parse_json_response(raw)
-    if not isinstance(arc, dict):
-        raise ValueError("planner response did not contain a JSON object")
-    arc = normalize_arc(arc)
-    ok, reason = validate_arc(arc)
-    if not ok:
-        raise ValueError(f"invalid initial arc: {reason}")
-    if not arc.get("central_question") or not arc["acts"]:
-        raise ValueError("Invalid arc structure generated by planner")
-    arc["version"] = 1
-    arc["revision"] = 0
-    arc["act"] = 1
-    arc["clock"] = {"minutes": 0}
-    return arc
+    last_error = None
+    for attempt in range(2):
+        try:
+            raw = chat_fn(messages, model=model, track=False, retries=1, fallback=True)
+            arc = parse_json_response(raw)
+            if not isinstance(arc, dict):
+                raise ValueError("planner response did not contain a JSON object")
+            arc = normalize_arc(arc)
+            ok, reason = validate_arc(arc)
+            if not ok:
+                raise ValueError(reason)
+            if not arc.get("central_question") or not arc["acts"]:
+                raise ValueError("invalid arc structure generated by planner")
+            arc["version"] = 1
+            arc["revision"] = 0
+            arc["act"] = 1
+            arc["clock"] = {"minutes": 0}
+            return arc
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.warning("initial planner output invalid; retrying once: %s", exc)
+    raise ValueError(f"initial planner failed validation after retry: {last_error}")
 
 
 def _unique_beat_id(arc, act_n, revision, base):
@@ -685,6 +688,28 @@ def _unique_beat_id(arc, act_n, revision, base):
         candidate = f"a{act_n}r{revision}{base}{i}"
         i += 1
     return candidate
+
+
+def _validate_planned_beats(arc, act_n, beats):
+    """Validate a planner's beat list without revalidating unrelated live pressures."""
+    if not isinstance(beats, list) or not MIN_BEATS <= len(beats) <= MAX_BEATS:
+        return False, f"act {act_n} must have {MIN_BEATS}-{MAX_BEATS} beats"
+    existing = {
+        str(beat.get("id"))
+        for act in _dicts(arc.get("acts"))
+        for beat in _dicts(act.get("beats"))
+    }
+    seen = set()
+    for beat in beats:
+        beat_id = str(beat.get("id", "")).strip()
+        if not beat_id:
+            return False, "planned beat missing id"
+        if beat_id in existing or beat_id in seen:
+            return False, f"duplicate beat id {beat_id}"
+        if not str(beat.get("hook", "")).strip():
+            return False, f"beat {beat_id} has empty hook"
+        seen.add(beat_id)
+    return True, ""
 
 
 def plan_replan_arc(arc, outcomes, history, chat_fn):
@@ -707,48 +732,47 @@ def plan_replan_arc(arc, outcomes, history, chat_fn):
         if b.get("status") == "pending":
             b["status"] = "superseded"
 
+    existing_ids = [str(b.get("id")) for a in _dicts(arc.get("acts")) for b in _dicts(a.get("beats"))]
     prompt = (
-        f"ACT {act_n} RESOLVED OUTCOMES:\n{json.dumps(outcomes, ensure_ascii=False)}\n\n"
+        f"ACT: {act_n}\n"
+        f"RESOLVED OUTCOMES: {json.dumps(outcomes, ensure_ascii=False)}\n"
         f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
-        f"ACT {act_n} GOAL: {active_act.get('goal', '')}\n\n"
-        "Provide 3-5 sequential dramatic beats for this act as a JSON list:\n"
-        '[{"id": "a' + str(act_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
-        "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
+        f"ACT GOAL: {active_act.get('goal', '')}\n"
+        f"EXISTING BEAT IDS: {json.dumps(existing_ids)}\n"
+        "Plan replacement beats for the unresolved part of this act."
     )
 
-    try:
-        raw = chat_fn([
-            {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
-            {"role": "user", "content": prompt},
-        ], model=model, track=False, retries=1, fallback=True)
-        new_beats = normalize_beats(parse_json_response(raw), act_n)
-        if not new_beats:
-            raise ValueError("planner returned no beats")
-        # Give new beats ids unique across the whole arc.
-        revision = arc.get("revision", 0) + 1
-        for b in new_beats:
-            b["id"] = _unique_beat_id(arc, act_n, revision, str(b.get("id") or f"b{len(new_beats)}"))
-        # Validate the combined beat list against the arc structure.
-        test_arc = dict(arc)
-        test_arc["acts"] = [
-            {**a, "beats": old_beats + new_beats if a.get("n") == act_n else a.get("beats", [])}
-            for a in test_arc.get("acts", [])
-        ]
-        ok, reason = validate_arc(test_arc)
-        if not ok:
-            logger.warning("replan validation failed: %s", reason)
-            raise ValueError(reason)
-        active_act["beats"] = old_beats + new_beats
-        arc["revision"] = revision
-        return arc
-    except Exception as e:
-        # Restore previous statuses so a failed call leaves beats exactly as before.
-        for b in active_act.get("beats", []):
-            bid = str(b.get("id"))
-            if bid in old_statuses:
-                b["status"] = old_statuses[bid]
-        logger.warning("replan failed: %s", e)
-        return None
+    last_error = None
+    for attempt in range(2):
+        try:
+            raw = chat_fn([
+                {"role": "system", "content": BEAT_PLANNER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ], model=model, track=False, retries=1, fallback=True)
+            new_beats = normalize_beats(parse_json_response(raw), act_n)
+            if len(new_beats) < MIN_BEATS or len(new_beats) > MAX_BEATS:
+                raise ValueError("replan must return 3-5 beats")
+            revision = _num(arc.get("revision"), 0) + 1
+            for i, beat in enumerate(new_beats, start=1):
+                beat["id"] = _unique_beat_id(arc, act_n, revision, f"b{i}")
+            ok, reason = _validate_planned_beats(arc, act_n, new_beats)
+            if not ok:
+                raise ValueError(reason)
+            active_act["beats"] = old_beats + new_beats
+            arc["revision"] = revision
+            return arc
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.warning("replan output invalid; retrying once: %s", exc)
+    # Restore previous statuses so a failed replan leaves beats exactly as before.
+    for beat in active_act.get("beats", []):
+        bid = str(beat.get("id"))
+        if bid in old_statuses:
+            beat["status"] = old_statuses[bid]
+    logger.warning("replan failed after validation retry: %s", last_error)
+    return None
+
 
 
 def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
@@ -758,49 +782,79 @@ def plan_next_act_beats(arc, next_n, outcomes, chat_fn):
     """
     model = cfg.planner_model or cfg.scribe_model or cfg.model
     next_act = next((a for a in arc.get("acts", []) if a.get("n") == next_n), {})
+    existing_ids = [str(b.get("id")) for a in _dicts(arc.get("acts")) for b in _dicts(a.get("beats"))]
+    revision = _num(arc.get("revision"), 0) + 1
     prompt = (
-        f"ACT {next_n - 1} RESOLVED OUTCOMES:\n{json.dumps(outcomes, ensure_ascii=False)}\n\n"
+        f"PREVIOUS ACT: {next_n - 1}\n"
+        f"RESOLVED OUTCOMES: {json.dumps(outcomes, ensure_ascii=False)}\n"
         f"CENTRAL QUESTION: {arc.get('central_question', '')}\n"
-        f"ACT {next_n} GOAL: {next_act.get('goal', '')}\n\n"
-        "Provide 3-5 sequential dramatic beats for Act " + str(next_n) + " as a JSON list:\n"
-        '[{"id": "a' + str(next_n) + 'b1", "text": "...", "hook": "a lead the player can see", "status": "pending"}, ...]\n'
-        "Hooks must be spoiler-safe: never name the antagonist or reveal the solution."
+        f"NEXT ACT: {next_n}\n"
+        f"ACT GOAL: {next_act.get('goal', '')}\n"
+        f"EXISTING BEAT IDS: {json.dumps(existing_ids)}\n"
+        "Plan this act from the recorded outcomes."
     )
-    try:
-        raw = chat_fn([
-            {"role": "system", "content": "You are the story planner. Return only a JSON array of beats."},
-            {"role": "user", "content": prompt},
-        ], model=model, track=False, retries=1, fallback=True)
-        beats = normalize_beats(parse_json_response(raw), next_n)
-        if beats:
+    last_error = None
+    for attempt in range(2):
+        try:
+            raw = chat_fn([
+                {"role": "system", "content": BEAT_PLANNER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ], model=model, track=False, retries=1, fallback=True)
+            beats = normalize_beats(parse_json_response(raw), next_n)
+            if len(beats) < MIN_BEATS or len(beats) > MAX_BEATS:
+                raise ValueError("next-act planner must return 3-5 beats")
+            for i, beat in enumerate(beats, start=1):
+                beat["id"] = _unique_beat_id(arc, next_n, revision, f"b{i}")
+            ok, reason = _validate_planned_beats(arc, next_n, beats)
+            if not ok:
+                raise ValueError(reason)
             return beats
-    except Exception as e:
-        logger.warning("next-act beat planning failed: %s", e)
-    return [{"id": f"a{next_n}b1", "text": "Navigate emerging complications",
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                logger.warning("next-act planner output invalid; retrying once: %s", exc)
+    logger.warning("next-act planning failed after validation retry: %s", last_error)
+    fallback_id = _unique_beat_id(arc, next_n, revision, "b1")
+    return [{"id": fallback_id, "text": "Navigate emerging complications",
              "hook": "An opening the player can act on", "status": "pending"}]
+
 
 
 # ---------------------------------------------------------------------------
 # Record Pass: Background evaluation after turn
 # ---------------------------------------------------------------------------
 
+RECORD_SYSTEM = (
+    "You are the continuity recorder for a text RPG.\n"
+    "ROLE: Evaluate the committed exchange and update only supported state.\n"
+    "INPUTS: CURRENT ARC STATUS and CURRENT STEERING describe state before this exchange. LATEST EXCHANGE is the "
+    "only new evidence. Keep hidden arc details private; objective and open_question are player-facing.\n"
+    "TASK: Record only consequences supported by the exchange, without inventing events or changing canon.\n"
+    "OUTPUT: Return only the JSON object defined in the user message.\n"
+    "RULES: Use only supplied active-act beat and pressure ids. elapsed_minutes is an integer from 1 to 120. "
+    "objective and open_question are each at most 160 characters. matched_beats contains only active-act ids "
+    "addressed by this exchange. progress is true only for a completed beat, changed objective, or resolved open question.\n"
+    "WHEN UNSURE: Set booleans false, use empty arrays, and preserve the previous steering text.\n"
+    "EXAMPLES: Good: matched_beats lists a supplied id. Bad: inventing a beat id or putting arc names in objective."
+)
+
 RECORD_PROMPT = (
-    "Evaluate the in-game consequences of the latest exchange.\n"
-    "Return ONLY a JSON object:\n"
+    "OUTPUT SCHEMA (types and limits):\n"
     "{\n"
-    '  "elapsed_minutes": <int: estimated in-game minutes elapsed, 1-120>,\n'
-    '  "beats_done": [<list of beat id strings from the active act that were accomplished or resolved>],\n'
-    '  "pressures": [\n'
-    '    {"id": "<pressure_id>", "effect": "advanced|delayed|countered|cancelled|none"}\n'
-    '  ],\n'
-    '  "act_complete": <bool: true if the active act goal is fully achieved or ready for transition>,\n'
-    '  "central_question_resolved": <bool: whether play resolved the campaign central question>,\n'
-    '  "on_arc": <bool: true if this exchange advanced the hidden arc plot, false if off-arc>,\n'
-    '  "matched_beats": [<list of beat ids from the active act that this exchange addressed>],\n'
-    '  "objective": "<string: the player-facing goal right now, at most 160 chars>",\n'
-    '  "open_question": "<string: the decision currently facing the player, at most 160 chars>",\n'
-    '  "progress": <bool: true if a beat was completed, the objective changed, or the open question was resolved>\n'
-    "}"
+    '  "elapsed_minutes": integer 1-120,\n'
+    '  "beats_done": array of active-act beat id strings accomplished or resolved,\n'
+    '  "pressures": array of {"id": active pressure id, "effect": "advanced|delayed|countered|cancelled|none"},\n'
+    '  "act_complete": boolean,\n'
+    '  "central_question_resolved": boolean,\n'
+    '  "on_arc": boolean,\n'
+    '  "matched_beats": array of active-act beat ids addressed by this exchange,\n'
+    '  "objective": string, maximum 160 characters,\n'
+    '  "open_question": string, maximum 160 characters,\n'
+    '  "progress": boolean\n'
+    "}\n"
+    "LIMITS: Do not include unknown ids. elapsed_minutes must be 1-120. objective/open_question must be concise, "
+    "player-facing text and no more than 160 characters each. progress is true only if a beat completed, the "
+    "objective changed, or the open question was resolved."
 )
 
 
@@ -886,7 +940,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
     prompt = "\n".join(blocks)
 
     messages = [
-        {"role": "system", "content": "You are the continuity recorder for a text RPG. Output only JSON."},
+        {"role": "system", "content": RECORD_SYSTEM},
         {"role": "user", "content": prompt},
     ]
 
@@ -1031,6 +1085,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
         ]
         if not outcomes:
             outcomes = ["The act is ongoing; no detailed record available."]
+        drift_count = int(rt.get("off_arc_turns", 0))
         new_arc = plan_replan_arc(arc, outcomes, history, chat_fn)
         if new_arc is not None:
             arc = new_arc
@@ -1043,10 +1098,11 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
                 act=act_n,
                 kind="replan",
                 diff={"off_arc_turns": 0},
-                reason=f"Replan after {rt.get('off_arc_turns')} consecutive off-arc turns",
+                reason=f"Replan after {drift_count} consecutive off-arc turns",
             )
         else:
             rt["off_arc_turns"] = 0
+            save_arc(root, arc)
             logger.warning("Replan failed; keeping previous arc (I6)")
             append_arc_log(
                 root,
@@ -1055,7 +1111,7 @@ def run_record_pass(root, player_action, dm_reply, msg_idx, chat_fn, played_move
                 act=act_n,
                 kind="replan_failed",
                 diff={"off_arc_turns": 0},
-                reason=f"Replan failed after {rt.get('off_arc_turns')} consecutive off-arc turns",
+                reason=f"Replan failed after {drift_count} consecutive off-arc turns",
             )
 
     # If act complete, trigger act transition
@@ -1119,6 +1175,7 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
 
     next_n = act_n + 1
     next_act = next((a for a in arc.get("acts", []) if a.get("n") == next_n), None)
+    next_act_fallback = False
     if next_act:
         arc["act"] = next_n
         next_act["status"] = "active"
@@ -1128,6 +1185,7 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
         if not next_act.get("beats"):
             beats = plan_next_act_beats(arc, next_n, outcomes, chat_fn)
             next_act["beats"] = beats
+            next_act_fallback = len(beats) == 1
     else:
         arc["terminal"] = bool(central_question_resolved)
         arc["central_question_resolved"] = central_question_resolved
@@ -1149,6 +1207,16 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
         diff={"resolved_act": act_n, "new_act": arc.get("act"), "forced": forced},
         reason=reason,
     )
+    if next_act_fallback:
+        append_arc_log(
+            root,
+            rev=arc["revision"],
+            at_msg=int(msg_idx) if msg_idx is not None else len(records),
+            act=next_n,
+            kind="next_act_fallback",
+            diff={"fallback_beats": 1},
+            reason="Next-act planner failed validation after one retry; inserted a single safe fallback beat",
+        )
 
 
 def fill_empty_pressures(root, arc, msg_idx=None):

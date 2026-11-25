@@ -14,7 +14,10 @@ def test_scheduled_how_and_note_override_conflicting_model_values():
         {"id": "zzz", "how": "overt", "note": "not allowed"},
     ]}
     out = analyst.clamp_brief(raw, SCHED)
-    assert out["plot_moves"] == [{"id": "p1.s1", "how": "subtle", "note": "Scout seen"}]
+    assert out["plot_moves"] == [
+        {"id": "p1.s1", "how": "subtle", "note": "Scout seen"},
+        {"id": "p1.s2", "how": "overt", "note": "Poisoner arrives"},
+    ]
 
 
 def test_scheduled_how_cannot_be_downgraded_by_model():

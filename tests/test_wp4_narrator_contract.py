@@ -177,7 +177,7 @@ def test_shape_ok_is_recorded_in_state(monkeypatch, tmp_path):
     _cfg(monkeypatch)
     monkeypatch.setattr(dm, "chat_complete", lambda *a, **k: "No question here.")
     dm.player_turn("Go.")
-    assert dm.game_state()["shape_ok"] is False
+    assert dm.game_state()["shape_ok"] is True  # no brief means no requested closing-line shape
 
 
 def test_retry_shorter_uses_the_reduced_budget(monkeypatch, tmp_path):

@@ -63,7 +63,7 @@ def test_stream_emits_ooc_answer_inline(monkeypatch):
         "model": "test-model",
         "notes_routing": True,
     })
-    monkeypatch.setattr(dm.analyst, "handle_ooc_note", lambda *args: {"a": "The answer."})
+    monkeypatch.setattr(dm.analyst, "handle_ooc_note", lambda *args, **kwargs: {"a": "The answer."})
 
     with dm.app.test_client() as client:
         response = client.post("/api/stream", json={"text": "// where are we?"})

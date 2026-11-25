@@ -11,6 +11,8 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
 - **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
 - **Beat Hooks & Mandatory Moves (WP2)**: Each beat carries a spoiler-safe `hook` — a lead the player can perceive — which `allowed_moves()` pushes once the act stalls. Every due move is mandatory: the analyst plays it or lists it in `deferred`, and `clamp_brief` forces in anything it drops. A hook escalates subtle → overt → offer while it goes unanswered.
+- **Arc Drift & Act Pacing (WP6)**: The record pass tracks on-arc progress, replans after `drift_turns` consecutive off-arc turns, retains superseded beats for history, and can force an act transition after `act_max_turns`.
+- **Canon Naming & Merge (WP7)**: Ledger entries keep up to six alternate names; lookups resolve aliases, duplicate entries can be merged, and continuity audits report alias collisions.
 - **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Contains no arc data.
 - **Narrator Contract (WP4)**: Every reply has three parts — the consequence, at most one new fact, and a closing line stating the live decision. The brief's fields are defined for the narrator in the prompt, so `end`, `push`, `clarify` and `intent=ask` work with style enforcement off. `brief.narration.words` is the single word target.
 - **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
@@ -91,6 +93,8 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `ledger_enabled` | bool | `true` | global | Context | Enable keyed canon ledger |
 | `difficulty` | select | `standard` | campaign | Gameplay | Pacing: `story`, `standard`, `hard` |
 | `arc_enabled` | bool | `false` | campaign | Gameplay | Enable hidden narrative arc manager |
+| `drift_turns` | int | `4` | campaign | Arc | Consecutive off-arc turns before a replan is triggered |
+| `act_max_turns` | int | `0` | campaign | Arc | Max turns in an act before forced transition (0 = off) |
 | `steering_enabled` | bool | `false` | campaign | Gameplay | Track the player-facing objective and open question |
 | `style_enabled` | bool | `false` | campaign | Style | Enable style enforcement |
 | `style_preset` | select | `none` | campaign | Style | Preset: `none`, `subtle`, `pulp`, `noir`, `terse` |
@@ -189,7 +193,7 @@ Tests run using pytest and use temporary isolated directories via `DM_CAMPAIGNS_
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest tests/
-ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py storage.py style_guard.py
+ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py steering.py storage.py style_guard.py
 mypy --strict campaign.py storage.py style_guard.py
 ```
 
@@ -203,6 +207,9 @@ Test coverage:
 - `tests/test_wp2_beat_moves.py`: Beat hooks, mandatory moves, escalation, and the fallback that plays.
 - `tests/test_wp3_analyst_inputs.py`: Analyst inputs, ledger-backed keep_true, retry, built fallback.
 - `tests/test_wp4_narrator_contract.py`: Reply shape, field meanings, word target, post-check.
+- `tests/test_wp5_prompt_contracts.py`: Analyst, record, planner, ledger and narrator prompt contracts.
+- `tests/test_wp6_wp7_acceptance.py`: Arc validation/retry/logging and ledger alias merge/lookup acceptance.
+- `docs/playtest.md`: Manual steering and drift/replan playtest procedure.
 
 ---
 
