@@ -1151,7 +1151,7 @@ def transition_act(root, act_n, chat_fn, msg_idx=None, history=None,
     )
 
 
-def fill_empty_pressures(root, arc):
+def fill_empty_pressures(root, arc, msg_idx=None):
     """WP6 F5: When a pressure has no pending steps and its deadline is more than
     EMPTY_PRESSURE_MINUTES_AWAY minutes away, append up to EMPTY_PRESSURE_MAX_STEPS
     future steps. Logged as a revision.
@@ -1190,7 +1190,7 @@ def fill_empty_pressures(root, arc):
         append_arc_log(
             root,
             rev=arc["revision"],
-            at_msg=arc.get("clock", {}).get("minutes", 0),
+            at_msg=int(msg_idx) if msg_idx is not None else arc.get("clock", {}).get("minutes", 0),
             act=arc.get("act", 1),
             kind="pressure_revision",
             diff={"filled_empty_pressures": True},

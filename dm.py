@@ -72,7 +72,7 @@ if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
 def bind_campaign(campaigns_dir=None, name=None):
-    """Set the active campaign and refresh compatibility aliases used by commands/tests."""
+    """Set the active campaign and refresh compatibility aliases used by tests."""
     global CAMPAIGN_CONTEXT, CAMPAIGN, CAMPAIGNS_DIR, ROOT
     global HISTORY, UNDONE, PREMISE, SUMMARY, LEDGER, AUDIT, STATE
     global TURN_LOCK, MAINT_LOCK, STATE_LOCK, JOB_LOCK
@@ -645,12 +645,14 @@ def compute_shape_ok(text, end):
 
     A `question` end needs a question mark; `decision` and `beat` need a non-empty
     closing line. With no requested end (no brief this turn) there is nothing to
-    check, so the answer is False rather than a guess.
+    check, so the answer is True (nothing to violate).
     """
     body = (text or "").strip()
     want = str(end or "").strip().lower()
-    if not body or not want:
+    if not body:
         return False
+    if not want:
+        return True
     parts = re.split(r"(?<=[.!?])\s+", body)
     closing = next((p.strip() for p in reversed(parts) if p.strip()), "")
     if not closing:
@@ -795,7 +797,7 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
     try:
-        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT))
+        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT), msg_idx)
     except Exception as e:
         logger.warning("Could not fill empty pressures: %s", e)
     try:
@@ -1219,7 +1221,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</think>" if self.hidden else "<think>"
+            tag = "</think>" if self.hidden else "         "
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:
