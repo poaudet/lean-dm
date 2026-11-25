@@ -74,8 +74,9 @@ def test_played_overt_move_is_consumed_and_starts_cooldown(monkeypatch, tmp_path
     _init(root)
     arc.save_arc(root, copy.deepcopy(ARC))
     _cfg(monkeypatch)
-    monkeypatch.setattr(dm, "chat_complete",
-                        _fake(_brief(moves=[{"id": "p1.s1", "how": "overt", "note": "n"}]), []))
+    brief = _brief(moves=[{"id": "p1.s1", "how": "overt", "note": "n"}])
+    brief["deferred"] = [{"id": "p1.s2", "reason": "keep the next pressure for the next scene"}]
+    monkeypatch.setattr(dm, "chat_complete", _fake(brief, []))
 
     dm.player_turn("I search the alley.")
 

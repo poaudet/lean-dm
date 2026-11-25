@@ -50,7 +50,11 @@ def test_terminal_arc_schedules_nothing():
 
 
 def test_plan_initial_arc_normalizes(monkeypatch):
-    raw = json.dumps(_arc(acts=[{"n": "1", "goal": "g"}, "bad"]))
+    raw = json.dumps(_arc(acts=[{"n": "1", "goal": "g", "status": "active", "beats": [
+        {"id": "a1b1", "text": "one", "hook": "lead one", "status": "pending"},
+        {"id": "a1b2", "text": "two", "hook": "lead two", "status": "pending"},
+        {"id": "a1b3", "text": "three", "hook": "lead three", "status": "pending"},
+    ]}, "bad"]))
     out = arc.plan_initial_arc("p", "", "", [], lambda *a, **k: raw)
     assert out["acts"][0]["n"] == 1
     assert out["pressures"][0]["steps"][0]["at_minutes"] == 60

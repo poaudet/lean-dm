@@ -16,7 +16,11 @@ def _init(root):
 
 PLAN = json.dumps({
     "version": 1, "central_question": "Q?",
-    "acts": [{"n": 1, "status": "active", "goal": "g", "beats": [], "outcomes": []}],
+    "acts": [{"n": 1, "status": "active", "goal": "g", "beats": [
+        {"id": "a1b1", "text": "Private beat 1", "hook": "A visible lead 1", "status": "pending"},
+        {"id": "a1b2", "text": "Private beat 2", "hook": "A visible lead 2", "status": "pending"},
+        {"id": "a1b3", "text": "Private beat 3", "hook": "A visible lead 3", "status": "pending"},
+    ], "outcomes": []}],
     "pressures": [],
 })
 
@@ -35,7 +39,7 @@ def _cfg(monkeypatch):
 def _fake(planner_calls):
     def fake(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
         sys_msg = messages[0]["content"]
-        if "master story planner" in sys_msg:
+        if "hidden story-arc planner" in sys_msg:
             planner_calls.append(1)
             return PLAN
         if "continuity recorder" in sys_msg:

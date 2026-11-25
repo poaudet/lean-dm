@@ -156,8 +156,8 @@ def test_two_stored_defers_force_the_move_into_plot_moves(monkeypatch, tmp_path)
 
     dm.player_turn("I search the alley.")
 
-    # 4 stored messages + the new exchange = 6, so the brief is keyed at 6.
-    saved = analyst.load_brief_for_msg(root, 6)
+    # Four stored messages precede the new player message at index 4.
+    saved = analyst.load_brief_for_msg(root, 4)
     assert saved is not None, sorted(analyst.load_briefs(root))
     assert [m["id"] for m in saved["plot_moves"]] == ["beat.a1b1"]
     assert saved["deferred"] == []
@@ -191,8 +191,8 @@ def test_a_first_defer_is_still_honoured(monkeypatch, tmp_path):
 
     dm.player_turn("I search the alley.")
 
-    # 2 stored messages + the new exchange = 4.
-    saved = analyst.load_brief_for_msg(root, 4)
+    # Two stored messages precede the new player message at index 2.
+    saved = analyst.load_brief_for_msg(root, 2)
     assert saved is not None, sorted(analyst.load_briefs(root))
     assert saved["plot_moves"] == []
     assert [d["id"] for d in saved["deferred"]] == ["beat.a1b1"]

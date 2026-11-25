@@ -17,7 +17,8 @@ import time
 import uuid
 
 from config import cfg
-from ledger import KINDS as LEDGER_KINDS, resolve_ledger_ref
+from ledger import KINDS as LEDGER_KINDS
+from ledger import resolve_ledger_ref
 from storage import append_jsonl, parse_json_response, replace_lines
 
 BRIEF_SCHEMA = {
@@ -458,30 +459,32 @@ def update_note_canon(root, note_id, is_canon=True):
 # ---------------------------------------------------------------------------
 
 ANALYST_SYSTEM = (
-    "You are the narrative director and analyst of a text RPG.\n"
-    "Evaluate the player's action and return ONLY a JSON brief with this structure:\n"
+    "ROLE: You are the narrative director for a text RPG.\n"
+    "INPUTS (authority order): CANON LEDGER is authoritative; [pinned] entries must never be contradicted. "
+    "PREMISE is fixed setup. STORY SO FAR is subordinate to the ledger. RECENT PLAY is subordinate to both. "
+    "The previous brief is context, not canon. ALLOWED PLOT MOVES are the scheduler's complete due list; "
+    "PENDING HOOKS are player-perceivable leads. CURRENT STEERING is player-facing direction.\n"
+    "TASK: Classify the player's action, assess its outcome, preserve canon, and choose how the scene advances.\n"
+    "OUTPUT: Return only this JSON object, with these fields and types:\n"
     "{\n"
-    '  "intent": "act|ask|steer|wait",\n'
-    '  "assessment": "one sentence: what the player attempts and how it lands in this scene",\n'
+    '  "intent": "act|ask|steer|wait", "assessment": "one sentence",\n'
     '  "outcome": "clean|partial|complication|setback",\n'
-    '  "plot_moves": [{"id": "move_id", "how": "overt|subtle|offscreen|offer", "note": "what player perceives"}],\n'
-    '  "deferred": [{"id": "move_id", "reason": "why it waits"}],\n'
-    '  "keep_true": [{"id": "ledger_id", "why": "what must stay true"}],\n'
+    '  "plot_moves": [{"id": "allowed move id", "how": "scheduler value", "note": "perceived effect"}],\n'
+    '  "deferred": [{"id": "allowed move id", "reason": "why it waits"}],\n'
+    '  "keep_true": [{"id": "ledger id or alias", "why": "what must stay true"}],\n'
     '  "narration": {"words": 140, "push": 0.7, "end": "decision|question|beat"},\n'
-    '  "clarify": null,\n'
-    '  "act_complete": false\n'
+    '  "clarify": null, "act_complete": false\n'
     "}\n"
-    "Rules:\n"
-    "- If intent is 'ask': direct answer <= 80 words, no plot move, no time passage.\n"
-    "- If intent is 'steer': honor within difficulty.\n"
-    "- If intent is 'act': resolve per assessment/outcome.\n"
-    "- 'clarify' only if intent is genuinely ambiguous (rarely).\n"
-    "- Choose plot_moves ONLY from the allowed_moves provided. If none are allowed, return [].\n"
-    "- Every allowed move is MANDATORY: play it, or list it in 'deferred' with a reason.\n"
-    "- A move deferred twice in a row is played whether you defer it again or not.\n"
-    "- 'how' is set by the scheduler; never change it. 'offer' means a clear in-world opening.\n"
-    "- 'keep_true' takes ledger ids only. An id not in the ledger is dropped.\n"
-    "- Authority on conflict: ledger beats summary beats recent play.\n"
+    "RULES:\n"
+    "1. Use intent=ask only for an OOC-style information request; answer directly, no plot moves or time passage.\n"
+    "2. Use steer to honor a declared direction within difficulty; use act for attempted action.\n"
+    "3. Choose plot_moves only from ALLOWED PLOT MOVES. Every due move is mandatory: play it or defer it with a reason.\n"
+    "4. A move deferred twice consecutively must be played now. Keep the scheduler's how value unchanged; offer is a clear opening.\n"
+    "5. keep_true contains ledger ids (aliases resolve to ids), never names or invented ids. Unknown ids are discarded.\n"
+    "6. clarify is null unless the action is genuinely ambiguous; then ask one short question and advance nothing.\n"
+    "7. Escalation is scheduler-owned: do not invent or lower a move's subtle, overt, offscreen or offer level.\n"
+    "WHEN UNSURE: Preserve pinned canon, choose the least disruptive outcome, and play every due move not explicitly deferred.\n"
+    "EXAMPLES: Good: defer a due move with {id, reason}, or play it with its scheduled how. Bad: omit a due move or invent a move id."
 )
 
 
@@ -585,19 +588,18 @@ def run_analyst(root, history, player_action, allowed_moves, style_guard_list, c
         prev_json = ""
 
     user_prompt = (
-        f"DIFFICULTY: {cfg.difficulty}\n"
-        f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
-        f"ALLOWED PLOT MOVES: {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
-        f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n"
-        + (f"PREMISE:\n{premise_txt}\n" if premise_txt else "")
+        (f"CANON LEDGER (authoritative; [pinned] entries are immutable):\n{canon_txt}\n" if canon_txt else "")
+        + (f"PREMISE (fixed setup):\n{premise_txt}\n" if premise_txt else "")
+        + (f"STORY SO FAR (subordinate to ledger):\n{summary_txt}\n" if summary_txt else "")
+        + (f"RECENT PLAY (subordinate to ledger and summary):\n{play_str}\n" if play_str else "")
         + (f"CURRENT ACT GOAL: {act_goal}\n" if act_goal else "")
-        + (f"STORY SO FAR:\n{summary_txt}\n" if summary_txt else "")
-        + (f"PENDING HOOKS: {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
-        + (f"PREVIOUS BRIEF: {prev_json}\n" if prev_json else "")
-        + (f"CANON LEDGER:\n{canon_txt}\n" if canon_txt else "")
         + (f"CURRENT STEERING (player-facing):\n{steering_text}\n" if steering_text else "")
-        + "\n"
-        f"RECENT PLAY:\n{play_str}\n\n"
+        + (f"PREVIOUS BRIEF (context only): {prev_json}\n" if prev_json else "")
+        + (f"PENDING HOOKS (player-perceivable): {json.dumps(hooks, ensure_ascii=False)}\n" if hooks else "")
+        + f"ALLOWED PLOT MOVES (mandatory unless deferred): {json.dumps(allowed_moves or [], ensure_ascii=False)}\n"
+        + f"DIFFICULTY: {cfg.difficulty}\n"
+        + f"STYLE KNOBS: preset={cfg.style_preset}, words={cfg.style_words_min}-{cfg.style_words_max}, push={cfg.style_push}\n"
+        + f"STYLE GUARD (avoid): {json.dumps(style_guard_list or [], ensure_ascii=False)}\n\n"
         f"PLAYER ACTION:\n{player_action}\n\n"
         "Output ONLY the JSON brief."
     )

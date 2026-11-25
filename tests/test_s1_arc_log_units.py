@@ -58,9 +58,11 @@ def test_act_boundary_logged_by_msg_idx_and_removed_by_undo(monkeypatch, tmp_pat
         dm.player_turn(f"Action {i}.")
 
     entries = [json.loads(l) for l in arc.arc_log_path(root).read_text(encoding="utf-8").splitlines() if l.strip()]
-    assert len(entries) == 1
+    assert len(entries) == 2
+    boundary = next(entry for entry in entries if entry["kind"] == "act_boundary")
+    fallback = next(entry for entry in entries if entry["kind"] == "next_act_fallback")
     # 3rd exchange = history indices 4 (player) and 5 (DM); the old code logged len(records) == 3
-    assert entries[0]["at_msg"] == 5
+    assert boundary["at_msg"] == 5 and fallback["at_msg"] == 5
 
     dm.undo_turn()
 

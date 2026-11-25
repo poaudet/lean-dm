@@ -292,3 +292,54 @@ Decision: Two small corrections to the WP1–WP5 behaviour, recorded together be
 **Only pressure moves set `last_overt_turn`.** `apply_played_moves` used to set the overt cooldown whenever any played move had `how == "overt"`, including beat hooks. That contradicts D-23: hook escalation is derived from `stalled_turns` and deliberately overrides the cooldown, so a beat move must not start a cooldown that suppresses pressure moves. The check now ignores ids carrying the `beat.` prefix. Pressure steps and `<pid>.deadline` moves still set it.
 
 Alternatives considered: Keep the steering key and have the narrator read it (two sources for the same text, and a schema that differs between normal and fallback briefs); drop `steering_text` from the signature (touches every call site in `dm.py` for no behavioural gain); suppress the cooldown for beat moves by clearing `last_overt_turn` instead of not setting it (would erase a cooldown a pressure move legitimately started).
+
+
+## D-29  Retry-shorter visibility with no requested shape
+
+Supersedes D-26 where it described the retry-shorter UI and the no-brief shape check.
+
+Decision: The shipped UI offers retry-shorter when `overlong` is true or `shape_ok` is false. `compute_shape_ok()` returns true when the reply is non-empty and there is no requested `end`: without an analyst brief there is no shape contract to violate. When `end=question`, the closing line must end in `?`; `decision` and `beat` require a non-empty reply/closing line. The overlong check remains independent and uses the brief word target multiplied by `overlong_ratio` (default 1.5). Retry-shorter uses `SHORTER_RATIO` (0.7).
+
+Alternatives considered: Treat a missing `end` as a failed shape (shows a retry control on every normal turn when the analyst is off); disable the overlong check when no shape is requested (unrelated checks should remain independent).
+
+---
+
+## D-30  Arc drift reset and retained replans
+
+Decision: `runtime.off_arc_turns` counts consecutive off-arc turns and resets to zero on an on-arc turn. When the configured `drift_turns` threshold is reached, the record pass attempts one replan. The counter is reset before the updated arc is saved, whether planning succeeds or fails; a failed planner therefore retries only after another full threshold window. Successful replans append new beats and mark old pending beats `superseded`; no beat is deleted. New beat ids include act and revision and remain unique across all acts, including superseded beats. The initial planner is retried once on invalid output before failing without writing an invalid arc; a failed replan restores the prior beat statuses and logs `replan_failed`; next-act planning retries once and then supplies a single fallback beat. `act_max_turns=0` disables the forced act cap; otherwise the cap triggers a transition at the configured turn.
+
+Alternatives considered: Reset only after a successful plan (retries every subsequent turn after failure); delete replaced beats (loses auditability and can collide with historical record ids); rewrite an existing beat id (breaks record references).
+
+---
+
+## D-31  Ledger aliases and merge semantics
+
+Decision: A ledger entry may keep at most six aliases. References resolve against id, canonical name and aliases. When merging `from` into `into`, the target receives the source aliases and the source's former name as an alias, subject to the cap and excluding the target's own name. Pinned entries on either side are not changed. The audit reports likely duplicate entities and name/alias collisions with suggested merge ids.
+
+Alternatives considered: Keep only the source aliases (the merged-away canonical name is then recreated on the next scribe pass); automatically merge from an audit suggestion (audit remains advisory and cannot mutate canon).
+
+---
+
+## D-32  Structured auxiliary prompt contracts
+
+Decision: Analyst, record and planner prompts use explicit ROLE, INPUTS, TASK, OUTPUT, RULES, WHEN UNSURE and EXAMPLES sections. The analyst sees canon in authority order (ledger, premise, summary, recent play), with pinned entries marked; `keep_true` references ledger ids and aliases. The record schema bounds elapsed time to 1-120 minutes, steering strings to 160 characters, and restricts matched beats to supplied active-act ids. Planner prompts require unique arc-wide ids, 3-5 beats when an act is planned, empty beats for future acts, and spoiler-safe hooks of at most 200 characters. The ledger prompt instructs alias creation, duplicate merge reporting, six-alias cap and pinned-entry protection. The audit includes alias collisions.
+
+Alternatives considered: Rely on model-inferred field semantics (ambiguous output); repeat field definitions across multiple prompts (drift); expose private beat text in hooks (violates I8).
+
+---
+
+## Reconciliation — Steering Requirements v2
+
+| Requirement | Status | Implementation |
+|---|---|---|
+| A1–A6 (arc validation, drift reset, retained replan, no-brief shape, log units, planner fallback/clamps) | Covered | `arc.py`, `dm.py`, `decisions.md` |
+| B1–B4 (merge aliases, alias lookup, ledger prompt, audit collisions) | Covered | `ledger.py`, `analyst.py`, `dm.py` |
+| C1–C4 (analyst inputs, pin markers, ledger-id keep_true, bounded retry) | Covered | `analyst.py` |
+| D1–D6 (OOC routing and note lifecycle) | Covered | `analyst.py`, `dm.py`, `narrator_context.py` |
+| E1–E6 (narrator shape, field meanings, single word target, shorter retry) | Covered | `config.py`, `narrator_context.py`, `dm.py`, `web/` |
+| F1–F5 (beat lifecycle, drift/replan, act cap, validation, spoiler-safe hooks) | Covered | `arc.py` |
+| G1–G3 (aliases, merge behavior, audit collisions) | Covered | `ledger.py`, `dm.py` |
+| Prompt rewrites (analyst, record, ledger, planner) | Covered | `analyst.py`, `arc.py`, `dm.py` |
+| Docs, CI and playtest procedure | Covered | `README.md`, `.github/workflows/ci.yml`, `docs/playtest.md` |
+
+---

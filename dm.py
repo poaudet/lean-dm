@@ -414,26 +414,26 @@ def parse_json_obj(raw):
     return value
 
 LEDGER_PROMPT = (
-    "Update the canon ledger from the new play. Return ONLY JSON: "
-    '{"upsert": [entry...], "close": [ids], "delete": [ids], "merge": [{"from": id, "into": id}...]}.\n'
-    'entry = {"id": stable-lowercase-slug, "kind": "player|person|place|item|promise|clock|rule|thread", '
-    '"name": "...", "state": "one line: the CURRENT truth", "aliases": ["optional alternate names"], '
-    '"src": "player|dm|note", "msg": index of the message where it last changed}\n'
-    "Rules:\n"
-    "- One entry per entity/thing. Reuse the existing id to update it; never create a second entry for the same thing.\n"
-    "- Durable canon only: who/where/what-state, exact counts, days, deadlines, ownership, promises, debts, injuries, "
-    "decisions the player declared. Skip moment-to-moment action and atmosphere.\n"
-    "- Be specific: keep numbers, names, locations. Characters who matter must keep an entry with their last known "
-    "location and open business, even if they have been offscreen for a long time.\n"
-    "- Player messages starting with 'note to dm', 'ooc' or in parentheses are out-of-character corrections: apply "
-    "them and set src to 'note'.\n"
-    "- If the DM contradicts an established value without the story changing it, keep the established value and add "
-    "'(DM said X at [n])' to the state.\n"
-    "- If the play uses a different name for an existing entry, add it to that entry's 'aliases' instead of creating "
-    "a new entry (max 6 aliases per entry).\n"
-    "- Report duplicate entries already in the ledger with 'merge': [{'from': id, 'into': id}] so they can be merged.\n"
-    "- Never alter pinned entries.\n"
-    "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
+    "ROLE: You are the canon ledger scribe for a text RPG.\n"
+    "INPUTS: The existing ledger is the current canon; new play may update it only when the story establishes a change.\n"
+    "TASK: Extract durable facts and update one canonical entry per entity or thing.\n"
+    'OUTPUT: Return only JSON: {"upsert": [entry], "close": [id], "delete": [id], '
+    '"merge": [{"from": "id", "into": "id"}]}. Each entry has id (stable lowercase slug), kind '
+    "(player|person|place|item|promise|clock|rule|thread), name, state (one line of current truth), aliases "
+    "(string array), src (player|dm|note), and msg (last changed message index).\n"
+    "RULES:\n"
+    "1. Reuse the existing id for an existing entity; never create a duplicate. If play uses another name, add it to "
+    "aliases, with at most six aliases per entry.\n"
+    "2. Report duplicates already present with merge [{from, into}]. Never alter pinned entries.\n"
+    "3. Keep durable canon: identities, locations, state, counts, deadlines, ownership, promises, debts, injuries and "
+    "player-declared decisions. Skip momentary action and atmosphere.\n"
+    "4. Preserve established values when the DM contradicts them without an in-story change; note the contradiction "
+    "in state with its message index. OOC corrections from 'note to dm', 'ooc' or parentheses use src=note.\n"
+    "5. close means resolved/dead/finished/obsolete but retained as history. delete only an erroneous entry.\n"
+    "WHEN UNSURE: Preserve the existing entry and do not invent a fact or duplicate.\n"
+    "EXAMPLES: Good: add 'the smith' as an alias of the existing person id. Bad: create a second person entry for "
+    "the same character or merge a pinned entry."
+)
 
 def ledger_pass(upto=None):
     """Advance the ledger over history[ledgered:upto]. Caller holds MAINT_LOCK."""
@@ -756,33 +756,6 @@ def _record_kwargs(brief):
         "analyst_act_complete": bool(brief.get("act_complete", False)),
     }
 
-
-def compute_defer_counts(root):
-    from analyst import load_briefs
-    briefs = load_briefs(root)
-    ordered = sorted(briefs.items(), key=lambda kv: kv[0])
-    counts = {}
-    for msg_idx in reversed([mi for mi, _ in ordered]):
-        entry = briefs[msg_idx]
-        if entry.get("source") not in ("analyst", "fallback"):
-            continue
-        brief = entry.get("brief", {})
-        deferred = brief.get("deferred", [])
-        deferred_ids = set()
-        for item in deferred:
-            if isinstance(item, dict):
-                mid = str(item.get("id", "")).strip()
-            elif isinstance(item, str):
-                mid = item.strip()
-            else:
-                continue
-            if mid:
-                deferred_ids.add(mid)
-        new_counts = {}
-        for mid in deferred_ids:
-            new_counts[mid] = counts.get(mid, 0) + 1
-        counts = new_counts
-    return counts
 
 def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     """Auto-plan a missing arc, then run the record pass for a committed turn."""
@@ -1228,15 +1201,16 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</thinking>" if self.hidden else "<thinking>"
-            i = self.buf.find(tag)
-            if i >= 0:
+            tags = ("</thinking>", "</think>") if self.hidden else ("<thinking>", "<think>")
+            matches = [(self.buf.find(tag), tag) for tag in tags if self.buf.find(tag) >= 0]
+            if matches:
+                i, tag = min(matches, key=lambda item: item[0])
                 if not self.hidden:
                     out += self.buf[:i]
                 self.buf, self.hidden = self.buf[i + len(tag):], not self.hidden
                 continue
-            keep = next((n for n in range(min(len(tag) - 1, len(self.buf)), 0, -1)
-                         if tag.startswith(self.buf[-n:])), 0)
+            keep = max((n for tag in tags for n in range(min(len(tag) - 1, len(self.buf)), 0, -1)
+                        if tag.startswith(self.buf[-n:])), default=0)
             if not self.hidden:
                 out += self.buf[:len(self.buf) - keep]
             self.buf = self.buf[len(self.buf) - keep:]

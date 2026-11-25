@@ -68,11 +68,9 @@ def brief_fields(brief):
         f"- end={end}: {end_meanings.get(end, end_meanings['decision'])}.",
         f"- push={round(push, 2)}: at most {round((1 - push) * 100)} percent of sentences "
         "may be pure atmosphere.",
+        (f"- clarify: ask this one short in-character question and advance nothing: \"{clarify}\""
+         if clarify else "- clarify=null: no clarification is needed."),
     ]
-    if clarify:
-        lines.append(
-            f"- clarify: ask this one short in-character question and advance nothing: "
-            f"\"{clarify}\"")
     if intent == "ask":
         lines.append(
             "- intent=ask: answer directly in at most 80 words. Add no new events.")
