@@ -523,7 +523,8 @@ def _audit():
          "2. LEDGER ERRORS — entries that are wrong or stale versus the play, with corrected text.\n"
          "3. DROPPED THREADS — characters, promises, clocks, objects introduced but not seen again (last index seen).\n"
          "4. NARRATOR HABITS — repeated phrases, imagery, structures; the DM acting or deciding for the player.\n"
-         "5. TOP 10 FIXES, ranked. Be specific; no filler."}],
+         "5. TOP 10 FIXES, ranked. Be specific; no filler.
+         "6. ALIAS COLLISIONS — entries that probably describe the same thing (same name, overlapping aliases, or one entry's name appearing as another's alias), with a suggested merge {\"from\": id, \"into\": id}; also flag any name or alias used by two different entries.""}],
         model=scribe_model(), track=False, **scribe_extra()))
     atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
                         f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
