@@ -17,7 +17,7 @@ import time
 import uuid
 
 from config import cfg
-from ledger import KINDS as LEDGER_KINDS
+from ledger import KINDS as LEDGER_KINDS, resolve_ledger_ref
 from storage import append_jsonl, parse_json_response, replace_lines
 
 BRIEF_SCHEMA = {
@@ -81,23 +81,10 @@ def _norm_how(value):
 
 
 def _ledger_entry(ledger, ref):
-    """Resolve an analyst keep_true reference to a ledger entry, by id or name."""
+    """Resolve an analyst keep_true reference to a ledger entry, by id, name, or alias."""
     if not isinstance(ledger, list):
         return None
-    key = str(ref or "").strip().lower()
-    if not key:
-        return None
-    for e in ledger:
-        if not isinstance(e, dict):
-            continue
-        if str(e.get("id", "")).strip().lower() == key:
-            return e
-    for e in ledger:
-        if not isinstance(e, dict):
-            continue
-        if str(e.get("name", "")).strip().lower() == key:
-            return e
-    return None
+    return resolve_ledger_ref(ledger, ref)
 
 
 def _keep_true_line(entry):
@@ -108,12 +95,16 @@ def _keep_true_line(entry):
 
 
 def _mentioned(entry, text):
-    """True when the entry's name or id appears in the text."""
+    """True when the entry's name, id, or any alias appears in the text."""
     if not text:
         return False
     low = str(text).lower()
     for field in ("name", "id"):
         token = str(entry.get(field) or "").strip().lower()
+        if token and token in low:
+            return True
+    for alias in entry.get("aliases", []):
+        token = str(alias or "").strip().lower()
         if token and token in low:
             return True
     return False

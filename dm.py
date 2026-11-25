@@ -72,7 +72,7 @@ if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
 def bind_campaign(campaigns_dir=None, name=None):
-    """Set the active campaign and refresh compatibility aliases used by commands/tests."""
+    """Set the active campaign and refresh compatibility aliases used by tests."""
     global CAMPAIGN_CONTEXT, CAMPAIGN, CAMPAIGNS_DIR, ROOT
     global HISTORY, UNDONE, PREMISE, SUMMARY, LEDGER, AUDIT, STATE
     global TURN_LOCK, MAINT_LOCK, STATE_LOCK, JOB_LOCK
@@ -415,10 +415,10 @@ def parse_json_obj(raw):
 
 LEDGER_PROMPT = (
     "Update the canon ledger from the new play. Return ONLY JSON: "
-    '{"upsert": [entry...], "close": [ids], "delete": [ids]}.\n'
+    '{"upsert": [entry...], "close": [ids], "delete": [ids], "merge": [{"from": id, "into": id}...]}.\n'
     'entry = {"id": stable-lowercase-slug, "kind": "player|person|place|item|promise|clock|rule|thread", '
-    '"name": "...", "state": "one line: the CURRENT truth", "src": "player|dm|note", '
-    '"msg": index of the message where it last changed}\n'
+    '"name": "...", "state": "one line: the CURRENT truth", "aliases": ["optional alternate names"], '
+    '"src": "player|dm|note", "msg": index of the message where it last changed}\n'
     "Rules:\n"
     "- One entry per entity/thing. Reuse the existing id to update it; never create a second entry for the same thing.\n"
     "- Durable canon only: who/where/what-state, exact counts, days, deadlines, ownership, promises, debts, injuries, "
@@ -429,6 +429,10 @@ LEDGER_PROMPT = (
     "them and set src to 'note'.\n"
     "- If the DM contradicts an established value without the story changing it, keep the established value and add "
     "'(DM said X at [n])' to the state.\n"
+    "- If the play uses a different name for an existing entry, add it to that entry's 'aliases' instead of creating "
+    "a new entry (max 6 aliases per entry).\n"
+    "- Report duplicate entries already in the ledger with 'merge': [{'from': id, 'into': id}] so they can be merged.\n"
+    "- Never alter pinned entries.\n"
     "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
 
 def ledger_pass(upto=None):
@@ -519,7 +523,10 @@ def _audit():
          "2. LEDGER ERRORS — entries that are wrong or stale versus the play, with corrected text.\n"
          "3. DROPPED THREADS — characters, promises, clocks, objects introduced but not seen again (last index seen).\n"
          "4. NARRATOR HABITS — repeated phrases, imagery, structures; the DM acting or deciding for the player.\n"
-         "5. TOP 10 FIXES, ranked. Be specific; no filler."}],
+         "5. TOP 10 FIXES, ranked. Be specific; no filler.\n"
+         "6. ALIAS COLLISIONS — entries that probably describe the same thing (same name, overlapping aliases, "
+         "or one entry's name appearing as another's alias), with a suggested merge {\"from\": id, \"into\": id}; "
+         "also flag any name or alias used by two different entries."}],
         model=scribe_model(), track=False, **scribe_extra()))
     atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
                         f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
@@ -645,12 +652,14 @@ def compute_shape_ok(text, end):
 
     A `question` end needs a question mark; `decision` and `beat` need a non-empty
     closing line. With no requested end (no brief this turn) there is nothing to
-    check, so the answer is False rather than a guess.
+    check, so the answer is True (nothing to violate).
     """
     body = (text or "").strip()
     want = str(end or "").strip().lower()
-    if not body or not want:
+    if not body:
         return False
+    if not want:
+        return True
     parts = re.split(r"(?<=[.!?])\s+", body)
     closing = next((p.strip() for p in reversed(parts) if p.strip()), "")
     if not closing:
@@ -795,7 +804,7 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
     try:
-        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT))
+        arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT), msg_idx)
     except Exception as e:
         logger.warning("Could not fill empty pressures: %s", e)
     try:
@@ -1219,7 +1228,7 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</think>" if self.hidden else "<think>"
+            tag = "</thinking>" if self.hidden else "<thinking>"
             i = self.buf.find(tag)
             if i >= 0:
                 if not self.hidden:

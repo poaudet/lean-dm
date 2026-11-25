@@ -105,6 +105,10 @@ def apply_ledger_ops(ledger, ops):
         src_aliases = [x.lower() for x in src.get("aliases", [])]
         if src_aliases:
             _merge_aliases(into, src_aliases)
+        # B1: the merged-away source name becomes an alias of the target
+        src_name = str(src.get("name") or "").strip().lower()
+        if src_name and src_name != str(into.get("name", "")).strip().lower():
+            _merge_aliases(into, [src_name])
         # Remove the source entry
         by.pop(src_id, None)
 
