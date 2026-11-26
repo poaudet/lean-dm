@@ -136,7 +136,7 @@ def test_export_transcript(tmp_path):
         assert "Welcome" in text
 
 
-def test_export_campaign_zip(tmp_path):
+def test_export_campaign_zip(tmp_path, monkeypatch):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
     (root / "premise.md").write_text("Premise", encoding="utf-8")
@@ -160,6 +160,12 @@ def test_export_campaign_zip(tmp_path):
             assert not {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl"} & set(names)
             assert "arc_snap/1.json" not in names
 
+        # D-37: include_arc is ignored unless debug mode is on.
+        ignored = client.get("/api/export/campaign.zip?include_arc=1")
+        with zipfile.ZipFile(io.BytesIO(ignored.data), "r") as zf:
+            assert "arc.json" not in zf.namelist()
+
+        monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
         debug = client.get("/api/export/campaign.zip?include_arc=1")
         assert debug.status_code == 200
         with zipfile.ZipFile(io.BytesIO(debug.data), "r") as zf:

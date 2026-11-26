@@ -199,11 +199,16 @@ def test_arc_debug_is_visible_but_not_written_into_narrative_files(monkeypatch, 
     for s in sentinels:
         assert s not in ledger_text
 
-    # The full arc is intentionally available through the explicit debug payload.
+    # D-37: the arc chip is always visible; the full arc only in debug mode.
     with dm.app.test_client() as client:
+        data = client.get("/api/state").get_json()
+        assert "Act 1" in data.get("arc_chip", "")
+        assert data.get("arc_debug") is None
+        for s in sentinels:
+            assert s not in json.dumps(data)
+        monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
         res = client.get("/api/state")
         data = res.get_json()
-        assert "Act 1" in data.get("arc_chip", "")
         debug_json = json.dumps(data.get("arc_debug"))
         for s in sentinels:
             assert s in debug_json

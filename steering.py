@@ -1,8 +1,9 @@
 """steering.py — player-facing steering state (objective, open question, live lead).
 
 Doctrine:
-- Steering remains a compact, separate summary; the complete arc is inspectable through
-  the explicit arc-debug state payload. No secrecy guarantee is built around arc data.
+- Steering remains a compact, separate summary; the complete arc is inspectable only
+  through the arc-debug state payload, which needs the arc_debug setting (D-37). Arc data
+  is not sensitive, but it is not one click away from the play UI either.
 - A2: the record pass is the single writer; it runs after the reply is committed.
 - A4: a failed update keeps the previous state, bumps the stall counter and marks the
   source as fallback. It never blocks the turn.

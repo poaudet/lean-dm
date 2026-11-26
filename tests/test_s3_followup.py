@@ -81,6 +81,7 @@ def test_campaign_zip_excludes_arc_files_unless_requested(monkeypatch):
     (dm.ROOT / "arc_snap").mkdir()
     (dm.ROOT / "arc_snap" / "1.json").write_text("{}", encoding="utf-8")
 
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
     with dm.app.test_client() as client:
         default_zip = zipfile.ZipFile(io.BytesIO(client.get("/api/export/campaign.zip").data))
         full_zip = zipfile.ZipFile(io.BytesIO(client.get("/api/export/campaign.zip?include_arc=1").data))

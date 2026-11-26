@@ -275,7 +275,7 @@ def test_arc_debug_is_exposed_only_when_arc_is_enabled(monkeypatch, tmp_path):
     _init(root)
     state = _arc_state()
     arc.save_arc(root, state)
-    _cfg(monkeypatch, arc_enabled=True)
+    _cfg(monkeypatch, arc_enabled=True, arc_debug=True)
     exposed = dm.game_state()["arc_debug"]
     assert exposed["central_question"] == "Will the gate open?"
     assert exposed["acts"][0]["beats"][0]["text"] == "private beat 1"
@@ -283,6 +283,23 @@ def test_arc_debug_is_exposed_only_when_arc_is_enabled(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_enabled": False})
     assert dm.game_state()["arc_debug"] is None
+
+
+def test_arc_debug_needs_debug_mode(monkeypatch, tmp_path):
+    root = tmp_path / "campaigns" / dm.CAMPAIGN
+    _init(root)
+    arc.save_arc(root, _arc_state())
+    _cfg(monkeypatch, arc_enabled=True)             # arc on, debug mode off (default)
+    state = dm.game_state()
+    assert state["arc_debug"] is None
+    assert state["arc_chip"]                        # the non-spoiler chip stays
+    assert "private beat 1" not in json.dumps(state)
+    assert "The Ash King" not in json.dumps(state)
+    _cfg(monkeypatch, arc_enabled=True, arc_debug=True)
+    assert dm.game_state()["arc_debug"]["pressures"][0]["antagonist"] == "The Ash King"
+    assert dm.cfg.arc_debug is True
+    _cfg(monkeypatch, arc_enabled=False, arc_debug=True)
+    assert dm.game_state()["arc_debug"] is None     # debug mode never exposes a disabled arc
 
 
 def test_ooc_prompt_has_examples_section():
