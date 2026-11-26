@@ -104,4 +104,5 @@ def test_stalled_turns_count_and_reset(tmp_path):
     assert arc.load_arc(tmp_path)["runtime"]["stalled_turns"] == 3
     arc.run_record_pass(tmp_path, "x", "y", 7, lambda m, **k: _rec(),
                         played_moves=[{"id": "rescue_opening", "how": "subtle"}])
-    assert arc.load_arc(tmp_path)["runtime"]["stalled_turns"] == 0
+    # A played rescue opening does not complete a beat; only beats_done resets the stall count.
+    assert arc.load_arc(tmp_path)["runtime"]["stalled_turns"] == 4

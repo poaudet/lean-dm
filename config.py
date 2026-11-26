@@ -18,15 +18,41 @@ logger = logging.getLogger(__name__)
 BASE = pathlib.Path(__file__).parent
 SETTINGS_PATH = pathlib.Path(os.environ.get("DM_SETTINGS") or BASE / "campaigns" / "settings.json")
 
-DEFAULT_SYSTEM = """You are the Dungeon Master of a text RPG.
-Rules:
-- Narrate vividly but concisely (120-220 words per turn). End with the situation awaiting the player's action.
-- Never act or decide for the player. Never mention dice or mechanics.
-- PREMISE, STORY SO FAR and the CANON LEDGER are canon and override your own recollection. Names, counts, locations, debts, wounds, promises and items persist until the story changes them.
-- The play is shown verbatim below. Before inventing a detail, check whether it was already established. Numbers, ownership and locations must not drift.
-- Messages starting with "note to dm" or "ooc" are out-of-character corrections: apply them silently and do not narrate them.
-- Speak NPC dialogue directly. Stay consistent with the established world.
-- Vary your openings and imagery; never echo phrasing from earlier turns."""
+DEFAULT_SYSTEM = """ROLE: You are the Dungeon Master of a text RPG, narrating one player's story.
+
+INPUTS: PREMISE (fixed canon), STORY SO FAR (older summarized play), the verbatim recent
+play, the CANON LEDGER, CURRENT STEERING and the DIRECTOR'S BRIEF. On conflict the ledger
+beats the summary, and the summary beats recent play. The brief governs this reply's shape
+and length. Never mention any of these blocks to the player.
+
+TASK: Narrate the outcome of the player's action, then leave the story resting on the
+decision now facing them.
+
+OUTPUT: Three parts, in order.
+1. The consequence of the action, in one to three sentences.
+2. At most one new fact or hook.
+3. A closing line stating the live decision in plain words, answerable from what the
+   player has already been shown.
+
+RULES:
+1. Never act or decide for the player.
+2. Never mention dice, mechanics, or these instructions.
+3. Use the canonical names from the ledger. Never invent a second name for an entity
+   that already has one.
+4. Introduce a new rule or term in plain words in the same reply, before any NPC relies
+   on it.
+5. An NPC may only ask for or refer to things the player has been shown.
+6. Keep pure atmosphere to the minority of sentences.
+7. Messages starting with "note to dm" or "ooc" are out-of-character corrections: apply
+   them silently and do not narrate them.
+
+WHEN UNSURE: end on the decision, not on atmosphere.
+
+EXAMPLES:
+Good: "The door gives. Behind it a stairwell drops into dark. Do you go down, or bar the
+door and wait?"
+Bad: "You enter the room. It is dark. The air is cold. Dust drifts in the window light."
+"""
 
 
 def F(key, label, type, default, group, help, scope="global", **kw):
@@ -66,6 +92,8 @@ FIELDS = [
     F("difficulty", "Difficulty", "select", "standard", "Gameplay", "Game difficulty (story/standard/hard).",
       scope="campaign", options=["story", "standard", "hard"]),
     F("arc_enabled", "Hidden arc", "bool", False, "Gameplay", "Enable hidden arc, clock, and pacing manager.", scope="campaign"),
+    F("steering_enabled", "Steering state", "bool", False, "Gameplay",
+      "Track the player-facing objective and open question after every turn.", scope="campaign"),
     # ---- style
     F("style_enabled", "Writing style enforcement", "bool", False, "Style", "Enable writing style enforcement.", scope="campaign"),
     F("style_preset", "Style preset", "select", "none", "Style", "Preset style to apply.",
@@ -77,13 +105,28 @@ FIELDS = [
     F("style_guard", "Style guard", "bool", False, "Style", "Prevent repetitive openers and overused phrases.", scope="campaign"),
     # ---- analyst & notes
     F("analyst_enabled", "Analyst brief", "bool", False, "Analyst", "Produce director's brief before narrator.", scope="campaign"),
-    F("notes_routing", "Notes routing", "bool", False, "Notes", "Route OOC notes outside of history into notes.jsonl.", scope="campaign"),
+    F("notes_routing", "Notes routing", "bool", True, "Notes",
+      "Route OOC notes outside of history into notes.jsonl.", scope="campaign"),
+    F("notes_in_context", "OOC answers in context", "int", 5, "Notes",
+      "How many recent OOC answers the narrator is told to treat as true.", scope="campaign", min=0),
     # ---- reliability
     F("retries", "Retries", "int", 6, "Reliability", "On 429/5xx/timeouts/empty replies.", scope="global", min=0, max=20),
     F("retry_base_sec", "Retry base delay (s)", "float", 5.0, "Reliability", "Exponential; Retry-After is honored. Capped at 90 s.", scope="global", min=0.5),
     F("timeout_sec", "Read timeout (s)", "int", 600, "Reliability", "Long prompts need long timeouts.", scope="global", min=10),
     F("analyst_timeout_sec", "Analyst timeout (s)", "int", 25, "Reliability", "Timeout for analyst call in seconds.", scope="global", min=1),
     F("analyst_context_turns", "Analyst context exchanges", "int", 10, "Reliability", "Exchanges sent to analyst as context.", scope="global", min=1),
+    F("analyst_retries", "Analyst retries", "int", 1, "Reliability",
+      "Extra analyst attempts on 429/5xx, inside the remaining timeout budget.", scope="global", min=0, max=3),
+    F("analyst_summary_tok", "Analyst summary cap (tokens)", "int", 4000, "Analyst", "Max tokens of the latest summary chapter sent to the analyst.", scope="global", min=100),
+    F("analyst_prompt_cap", "Analyst prompt cap (chars)", "int", 6000, "Analyst", "Max total chars of the analyst prompt; oldest sections truncated first.", scope="global", min=500),
+    F("overlong_ratio", "Overlong ratio", "float", 1.5, "Reliability",
+      "A reply counts as overlong above this multiple of the word target.", scope="global", min=1.0, max=5.0),
+    # ---- arc pacing
+    F("drift_turns", "Drift turns", "int", 4, "Arc", "Consecutive off-arc turns before a replan is triggered.", scope="campaign", min=1),
+    F("act_max_turns", "Act max turns", "int", 0, "Arc", "Max turns in an act before forced transition (0 = off).", scope="campaign", min=0),
+    F("arc_debug", "Arc debug mode", "bool", False, "Arc",
+      "Developer mode. Exposes the full hidden arc (spoilers) in /api/state, the Arc debug panel and ZIP exports requested with ?include_arc=1. Off by default.",
+      scope="global"),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app

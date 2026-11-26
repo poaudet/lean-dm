@@ -3,7 +3,7 @@ import base64
 import io
 import json
 import zipfile
-import pytest
+
 import dm
 
 
@@ -26,6 +26,7 @@ def test_serve_index_html():
         assert res.status_code == 200
         assert b"lean-dm" in res.data
         assert b"btn-send" in res.data
+        assert b"Arc debug (spoilers)" in res.data
 
 
 def test_serve_config_html():
@@ -135,12 +136,18 @@ def test_export_transcript(tmp_path):
         assert "Welcome" in text
 
 
-def test_export_campaign_zip(tmp_path):
+def test_export_campaign_zip(tmp_path, monkeypatch):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
     (root / "premise.md").write_text("Premise", encoding="utf-8")
     # Put a mock settings file that should be EXCLUDED
     (root / "settings.json").write_text("{}", encoding="utf-8")
+    (root / "arc.json").write_text('{"central_question":"debug question"}', encoding="utf-8")
+    (root / "arc_log.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "records.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "briefs.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "arc_snap").mkdir()
+    (root / "arc_snap" / "1.json").write_text("{}", encoding="utf-8")
 
     with dm.app.test_client() as client:
         res = client.get("/api/export/campaign.zip")
@@ -150,6 +157,21 @@ def test_export_campaign_zip(tmp_path):
             names = zf.namelist()
             assert "premise.md" in names
             assert "settings.json" not in names  # secrets excluded!
+            assert not {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl"} & set(names)
+            assert "arc_snap/1.json" not in names
+
+        # D-37: include_arc is ignored unless debug mode is on.
+        ignored = client.get("/api/export/campaign.zip?include_arc=1")
+        with zipfile.ZipFile(io.BytesIO(ignored.data), "r") as zf:
+            assert "arc.json" not in zf.namelist()
+
+        monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
+        debug = client.get("/api/export/campaign.zip?include_arc=1")
+        assert debug.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(debug.data), "r") as zf:
+            names = zf.namelist()
+            assert {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl"}.issubset(names)
+            assert "arc_snap/1.json" in names
 
 
 # ---------------------------------------------------------------------------

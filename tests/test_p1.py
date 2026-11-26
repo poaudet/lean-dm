@@ -33,7 +33,8 @@ def test_new_config_fields_have_defaults(tmp_path):
     assert c.style_guard is False
     assert c.analyst_enabled is False
     assert c.arc_enabled is False
-    assert c.notes_routing is False
+    # D2: notes routing is on by default for every campaign.
+    assert c.notes_routing is True
     assert c.analyst_model == ""
     assert c.planner_model == ""
     assert c.analyst_timeout_sec == 25

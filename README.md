@@ -9,7 +9,12 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 ## Features (v4)
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
-- **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
+- **Story Arc & Difficulty Pacing (P3)**: Optional 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The complete arc is only exposed in debug mode (`arc_debug: true`, global setting, off by default): then it appears in the collapsed Arc debug panel and `/api/state`, and campaign ZIP exports include it with `?include_arc=1`.
+- **Beat Hooks & Mandatory Moves (WP2)**: Each beat carries a spoiler-safe `hook` — a lead the player can perceive — which `allowed_moves()` pushes once the act stalls. Every due move is mandatory: the analyst plays it or lists it in `deferred`, and `clamp_brief` forces in anything it drops. A hook escalates subtle → overt → offer while it goes unanswered.
+- **Arc Drift & Act Pacing (WP6)**: The record pass tracks on-arc progress, replans after `drift_turns` consecutive off-arc turns, retains superseded beats for history, and can force an act transition after `act_max_turns`.
+- **Canon Naming & Merge (WP7)**: Ledger entries keep up to six alternate names; lookups resolve aliases, duplicate entries can be merged, and continuity audits report alias collisions.
+- **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Stores a compact steering summary separately from the inspectable arc state.
+- **Narrator Contract (WP4)**: Every reply has three parts — the consequence, at most one new fact, and a closing line stating the live decision. The brief's fields are defined for the narrator in the prompt, so `end`, `push`, `clarify` and `intent=ask` work with style enforcement off. `brief.narration.words` is the single word target.
 - **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
 - **Out-of-Character (OOC) Notes Routing (P2)**: Messages starting with `//`, `ooc`, or `note to dm:` bypass `history.jsonl` and are answered out of character in `notes.jsonl`. Promoted to canon only upon explicit request.
 - **Writing Style Enforcement & Style Guard (P1)**: Style presets in `styles/` (`subtle`, `pulp`, `noir`, `terse`) with word count ranges, push factor, and style notes. Pure deterministic `style_guard` prevents repetitive sentence openers and overused 3-grams.
@@ -25,9 +30,10 @@ lean-dm/
 ├── config.py                 # Configuration schema, coercion & dual-scope persistence
 ├── analyst.py                # Pre-turn director's brief & OOC notes routing
 ├── arc.py                    # Hidden arc planning, difficulty scheduling & record pass
+├── steering.py               # Player-facing steering state (objective, open question)
 ├── campaign.py               # Campaign filesystem paths and locks
 ├── ledger.py                 # Canon ledger operations and rendering
-├── narrator_context.py       # Narrator context and style instructions
+├── narrator_context.py       # Narrator context, brief field meanings, word target
 ├── storage.py                # Atomic writes, JSONL append, and model JSON parsing
 ├── style_guard.py            # Deterministic style repetition guard
 ├── styles/                   # Markdown writing style presets
@@ -39,8 +45,9 @@ lean-dm/
 │   ├── index.html
 │   ├── config.html
 │   ├── app.js
+│   ├── now.js
 │   └── style.css
-├── decisions.md              # Architecture decision records (D-01 through D-19)
+├── decisions.md              # Architecture decision records (D-01 through D-27)
 ├── Dockerfile                # Container definition
 ├── docker-compose.yaml
 └── campaigns/
@@ -53,10 +60,13 @@ lean-dm/
         ├── summary.md        # Folded chapter summaries
         ├── ledger.json       # Canon state index (entities, items, threads, clocks)
         ├── audit.md          # Continuity audit report
-        ├── state.json        # Engine pointers (folded, ledgered, audited)
+        ├── state.json        # Engine pointers (folded, ledgered, audited, shape_ok)
         ├── briefs.jsonl      # Analyst director briefs keyed by player msg index
         ├── notes.jsonl       # OOC notes & canon proposals
-        ├── arc.json          # Hidden narrative arc & pressure clock (never leaked)
+        ├── steering.json     # Player-facing objective and open question
+        ├── steering_snap/    # Pre-turn steering snapshots for safe undo/retry
+        │   └── <msg>.json
+        ├── arc.json          # Narrative arc plan and pressure clock (inspectable in Arc debug)
         ├── arc_log.jsonl     # Arc revision log (act boundaries)
         ├── records.jsonl     # Per-turn record pass output
         └── arc_snap/         # Pre-turn arc snapshots for safe undo/retry
@@ -82,7 +92,11 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `ctx_target_tok` | int | `200000` | global | Context | Token target after folding |
 | `ledger_enabled` | bool | `true` | global | Context | Enable keyed canon ledger |
 | `difficulty` | select | `standard` | campaign | Gameplay | Pacing: `story`, `standard`, `hard` |
-| `arc_enabled` | bool | `false` | campaign | Gameplay | Enable hidden narrative arc manager |
+| `arc_enabled` | bool | `false` | campaign | Gameplay | Enable narrative arc manager and Arc debug panel |
+| `drift_turns` | int | `4` | campaign | Arc | Consecutive off-arc turns before a replan is triggered |
+| `act_max_turns` | int | `0` | campaign | Arc | Max turns in an act before forced transition (0 = off) |
+| `arc_debug` | bool | `false` | global | Arc | Debug mode: expose the full arc (spoilers) in `/api/state`, the Arc debug panel and `?include_arc=1` exports |
+| `steering_enabled` | bool | `false` | campaign | Gameplay | Track the player-facing objective and open question |
 | `style_enabled` | bool | `false` | campaign | Style | Enable style enforcement |
 | `style_preset` | select | `none` | campaign | Style | Preset: `none`, `subtle`, `pulp`, `noir`, `terse` |
 | `style_words_min` | int | `0` | campaign | Style | Minimum words per reply (0 = off) |
@@ -92,7 +106,11 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `style_guard` | bool | `false` | campaign | Style | Prevent repetitive openers and trigrams |
 | `analyst_enabled` | bool | `false` | campaign | Analyst | Generate pre-turn director's brief |
 | `analyst_timeout_sec` | int | `25` | global | Reliability | Analyst timeout in seconds |
-| `notes_routing` | bool | `false` | campaign | Notes | Intercept OOC notes (`//`, `ooc`, `note to dm:`) |
+| `analyst_retries` | int | `1` | global | Reliability | Extra analyst attempts on 429/5xx |
+| `analyst_summary_tok` | int | `4000` | global | Reliability | Summary budget sent to the analyst |
+| `overlong_ratio` | float | `1.5` | global | Reliability | Overlong threshold as a multiple of the word target |
+| `notes_routing` | bool | `true` | campaign | Notes | Intercept OOC notes (`//`, `ooc`, `note to dm:`) |
+| `notes_in_context` | int | `5` | campaign | Notes | Recent OOC answers the narrator is told to treat as true |
 | `web_password` | secret | `""` | global | App | HTTP Basic authentication password |
 
 Arc recording runs synchronously to keep undo and retry ordered. The unused
@@ -140,6 +158,7 @@ python dm.py --show-context
 - `retry!`: Re-runs the analyst model and regenerates the DM reply.
 - `/brief`: Displays the analyst brief for the last turn after an explicit spoiler confirmation (D-10).
 - `/notes`: Lists out-of-character notes and their canon status.
+- `/now`: Shows the current objective and open question.
 - `/ledger`: Displays the active and resolved canon ledger entries.
 - `/context`: Displays assembled context.
 - `/rebuild`: Rebuilds the canon ledger from raw history.
@@ -153,17 +172,17 @@ python dm.py --show-context
 - `GET /healthz`: Unauthenticated liveness probe for container healthchecks.
 - `GET /`: Game interface.
 - `GET /config`: Settings management interface.
-- `GET /api/state`: Returns game status, turns, ledger, premise, and non-spoiler arc chip.
+- `GET /api/state`: Returns game status, turns, ledger, premise, the arc chip, full `arc_debug` data only when arc management and debug mode (`arc_debug` setting) are both enabled (otherwise `null`), player-facing steering fields, and the `shape_ok` / `overlong` post-check flags.
 - `POST /api/turn`: Standard turn completion (`{"text": "..."}`).
 - `POST /api/stream`: Server-Sent Events (SSE) streaming turn with stages: `analyzing` → `narrating` → `recording`.
 - `POST /api/undo`: Rewinds last exchange.
-- `POST /api/retry`: Regenerates DM reply.
+- `POST /api/retry`: Regenerates DM reply. Accepts `{"shorter": true}` to retry with the word budget multiplied by 0.7 (E4).
 - `POST /api/premise`: Atomically updates `premise.md` (retaining `premise.md.bak`).
 - `POST /api/ledger`: Pin, delete, or upsert entries (`{"action": "pin|delete|upsert", ...}`).
 - `GET /api/notes`: Returns OOC notes list.
 - `POST /api/notes/<id>/canon`: Promotes an OOC note or proposal to canon.
 - `GET /api/export/transcript`: Downloads campaign transcript as Markdown.
-- `GET /api/export/campaign.zip`: Downloads campaign archive zip (arc internals excluded by default; add `?include_arc=1` to include them).
+- `GET /api/export/campaign.zip`: Downloads campaign archive zip (arc internals excluded by default; `?include_arc=1` includes them only when `arc_debug` is on).
 - `GET /api/campaigns` & `POST /api/campaigns`: List, create, or duplicate campaigns.
 
 ---
@@ -175,7 +194,7 @@ Tests run using pytest and use temporary isolated directories via `DM_CAMPAIGNS_
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest tests/
-ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py storage.py style_guard.py
+ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py steering.py storage.py style_guard.py
 mypy --strict campaign.py storage.py style_guard.py
 ```
 
@@ -185,6 +204,13 @@ Test coverage:
 - `tests/test_p2.py`: Analyst briefs, timeouts, fallbacks, OOC notes routing, canon promotion.
 - `tests/test_p3.py`: Hidden arc, scheduling, difficulty bending table, and sentinel leak tests.
 - `tests/test_p4.py`: Web UI assets, SSE streaming, HTTP Basic auth, premise/ledger editing, ZIP and transcript exports.
+- `tests/test_wp1_steering.py`: Steering state — single writer, rollback, prompt injection, UI fields.
+- `tests/test_wp2_beat_moves.py`: Beat hooks, mandatory moves, escalation, and the fallback that plays.
+- `tests/test_wp3_analyst_inputs.py`: Analyst inputs, ledger-backed keep_true, retry, built fallback.
+- `tests/test_wp4_narrator_contract.py`: Reply shape, field meanings, word target, post-check.
+- `tests/test_wp5_prompt_contracts.py`: Analyst, record, planner, ledger and narrator prompt contracts.
+- `tests/test_wp6_wp7_acceptance.py`: Arc validation/retry/logging and ledger alias merge/lookup acceptance.
+- `docs/playtest.md`: Manual steering and drift/replan playtest procedure.
 
 ---
 
@@ -192,4 +218,6 @@ Test coverage:
 
 1. **Backwards Compatibility**: With all new features at their defaults (`false` / `none` / `""`), prompt generation is byte-identical to v3 (Invariants I11).
 2. **Opt-in Arc**: Existing campaigns continue unchanged. Enable arc management by setting `arc_enabled: true` in settings or running `python dm.py --campaign <name> --plan-arc`.
-3. **No Migration Needed**: Old `settings.json` files automatically load with sensible defaults for new fields.
+3. **Opt-in Steering**: Set `steering_enabled: true` to track the objective and open question. It works with or without the arc.
+4. **No Migration Needed**: Old `settings.json` files automatically load with sensible defaults for new fields.
+5. **Custom system prompts**: `DEFAULT_SYSTEM` was rewritten in the section 9 format and no longer states a word count. A campaign with a custom `system_prompt` keeps it unchanged, but will not get the E1 reply shape or the E5/E6 rules unless it is updated by hand.

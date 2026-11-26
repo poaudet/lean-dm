@@ -38,7 +38,7 @@ jobs:
 
       - name: Run Ruff
         run: |
-          ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py storage.py style_guard.py
+          ruff check dm.py analyst.py arc.py campaign.py config.py ledger.py narrator_context.py steering.py storage.py style_guard.py
 
       - name: Type-check shared modules
         run: |

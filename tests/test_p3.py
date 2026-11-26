@@ -1,8 +1,8 @@
 """tests/test_p3.py — Hidden arc, clock, difficulty scheduling, and record pass tests."""
 import json
-import pytest
-import dm
+
 import arc
+import dm
 
 
 def _init(root):
@@ -113,16 +113,17 @@ def test_act_boundary_accepted_writes_arc_log(monkeypatch, tmp_path):
     assert log_file.exists()
     lines = log_file.read_text(encoding="utf-8").splitlines()
     assert len(lines) >= 1
-    entry = json.loads(lines[-1])
-    assert entry["kind"] == "act_boundary"
+    entries = [json.loads(line) for line in lines]
+    entry = next(item for item in entries if item["kind"] == "act_boundary")
     assert entry["act"] == 1
+    assert any(item["kind"] == "next_act_fallback" for item in entries)
 
 
 # ---------------------------------------------------------------------------
-# 4. Arc leak test: Sentinel strings never leak into history, premise, chapters, ledger, audit, or API (A9)
+# 4. Arc debug visibility: internals stay out of narrative files but are inspectable by the player.
 # ---------------------------------------------------------------------------
 
-def test_arc_leak_no_arc_in_history(monkeypatch, tmp_path):
+def test_arc_debug_is_visible_but_not_written_into_narrative_files(monkeypatch, tmp_path):
     root = tmp_path / "campaigns" / dm.CAMPAIGN
     _init(root)
 
@@ -198,15 +199,19 @@ def test_arc_leak_no_arc_in_history(monkeypatch, tmp_path):
     for s in sentinels:
         assert s not in ledger_text
 
-    # Check /api/state response via test client
+    # D-37: the arc chip is always visible; the full arc only in debug mode.
     with dm.app.test_client() as client:
-        res = client.get("/api/state")
-        state_json = json.dumps(res.get_json())
-        for s in sentinels:
-            assert s not in state_json
-        # Only non-spoiler arc_chip should be in state
-        data = res.get_json()
+        data = client.get("/api/state").get_json()
         assert "Act 1" in data.get("arc_chip", "")
+        assert data.get("arc_debug") is None
+        for s in sentinels:
+            assert s not in json.dumps(data)
+        monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
+        res = client.get("/api/state")
+        data = res.get_json()
+        debug_json = json.dumps(data.get("arc_debug"))
+        for s in sentinels:
+            assert s in debug_json
 
 
 # ---------------------------------------------------------------------------

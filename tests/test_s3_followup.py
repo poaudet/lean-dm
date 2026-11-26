@@ -63,7 +63,7 @@ def test_stream_emits_ooc_answer_inline(monkeypatch):
         "model": "test-model",
         "notes_routing": True,
     })
-    monkeypatch.setattr(dm.analyst, "handle_ooc_note", lambda *args: {"a": "The answer."})
+    monkeypatch.setattr(dm.analyst, "handle_ooc_note", lambda *args, **kwargs: {"a": "The answer."})
 
     with dm.app.test_client() as client:
         response = client.post("/api/stream", json={"text": "// where are we?"})
@@ -81,6 +81,7 @@ def test_campaign_zip_excludes_arc_files_unless_requested(monkeypatch):
     (dm.ROOT / "arc_snap").mkdir()
     (dm.ROOT / "arc_snap" / "1.json").write_text("{}", encoding="utf-8")
 
+    monkeypatch.setattr(dm.cfg, "_vals", {**dm.cfg._vals, "arc_debug": True})
     with dm.app.test_client() as client:
         default_zip = zipfile.ZipFile(io.BytesIO(client.get("/api/export/campaign.zip").data))
         full_zip = zipfile.ZipFile(io.BytesIO(client.get("/api/export/campaign.zip?include_arc=1").data))

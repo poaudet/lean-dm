@@ -46,12 +46,24 @@
     </div>
   </div>
 
+  <div id="now-panel" class="now-panel" style="display:none">
+    <div id="steering-fields">
+      <div class="now-row"><span class="now-label">Objective</span><span id="now-objective"></span></div>
+      <div class="now-row"><span class="now-label">Open question</span><span id="now-question"></span></div>
+    </div>
+    <details id="arc-debug-panel" hidden>
+      <summary>Arc debug (spoilers)</summary>
+      <pre id="arc-debug-data"></pre>
+    </details>
+  </div>
+
   <div id="log" role="log" aria-live="polite"></div>
 
   <div id="bar">
     <div class="bar-controls">
       <button id="btn-undo" class="ghost" data-action="undo" title="Undo last turn">↶ undo</button>
       <button id="btn-retry" class="ghost" data-action="retry" title="Retry DM reply">↻ retry</button>
+      <button id="btn-retry-shorter" class="ghost" data-action="retry-shorter" title="Retry with shorter reply" style="display:none">↻ shorter</button>
       <textarea id="in" placeholder="Your action… (Enter to send, Shift+Enter for newline)" autofocus rows="1"></textarea>
       <button id="btn-send" data-action="send">Send</button>
       <button id="btn-stop" class="ghost" data-action="stop" style="display:none;color:var(--err)">Stop</button>
@@ -72,5 +84,6 @@
 </div>
 
 <script src="/web/app.js"></script>
+<script src="/web/now.js"></script>
 </body>
 </html>

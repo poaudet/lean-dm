@@ -51,13 +51,14 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 import analyst
 import arc
+import steering
 from campaign import Campaign
 from config import SETTINGS_PATH, cfg
 from ledger import KINDS as KINDS
 from ledger import _lst as _lst
 from ledger import apply_ledger_ops, render_ledger
 from ledger import slug as slug
-from narrator_context import assemble_context
+from narrator_context import assemble_context, render_notes, shorter_words, word_target
 from narrator_context import merge_same_role as merge_same_role
 from storage import append_jsonl, atomic_write, clean_reply, parse_json_response
 from style_guard import compute_style_guard
@@ -71,7 +72,7 @@ if "--campaign" in sys.argv:
     CAMPAIGN = re.sub(r"[^\w.\-]", "_", sys.argv[sys.argv.index("--campaign") + 1]) or "default"
 
 def bind_campaign(campaigns_dir=None, name=None):
-    """Set the active campaign and refresh compatibility aliases used by commands/tests."""
+    """Set the active campaign and refresh compatibility aliases used by tests."""
     global CAMPAIGN_CONTEXT, CAMPAIGN, CAMPAIGNS_DIR, ROOT
     global HISTORY, UNDONE, PREMISE, SUMMARY, LEDGER, AUDIT, STATE
     global TURN_LOCK, MAINT_LOCK, STATE_LOCK, JOB_LOCK
@@ -124,10 +125,9 @@ def ensure_configured():
 
 
 def print_config():
-    key = cfg.api_key[:6] + "…" if len(cfg.api_key) > 6 else ("***" if cfg.api_key else "(none)")
+    key = "***" if cfg.api_key else "(none)"
     print(f"settings={SETTINGS_PATH}")
-    print(f"endpoint={cfg.base_url}  key={key}")
-    print(f"model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
+    print(f"endpoint={cfg.base_url}  key={key}  model={cfg.model or '(none)'}  scribe={cfg.scribe_model or 'same'}  fallback={cfg.fallback_model or 'none'}")
     print(f"campaign='{CAMPAIGN}'  fold {cfg.ctx_budget_tok // 1000}k→{cfg.ctx_target_tok // 1000}k tok  "
           f"ledger={'on' if cfg.ledger_enabled else 'off'}")
 
@@ -231,6 +231,9 @@ def build_context(history, brief=None):
         history, brief, folded_count=k, premise=read(PREMISE),
         summary=read(SUMMARY) if k else "",
         canon=render_ledger(load_ledger()) if cfg.ledger_enabled else "",
+        steering=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
+        # D3: the last K OOC answers, so the narrator knows what the player was told.
+        notes=render_notes(analyst.load_notes(ROOT)) if cfg.notes_routing else "",
     )
 
 def ctx_label():
@@ -262,10 +265,14 @@ class ApiError(RuntimeError):
 
 TRANSIENT = (requests.ConnectionError, requests.Timeout, ApiError)
 
-def _raw_post(payload, stream=False):
+def _raw_post(payload, stream=False, timeout=None):
     url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    # FIX4: an explicit timeout bounds the call itself. Without it the analyst thread
+    # would keep its HTTP request alive for cfg.timeout_sec (600 s) after the analyst
+    # timeout had already fired and returned a fallback brief.
+    read_timeout = timeout if timeout is not None else cfg.timeout_sec
     r = requests.post(url, headers={"Authorization": f"Bearer {cfg.api_key}"}, json=payload,
-                      timeout=(10, cfg.timeout_sec), stream=stream)
+                      timeout=(10, read_timeout), stream=stream)
     if r.status_code >= 400:
         wait = None
         try:
@@ -318,10 +325,17 @@ def scribe_extra():
 def scribe_model():
     return cfg.scribe_model or cfg.model
 
-def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True, **extra):
+def chat_complete(messages, model=None, *, track=True, retries=None, fallback=True,
+                  timeout=None, **extra):
+    """FIX4: `timeout` is a named parameter, not part of **extra.
+
+    Anything in **extra is splatted into the request payload, so a timeout passed
+    that way would be sent to the provider as an unknown field.
+    """
     def call(m):
         def go():
-            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra})
+            r = _raw_post({"model": m, "messages": messages, "stream": False, **extra},
+                          timeout=timeout)
             try:
                 data = r.json()
             except ValueError:
@@ -400,22 +414,26 @@ def parse_json_obj(raw):
     return value
 
 LEDGER_PROMPT = (
-    "Update the canon ledger from the new play. Return ONLY JSON: "
-    '{"upsert": [entry...], "close": [ids], "delete": [ids]}.\n'
-    'entry = {"id": stable-lowercase-slug, "kind": "player|person|place|item|promise|clock|rule|thread", '
-    '"name": "...", "state": "one line: the CURRENT truth", "src": "player|dm|note", '
-    '"msg": index of the message where it last changed}\n'
-    "Rules:\n"
-    "- One entry per entity/thing. Reuse the existing id to update it; never create a second entry for the same thing.\n"
-    "- Durable canon only: who/where/what-state, exact counts, days, deadlines, ownership, promises, debts, injuries, "
-    "decisions the player declared. Skip moment-to-moment action and atmosphere.\n"
-    "- Be specific: keep numbers, names, locations. Characters who matter must keep an entry with their last known "
-    "location and open business, even if they have been offscreen for a long time.\n"
-    "- Player messages starting with 'note to dm', 'ooc' or in parentheses are out-of-character corrections: apply "
-    "them and set src to 'note'.\n"
-    "- If the DM contradicts an established value without the story changing it, keep the established value and add "
-    "'(DM said X at [n])' to the state.\n"
-    "- 'close' = resolved, dead, finished or obsolete (kept as history). 'delete' only for entries that were mistakes.")
+    "ROLE: You are the canon ledger scribe for a text RPG.\n"
+    "INPUTS: The existing ledger is the current canon; new play may update it only when the story establishes a change.\n"
+    "TASK: Extract durable facts and update one canonical entry per entity or thing.\n"
+    'OUTPUT: Return only JSON: {"upsert": [entry], "close": [id], "delete": [id], '
+    '"merge": [{"from": "id", "into": "id"}]}. Each entry has id (stable lowercase slug), kind '
+    "(player|person|place|item|promise|clock|rule|thread), name, state (one line of current truth), aliases "
+    "(string array), src (player|dm|note), and msg (last changed message index).\n"
+    "RULES:\n"
+    "1. Reuse the existing id for an existing entity; never create a duplicate. If play uses another name, add it to "
+    "aliases, with at most six aliases per entry.\n"
+    "2. Report duplicates already present with merge [{from, into}]. Never alter pinned entries.\n"
+    "3. Keep durable canon: identities, locations, state, counts, deadlines, ownership, promises, debts, injuries and "
+    "player-declared decisions. Skip momentary action and atmosphere.\n"
+    "4. Preserve established values when the DM contradicts them without an in-story change; note the contradiction "
+    "in state with its message index. OOC corrections from 'note to dm', 'ooc' or parentheses use src=note.\n"
+    "5. close means resolved/dead/finished/obsolete but retained as history. delete only an erroneous entry.\n"
+    "WHEN UNSURE: Preserve the existing entry and do not invent a fact or duplicate.\n"
+    "EXAMPLES: Good: add 'the smith' as an alias of the existing person id. Bad: create a second person entry for "
+    "the same character or merge a pinned entry."
+)
 
 def ledger_pass(upto=None):
     """Advance the ledger over history[ledgered:upto]. Caller holds MAINT_LOCK."""
@@ -505,7 +523,10 @@ def _audit():
          "2. LEDGER ERRORS — entries that are wrong or stale versus the play, with corrected text.\n"
          "3. DROPPED THREADS — characters, promises, clocks, objects introduced but not seen again (last index seen).\n"
          "4. NARRATOR HABITS — repeated phrases, imagery, structures; the DM acting or deciding for the player.\n"
-         "5. TOP 10 FIXES, ranked. Be specific; no filler."}],
+         "5. TOP 10 FIXES, ranked. Be specific; no filler.\n"
+         "6. ALIAS COLLISIONS — entries that probably describe the same thing (same name, overlapping aliases, "
+         "or one entry's name appearing as another's alias), with a suggested merge {\"from\": id, \"into\": id}; "
+         "also flag any name or alias used by two different entries."}],
         model=scribe_model(), track=False, **scribe_extra()))
     atomic_write(AUDIT, f"# Continuity audit — {time.strftime('%Y-%m-%d %H:%M')}\n"
                         f"Covers messages {start}–{len(h) - 1} of {len(h)}\n\n{report}")
@@ -626,6 +647,56 @@ def _generate_stream(ctx):
         raise RuntimeError("model returned an empty reply")
     yield {"done": True, "dm": dm}
 
+def compute_shape_ok(text, end):
+    """E4: does the closing line match the requested `end`?
+
+    A `question` end needs a question mark; `decision` and `beat` need a non-empty
+    closing line. With no requested end (no brief this turn) there is nothing to
+    check, so the answer is True (nothing to violate).
+    """
+    body = (text or "").strip()
+    want = str(end or "").strip().lower()
+    if not body:
+        return False
+    if not want:
+        return True
+    parts = re.split(r"(?<=[.!?])\s+", body)
+    closing = next((p.strip() for p in reversed(parts) if p.strip()), "")
+    if not closing:
+        return False
+    if want == "question":
+        return closing.endswith("?")
+    return True
+
+
+def _shorter_brief(brief):
+    """E4: the retry-shorter action regenerates with the budget multiplied by 0.7."""
+    current = _int(get_state().get("word_budget", 0)) or word_target(brief)
+    out = dict(brief) if isinstance(brief, dict) else {}
+    narr = dict(out.get("narration") or {})
+    narr["words"] = shorter_words(current)
+    out["narration"] = narr
+    return out
+
+
+def _pending_hooks(arc_state):
+    """Hooks of the active act's pending beats, for the analyst prompt (C1).
+
+    Hooks are player-perceivable by construction (B1), so this stays spoiler-safe.
+    """
+    if not arc_state or not isinstance(arc_state, dict):
+        return []
+    act_n = arc_state.get("act", 1)
+    out = []
+    for a in arc_state.get("acts") or []:
+        if not isinstance(a, dict) or a.get("n") != act_n:
+            continue
+        for b in a.get("beats") or []:
+            if isinstance(b, dict) and b.get("status") == "pending" and b.get("hook"):
+                out.append(str(b["hook"])[:200])
+    return out
+
+
 def _act_goal():
     if not cfg.arc_enabled:
         return ""
@@ -634,6 +705,27 @@ def _act_goal():
         return ""
     act = next((a for a in arc_state.get("acts", []) if a.get("n") == arc_state.get("act", 1)), {})
     return str(act.get("goal") or "")
+
+def _defer_counts():
+    """B4: consecutive most-recent briefs that defer each move id.
+
+    Only the unbroken run at the tail counts: a brief that does not defer a move
+    ends its streak. Undo truncates briefs.jsonl, so the count rolls back with it.
+    """
+    briefs = analyst.load_briefs(ROOT)
+    if not briefs:
+        return {}
+    counts, active = {}, None
+    for idx in sorted(briefs, reverse=True):
+        deferred = (briefs[idx].get("brief") or {}).get("deferred") or []
+        ids = {str(d.get("id")) for d in deferred if isinstance(d, dict) and d.get("id")}
+        active = ids if active is None else (active & ids)
+        if not active:
+            break
+        for mid in active:
+            counts[mid] = counts.get(mid, 0) + 1
+    return counts
+
 
 def get_allowed_moves(history=None):
     if not cfg.arc_enabled:
@@ -661,14 +753,16 @@ def _record_kwargs(brief):
     return {
         "played_moves": brief.get("plot_moves") or [],
         "intent": brief.get("intent", "act"),
-        "analyst_act_complete": bool(brief.get("act_complete", False)),
+        "analyst_act_complete": brief.get("act_complete") is True,
+        "clarify": bool(brief.get("clarify")),
     }
+
 
 def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
     """Auto-plan a missing arc, then run the record pass for a committed turn."""
-    if not retry and arc.arc_is_corrupt(ROOT):
+    if cfg.arc_enabled and not retry and arc.arc_is_corrupt(ROOT):
         warn("arc.json exists but is unreadable; the arc is paused until you fix or delete it")
-    elif not retry and not arc.load_arc(ROOT):
+    elif cfg.arc_enabled and not retry and not arc.load_arc(ROOT):
         try:
             new_arc = arc.plan_initial_arc(
                 read(PREMISE), read(SUMMARY), render_ledger(load_ledger()),
@@ -683,13 +777,23 @@ def _arc_step(text, dm, msg_idx, history, user, played_history, brief, retry):
                             history=played_history, **_record_kwargs(brief))
     except Exception as e:
         logger.warning("Arc record pass failed; the arc did not advance for message %s: %s", msg_idx, e)
+    if not (brief and (brief.get("intent") == "ask" or brief.get("clarify"))):
+        try:
+            arc.fill_empty_pressures(ROOT, arc.load_arc(ROOT), msg_idx)
+        except Exception as e:
+            logger.warning("Could not fill empty pressures: %s", e)
     try:
-        arc.prune_arc_snapshots(ROOT, max(folded(), ledgered()))
+        below = max(folded(), ledgered())
+        arc.prune_arc_snapshots(ROOT, below)
+        steering.prune_steering_snapshots(ROOT, below)
     except OSError as e:
-        logger.warning("Could not prune arc snapshots: %s", e)
+        logger.warning("Could not prune snapshots: %s", e)
 
-def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False):
-    """Single turn engine shared by CLI, web turns, streaming turns, and retries."""
+def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_analyst=False, shorter=False):
+    """Single turn engine shared by CLI, web turns, streaming turns, and retries.
+
+    If shorter is True, the analyst word budget is multiplied by 0.7 (E4 retry shorter).
+    """
     if not lock_acquired and not TURN_LOCK.acquire(blocking=False):
         raise RuntimeError("turn already in progress")
     elif not lock_acquired:
@@ -702,14 +806,19 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
             lines, history = raw_history_lines(), load_history()
             _last_exchange(lines, history)
             text = history[-2]["content"]
-            if cfg.arc_enabled:
+            if cfg.arc_enabled or cfg.steering_enabled:
                 arc_backup = arc.backup_state(ROOT)
+            if cfg.arc_enabled:
                 arc.restore_arc_snapshot(ROOT, len(history) - 1)
                 arc.truncate_records(ROOT, len(history) - 1)
                 arc.truncate_arc_log(ROOT, len(history) - 1)
+            if cfg.steering_enabled:
+                steering.restore_steering_snapshot(ROOT, len(history) - 1)
             if stream and cfg.analyst_enabled and rerun_analyst:
                 yield {"stage": "analyzing"}
             brief = _retry_brief(history, rerun_analyst)
+            if shorter:                                 # E4: retry with a smaller budget
+                brief = _shorter_brief(brief)
             user = history[-2]
             msg_idx = len(history) - 1
             played_history = history[:-1]
@@ -719,7 +828,8 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
             if cfg.notes_routing and analyst.is_ooc_note(text):
                 entry = analyst.handle_ooc_note(
                     ROOT, text, history, read(PREMISE), read(SUMMARY),
-                    render_ledger(load_ledger()), chat_complete
+                    render_ledger(load_ledger()), chat_complete,
+                    steering_text=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
                 )
                 yield {"chunk": entry["a"], "ooc": True}
                 yield {"done": True, "dm": entry["a"], "ooc": True}
@@ -731,11 +841,28 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
                     yield {"stage": "analyzing"}
                 allowed = get_allowed_moves()
                 guard_items = compute_style_guard(history) if cfg.style_guard else []
+                ledger = load_ledger()
                 brief, source, model_used, ms = analyst.run_analyst(
                     ROOT, history, text, allowed, guard_items, chat_complete,
-                    ledger_text=render_ledger(load_ledger()), act_goal=_act_goal()
+                    ledger_text=render_ledger(ledger), act_goal=_act_goal(),
+                    steering_text=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
+                    premise=read(PREMISE),
+                    summary=read(SUMMARY),
+                    hooks=_pending_hooks(arc.load_arc(ROOT)) if cfg.arc_enabled else None,
+                    previous_brief=analyst.load_brief_for_msg(ROOT, len(history) - 2),
+                    ledger=ledger,
+                    defer_counts=_defer_counts(),
                 )
+                if shorter:
+                    brief = _shorter_brief(brief)
                 analyst.save_brief(ROOT, len(history), source, model_used, ms, brief)
+            elif cfg.arc_enabled:
+                # Arc scheduling remains active without the optional analyst model.
+                allowed = get_allowed_moves()
+                if allowed:
+                    brief = analyst.make_fallback_brief(
+                        allowed_moves=allowed, ledger=load_ledger(), player_action=text,
+                    )
 
             user = {"role": "user", "content": text}
             msg_idx = len(history) + 1
@@ -766,11 +893,21 @@ def run_turn(text="", stream=False, lock_acquired=False, retry=False, rerun_anal
         maintain_needed = True
         played_history = played_history + [{"role": "assistant", "content": dm}]
 
+        # E4: check the reply after the fact, since streaming rules out a silent
+        # regeneration. The budget comes from the brief, so this works with style
+        # enforcement off; overlong is measured against overlong_ratio, not a
+        # hard-coded 1.5.
         words = len(dm.split())
-        overlong = bool(cfg.style_words_max > 0 and words > int(1.5 * cfg.style_words_max))
-        set_state(last_words=words, overlong=overlong)
+        budget = (word_target(brief) if brief
+                  else (_int(get_state().get("word_budget", 0)) or word_target(None)))
+        # A zero budget means "no target known"; never flag every reply as overlong.
+        overlong = bool(budget > 0 and words > int(cfg.overlong_ratio * budget))
+        narr = brief.get("narration") if isinstance(brief, dict) else None
+        end = str((narr or {}).get("end") or "").strip().lower() or None
+        shape_ok = compute_shape_ok(dm, end)
+        set_state(last_words=words, overlong=overlong, shape_ok=shape_ok, word_budget=budget)
 
-        if cfg.arc_enabled:
+        if cfg.arc_enabled or cfg.steering_enabled:
             if stream:
                 try:
                     yield {"stage": "recording"}
@@ -816,12 +953,16 @@ def undo_turn():
             arc.restore_arc_snapshot(ROOT, len(h) - 1)
             arc.truncate_records(ROOT, len(h) - 2)
             arc.truncate_arc_log(ROOT, len(h) - 2)
+        if cfg.steering_enabled:
+            steering.restore_steering_snapshot(ROOT, len(h) - 1)
         analyst.truncate_briefs(ROOT, len(h) - 2)
         append_jsonl(UNDONE, lines[-2:])
         atomic_write(HISTORY, "".join(line + "\n" for line in lines[:-2]))
         text = h[-2]["content"]
         if len(h) == 2 and read(PREMISE) == text.strip():
             PREMISE.unlink()                            # undoing the opening un-pins it too
+        # Clear per-reply flags so they describe the last reply only
+        set_state(overlong=False, shape_ok=True, word_budget=0)
         return text
     finally:
         TURN_LOCK.release()
@@ -829,6 +970,12 @@ def undo_turn():
 def _retry_brief(h, rerun_analyst):
     """Director's brief for retrying the last exchange: reuse the stored one unless asked to re-run."""
     if not cfg.analyst_enabled:
+        if cfg.arc_enabled:
+            allowed = get_allowed_moves(h[:-2])
+            if allowed:
+                return analyst.make_fallback_brief(
+                    allowed_moves=allowed, ledger=load_ledger(), player_action=h[-2]["content"],
+                )
         return None
     player_idx = len(h) - 2
     if not rerun_analyst:
@@ -837,16 +984,28 @@ def _retry_brief(h, rerun_analyst):
             return brief
     allowed = get_allowed_moves(h[:-2])
     guard_items = compute_style_guard(h[:-2]) if cfg.style_guard else []
+    ledger = load_ledger()
     brief, source, model_used, ms = analyst.run_analyst(
-        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete
+        ROOT, h[:-2], h[-2]["content"], allowed, guard_items, chat_complete,
+        ledger_text=render_ledger(ledger), act_goal=_act_goal(),
+        steering_text=steering.render_steering(steering.load_steering(ROOT)) if cfg.steering_enabled else "",
+        premise=read(PREMISE),
+        summary=read(SUMMARY),
+        hooks=_pending_hooks(arc.load_arc(ROOT)) if cfg.arc_enabled else None,
+        previous_brief=analyst.load_brief_for_msg(ROOT, player_idx - 2),
+        ledger=ledger,
+        defer_counts=_defer_counts(),
     )
     analyst.save_brief(ROOT, player_idx, source, model_used, ms, brief)
     return brief
 
-def retry_turn(stream=False, rerun_analyst=False):
-    """Regenerate the DM's last reply for the same player action."""
+def retry_turn(stream=False, rerun_analyst=False, shorter=False):
+    """Regenerate the DM's last reply for the same player action.
+
+    If shorter is True, the word budget is multiplied by 0.7 for the retried reply.
+    """
     result = None
-    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst):
+    for event in run_turn(stream=stream, retry=True, rerun_analyst=rerun_analyst, shorter=shorter):
         if stream and event.get("chunk"):
             print(event["chunk"], end="", flush=True)
         if event.get("done"):
@@ -860,7 +1019,8 @@ def game_state():
         est = est_tokens(build_context(history + [{"role": "user", "content": "x"}]))
         label = f"next prompt ≈{est / 1000:.1f}k tok"
     st = get_state()
-    arc_chip = arc.get_arc_chip(arc.load_arc(ROOT)) if cfg.arc_enabled else None
+    arc_state = arc.load_arc(ROOT) if cfg.arc_enabled else None
+    arc_chip = arc.get_arc_chip(arc_state) if arc_state else None
 
     # Undo / retry status
     can_undo = True
@@ -891,8 +1051,11 @@ def game_state():
         "job": dict(JOB),
         "ctx": label,
         "overlong": bool(st.get("overlong", False)),
+        "shape_ok": bool(st.get("shape_ok", True)),
         "last_words": _int(st.get("last_words", 0)),
+        "word_budget": _int(st.get("word_budget", 0)),
         "arc_chip": arc_chip,
+        "arc_debug": arc_state if (cfg.arc_debug and cfg.arc_enabled) else None,   # D-37: debug mode only
         "can_undo": can_undo,
         "can_retry": can_undo,
         "undo_blocked_reason": undo_reason,
@@ -907,6 +1070,7 @@ def game_state():
         "difficulty": cfg.difficulty,
         "style_preset": cfg.style_preset,
         "style_notes": cfg.style_notes,
+        "steering": steering.player_fields(steering.load_steering(ROOT)) if cfg.steering_enabled else None,
     }
 
 
@@ -1046,7 +1210,7 @@ def api_turn():
         return jsonify({"error": str(e)}), 502
 
 class ThinkFilter:
-    """Hide <think>…</think> text from a live stream, tolerating tags split across chunks."""
+    """Hide reasoning text from a live stream, tolerating tags split across chunks."""
     def __init__(self):
         self.buf, self.hidden = "", False
 
@@ -1054,15 +1218,16 @@ class ThinkFilter:
         self.buf += piece
         out = ""
         while self.buf:
-            tag = "</think>" if self.hidden else "<think>"
-            i = self.buf.find(tag)
-            if i >= 0:
+            tags = ("</thinking>", "</think>") if self.hidden else ("<thinking>", "<think>")
+            matches = [(self.buf.find(tag), tag) for tag in tags if self.buf.find(tag) >= 0]
+            if matches:
+                i, tag = min(matches, key=lambda item: item[0])
                 if not self.hidden:
                     out += self.buf[:i]
                 self.buf, self.hidden = self.buf[i + len(tag):], not self.hidden
                 continue
-            keep = next((n for n in range(min(len(tag) - 1, len(self.buf)), 0, -1)
-                         if tag.startswith(self.buf[-n:])), 0)
+            keep = max((n for tag in tags for n in range(min(len(tag) - 1, len(self.buf)), 0, -1)
+                        if tag.startswith(self.buf[-n:])), default=0)
             if not self.hidden:
                 out += self.buf[:len(self.buf) - keep]
             self.buf = self.buf[len(self.buf) - keep:]
@@ -1118,8 +1283,10 @@ def api_undo():
 
 @app.route("/api/retry", methods=["POST"])
 def api_retry():
+    body = request.get_json(silent=True) or {}
+    shorter = bool(body.get("shorter", False))
     try:
-        return jsonify({"dm": retry_turn()})
+        return jsonify({"dm": retry_turn(shorter=shorter)})
     except Exception as e:
         if str(e) == "turn already in progress":
             return jsonify({"error": str(e)}), 409
@@ -1201,7 +1368,7 @@ def api_export_transcript():
 @app.route("/api/export/campaign.zip", methods=["GET"])
 def api_export_zip():
     buf = io.BytesIO()
-    include_arc = request.args.get("include_arc") == "1"
+    include_arc = bool(cfg.arc_debug) and request.args.get("include_arc") == "1"   # D-37: needs debug mode
     arc_names = {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl", "arc_snap"}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in ROOT.rglob("*"):
@@ -1326,7 +1493,7 @@ def api_config_test():
 def cli():
     history = load_history()
     print(f"=== Campaign '{CAMPAIGN}' — {sum(m['role'] == 'user' for m in history)} turns — "
-          f"/undo /retry /context /ledger /rebuild /audit /quit ===\n")
+          f"/undo /retry /now /context /ledger /rebuild /audit /quit ===\n")
     if not history:
         print("(new campaign — open with your character concept and the opening scene; "
               "this first message is pinned as the premise)\n")
@@ -1355,6 +1522,12 @@ def cli():
                 print(read(AUDIT), "\n")
             elif player == "/undo":
                 print(f"[removed; your move was: {undo_turn()}]\n")
+            elif player == "/now":
+                state = steering.load_steering(ROOT)
+                if not state:
+                    print("(no steering state yet — enable steering_enabled and play a turn)\n")
+                else:
+                    print((steering.render_steering(state) or "(nothing recorded yet)") + "\n")
             elif player == "/notes":
                 notes = analyst.load_notes(ROOT)
                 if not notes:
@@ -1379,7 +1552,7 @@ def cli():
                 retry_turn(stream=True, rerun_analyst=(player == "retry!"))
                 print(f"\n\n[{ctx_label()}]\n")
             elif player.startswith("/"):
-                print("[commands: /undo /retry retry! /brief /notes /context /ledger /rebuild /audit /quit]\n")
+                print("[commands: /undo /retry retry! /brief /notes /now /context /ledger /rebuild /audit /quit]\n")
             else:
                 print()
                 player_turn(player, stream=True)

@@ -10,7 +10,7 @@ def _arc(**over):
         "version": 1, "central_question": "Q?", "act": 1, "clock": {"minutes": 90},
         "acts": [{"n": 1, "status": "active", "goal": "g", "beats": []}],
         "pressures": [{"id": "p1", "status": "active",
-                       "steps": [{"id": "s1", "status": "pending", "at_minutes": "60", "effect": "x"}]}],
+                       "steps": [{"id": "s1", "status": "pending", "at_minutes": 60, "effect": "x"}]}],
     }
     base.update(over)
     return base
@@ -50,7 +50,11 @@ def test_terminal_arc_schedules_nothing():
 
 
 def test_plan_initial_arc_normalizes(monkeypatch):
-    raw = json.dumps(_arc(acts=[{"n": "1", "goal": "g"}, "bad"]))
+    raw = json.dumps(_arc(acts=[{"n": "1", "goal": "g", "status": "active", "beats": [
+        {"id": "a1b1", "text": "one", "hook": "lead one", "status": "pending"},
+        {"id": "a1b2", "text": "two", "hook": "lead two", "status": "pending"},
+        {"id": "a1b3", "text": "three", "hook": "lead three", "status": "pending"},
+    ]}, "bad"]))
     out = arc.plan_initial_arc("p", "", "", [], lambda *a, **k: raw)
     assert out["acts"][0]["n"] == 1
     assert out["pressures"][0]["steps"][0]["at_minutes"] == 60
