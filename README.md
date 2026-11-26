@@ -9,11 +9,11 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 ## Features (v4)
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
-- **Hidden Story Arc & Difficulty Pacing (P3)**: Optional hidden 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The hidden arc never leaks to player transcripts or UI.
+- **Story Arc & Difficulty Pacing (P3)**: Optional 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The complete arc is available in the collapsed Arc debug panel and `/api/state`; it is also included in campaign ZIP exports only when `?include_arc=1` is set.
 - **Beat Hooks & Mandatory Moves (WP2)**: Each beat carries a spoiler-safe `hook` — a lead the player can perceive — which `allowed_moves()` pushes once the act stalls. Every due move is mandatory: the analyst plays it or lists it in `deferred`, and `clamp_brief` forces in anything it drops. A hook escalates subtle → overt → offer while it goes unanswered.
 - **Arc Drift & Act Pacing (WP6)**: The record pass tracks on-arc progress, replans after `drift_turns` consecutive off-arc turns, retains superseded beats for history, and can force an act transition after `act_max_turns`.
 - **Canon Naming & Merge (WP7)**: Ledger entries keep up to six alternate names; lookups resolve aliases, duplicate entries can be merged, and continuity audits report alias collisions.
-- **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Contains no arc data.
+- **Steering State (WP1)**: Optional player-facing objective and open question (`steering.json`), written by the record pass after each reply and shown in the web UI's Now panel and the CLI `/now` command. Stores a compact steering summary separately from the inspectable arc state.
 - **Narrator Contract (WP4)**: Every reply has three parts — the consequence, at most one new fact, and a closing line stating the live decision. The brief's fields are defined for the narrator in the prompt, so `end`, `push`, `clarify` and `intent=ask` work with style enforcement off. `brief.narration.words` is the single word target.
 - **Director's Analyst Brief (P2)**: Optional pre-turn director call producing structured JSON guidance (`briefs.jsonl`) clamped in code (intent, assessment, outcome, plot moves, keep-true items). Fallback never blocks play; its diagnostic category is stored outside the narrator-visible brief.
 - **Out-of-Character (OOC) Notes Routing (P2)**: Messages starting with `//`, `ooc`, or `note to dm:` bypass `history.jsonl` and are answered out of character in `notes.jsonl`. Promoted to canon only upon explicit request.
@@ -66,7 +66,7 @@ lean-dm/
         ├── steering.json     # Player-facing objective and open question
         ├── steering_snap/    # Pre-turn steering snapshots for safe undo/retry
         │   └── <msg>.json
-        ├── arc.json          # Hidden narrative arc & pressure clock (never leaked)
+        ├── arc.json          # Narrative arc plan and pressure clock (inspectable in Arc debug)
         ├── arc_log.jsonl     # Arc revision log (act boundaries)
         ├── records.jsonl     # Per-turn record pass output
         └── arc_snap/         # Pre-turn arc snapshots for safe undo/retry
@@ -92,7 +92,7 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `ctx_target_tok` | int | `200000` | global | Context | Token target after folding |
 | `ledger_enabled` | bool | `true` | global | Context | Enable keyed canon ledger |
 | `difficulty` | select | `standard` | campaign | Gameplay | Pacing: `story`, `standard`, `hard` |
-| `arc_enabled` | bool | `false` | campaign | Gameplay | Enable hidden narrative arc manager |
+| `arc_enabled` | bool | `false` | campaign | Gameplay | Enable narrative arc manager and Arc debug panel |
 | `drift_turns` | int | `4` | campaign | Arc | Consecutive off-arc turns before a replan is triggered |
 | `act_max_turns` | int | `0` | campaign | Arc | Max turns in an act before forced transition (0 = off) |
 | `steering_enabled` | bool | `false` | campaign | Gameplay | Track the player-facing objective and open question |
@@ -171,7 +171,7 @@ python dm.py --show-context
 - `GET /healthz`: Unauthenticated liveness probe for container healthchecks.
 - `GET /`: Game interface.
 - `GET /config`: Settings management interface.
-- `GET /api/state`: Returns game status, turns, ledger, premise, non-spoiler arc chip, the player-facing steering fields, and the `shape_ok` / `overlong` post-check flags.
+- `GET /api/state`: Returns game status, turns, ledger, premise, the arc chip, full `arc_debug` data when arc management is enabled, player-facing steering fields, and the `shape_ok` / `overlong` post-check flags.
 - `POST /api/turn`: Standard turn completion (`{"text": "..."}`).
 - `POST /api/stream`: Server-Sent Events (SSE) streaming turn with stages: `analyzing` → `narrating` → `recording`.
 - `POST /api/undo`: Rewinds last exchange.

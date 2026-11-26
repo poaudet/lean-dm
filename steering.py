@@ -1,8 +1,8 @@
 """steering.py — player-facing steering state (objective, open question, live lead).
 
 Doctrine:
-- I8: steering.json holds player-facing text only. Arc ids, beat text, pressure ids
-  and antagonist data never reach it.
+- Steering remains a compact, separate summary; the complete arc is inspectable through
+  the explicit arc-debug state payload. No secrecy guarantee is built around arc data.
 - A2: the record pass is the single writer; it runs after the reply is committed.
 - A4: a failed update keeps the previous state, bumps the stall counter and marks the
   source as fallback. It never blocks the turn.
@@ -117,13 +117,15 @@ def clamp_steering(raw, previous=None, msg_idx=0, source="record"):
     prev = previous if isinstance(previous, dict) else default_steering()
     data = raw if isinstance(raw, dict) else {}
     objective = _text(data.get("objective"), MAX_TEXT) or _text(prev.get("objective"), MAX_TEXT)
-    open_question = (_text(data.get("open_question"), MAX_TEXT)
-                     or _text(prev.get("open_question"), MAX_TEXT))
+    open_question = (
+        _text(data.get("open_question"), MAX_TEXT)
+        if "open_question" in data else _text(prev.get("open_question"), MAX_TEXT)
+    )
     if "active_hook" in data:
         active_hook = _text(data.get("active_hook"), MAX_HOOK) or None
     else:
         active_hook = prev.get("active_hook") if isinstance(prev.get("active_hook"), str) else None
-    progress = bool(data.get("progress", False))
+    progress = data.get("progress") is True
     if not progress and objective and objective != _text(prev.get("objective"), MAX_TEXT):
         progress = True                     # A2: a changed objective counts as progress
     return {
@@ -147,7 +149,7 @@ def stalled_steering(previous, msg_idx):
 
 
 def render_steering(state):
-    """Player-facing steering block for the narrator and analyst prompts (I8: no arc data)."""
+    """Render the compact steering summary for narrator and analyst prompts."""
     if not isinstance(state, dict):
         return ""
     lines = []

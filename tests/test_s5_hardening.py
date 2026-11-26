@@ -10,7 +10,7 @@ def _arc(**over):
         "version": 1, "central_question": "Q?", "act": 1, "clock": {"minutes": 90},
         "acts": [{"n": 1, "status": "active", "goal": "g", "beats": []}],
         "pressures": [{"id": "p1", "status": "active",
-                       "steps": [{"id": "s1", "status": "pending", "at_minutes": "60", "effect": "x"}]}],
+                       "steps": [{"id": "s1", "status": "pending", "at_minutes": 60, "effect": "x"}]}],
     }
     base.update(over)
     return base

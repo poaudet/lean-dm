@@ -343,3 +343,31 @@ Alternatives considered: Rely on model-inferred field semantics (ambiguous outpu
 | Docs, CI and playtest procedure | Covered | `README.md`, `.github/workflows/ci.yml`, `docs/playtest.md` |
 
 ---
+
+
+## D-33  Arc state is inspectable for debugging
+
+Supersedes D-10's prohibition on showing the arc in the UI and the secrecy clauses in D-21 and the original I8 implementation notes.
+
+Decision: Arc data is not sensitive campaign state. When arc management is enabled, `/api/state` exposes the complete arc as `arc_debug`, and the UI renders it in a collapsed “Arc debug (spoilers)” panel. Players may inspect it; cheating is an accepted choice and visibility supports debugging. Campaign ZIP exports continue to omit arc internals by default and include them when `?include_arc=1` is requested. No additional owner-only authentication or sanitization is required beyond the app's existing global authentication configuration. Steering remains a separate compact summary, but it is not treated as a security boundary.
+
+Alternatives considered: Hide arc data from all player-facing responses (rejected: prevents debugging); require a separate owner role for debug/export access (rejected: there is no owner/player role model and the arc is not sensitive).
+
+
+## D-34  Clarification turns leave scheduled story moves untouched
+
+Decision: When the analyst supplies a non-empty `clarify`, the narrator asks that one in-character question. The brief plays no plot moves, defers none, and cannot complete an act. The record pass does not run, the arc clock/progress and steering remain unchanged, and empty-pressure autofill is skipped. Due moves remain scheduled and are reconsidered on the next ordinary turn, including when a pressure deadline is already due. `intent=ask` retains its existing non-advancing behavior.
+
+Alternatives considered: Play mandatory moves during a clarification (contradicts “advance nothing”); defer them (changes their deferral streak and can force play on a clarification); consume or cancel them (loses scheduled story state).
+
+## D-35  Arc scheduling works without the analyst
+
+Decision: `analyst_enabled` controls only the optional model call. When `arc_enabled` is true and the analyst is off, code builds a fallback brief containing all currently due moves (up to the existing brief cap), so mandatory arc moves still reach the narrator and record pass. Retry reconstructs the same code-generated brief from the pre-turn arc snapshot. With arc disabled, no arc brief is built.
+
+Alternatives considered: Require analyst_enabled whenever arc_enabled is true (unnecessarily couples independent settings); silently omit due moves (breaks mandatory scheduling).
+
+## D-36  Active hook is an optional record-owned steering field
+
+Decision: `active_hook` is an optional player-perceivable current lead supplied by the record pass, limited to 200 characters. Omission preserves the previous value; explicit null/empty clears it. It is a compact steering summary, not a secrecy boundary; the full arc remains inspectable under D-33.
+
+Alternatives considered: Derive it from the first pending beat in code (may surface a stale or contextually irrelevant lead); remove the field (loses the existing Now-panel contract).
