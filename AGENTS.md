@@ -1,8 +1,8 @@
 # Lean-DM: Remaining Work
 
-This file tracks only the outstanding issues identified in the independent review of `handoff/steering-requirements-wp1` at `db39edc`. The steering handoff packages and prompt/documentation work already merged are not repeated here. Treat the items below as review findings to verify and resolve; do not assume a proposed fix is correct until its behavior is covered by tests.
+This file tracks follow-up work left after the steering/arc review fixes in this branch. The former code findings (record validation, clarification behavior, pressure scheduling, analyst prompt limits, planner constraints, flag combinations, arc debug visibility/export policy, active-hook contract, and OOC prompt examples) have been addressed with regression coverage. See `decisions.md` for the associated product decisions.
 
-## High priority
+## Release verification still outstanding
 
 ### 1. Arc visibility and debug access (resolved by D-33)
 
@@ -10,49 +10,49 @@ The product decision is that arc data is not sensitive: players may inspect it, 
 
 **Acceptance:** `arc_debug` exposes the full active arc when enabled, the UI renders it in a collapsed spoiler-labelled panel, and it is absent when arc management is disabled.
 
-## Medium priority
+### 2. Execute the documented manual playtest
 
-### 2. Allow the record pass to clear a resolved open question
+The documented playtest has not yet been run.
 
-**Relevant code:** `steering.py`, `clamp_steering()` (currently around line 119).
+**Relevant guide:** `docs/playtest.md`.
 
-An explicit empty or null `open_question` currently falls back to the previous value, so a resolved question can remain visible indefinitely.
+**Remaining work:** Execute the full playtest, including the scripted off-arc/replan scenario. Pay particular attention to clarification turns, pressure deadlines, Arc debug visibility, undo, and retry behavior.
 
-**Remaining work:** Distinguish an omitted field (preserve the previous value) from an explicitly supplied empty/null value (clear it), consistent with the record-output contract.
+**Acceptance:** Record the date, environment, scenarios completed, and any defects or deviations. All required scenarios pass or have tracked follow-up issues.
 
-**Acceptance:** Test that omission preserves the previous question and explicit empty/null clears it.
+### 3. Establish a coverage baseline
 
-### 3. Strictly validate record booleans and beat IDs
+No line or branch coverage percentage is currently available; `coverage`/`pytest-cov` was not installed or configured in the reviewed environment.
 
-**Relevant code:** `arc.py` record normalization and `run_record_pass()` (around lines 978–1006 and 1035–1036); `analyst.py` brief clamping (around line 288); `steering.py` progress handling.
+**Remaining work:** Decide whether coverage tooling should be added. Do not add or change dependencies without approval. If approved and configured, establish a baseline and identify untested branches in steering, arc recording/scheduling, and analyst brief/prompt handling.
 
-Truthiness conversions such as `bool("false")` treat invalid string values as true. In addition, arbitrary non-empty `beats_done` values can reset stalled-turn counters, and `matched_beats` is not consistently restricted to IDs in the active act.
+**Acceptance:** Document the coverage command and baseline, or record an explicit decision not to add coverage tooling.
 
-**Remaining work:** Validate booleans as actual booleans (or an explicitly documented accepted representation); reject or safely default malformed values. Filter matched/completed beat IDs against the active act. Reset drift/stall counters only when a newly completed, valid beat is recorded.
+### 4. Expand strict typing verification
 
-**Acceptance:** Cover string booleans, malformed values, unknown IDs, IDs from another act, duplicate IDs, and a valid newly completed beat. Assert invalid output cannot trigger act transitions or reset drift counters.
+Strict mypy was run only for `campaign.py`, `storage.py`, and `style_guard.py`.
 
-### 4. Make `clarify` intent non-advancing
+**Remaining work:** Agree on the intended typing scope, then run strict mypy across the remaining application modules. Fix newly exposed issues without broad unrelated cleanup.
 
-**Relevant code:** `analyst.py` `clamp_brief()` (around lines 283–294); `arc.py` `run_record_pass()` (around lines 904–911).
+**Acceptance:** Record the exact command and exit status for the agreed module set, and track any intentionally excluded modules with reasons.
 
-The `ask` intent suppresses moves, but `clarify` does not. A clarify brief can therefore retain due moves and the record pass can continue to advance the story/clock, despite the requirement that clarification asks one short in-character question and advances nothing.
+### 5. Perform a live service/deployment smoke check
 
-**Remaining work:** Define and implement the interaction between `clarify`, mandatory due moves, and clock advancement. Preserve mandatory-move guarantees for ordinary turns, but make the clarify behavior explicit and consistent across analyst and record passes.
+The Docker image build passed locally/through prior CI, but no live container/service healthcheck was performed.
 
-**Acceptance:** With due moves present, a clarify turn asks one short in-character question, plays/defer no story moves, and does not advance story time or arc progress. Add a separate test for the chosen behavior when mandatory pressure deadlines coincide with clarify.
+**Remaining work:** Start the built image in a representative target environment and verify startup, configured health endpoint, static UI delivery, and one basic state/API request. Do not expose credentials or production data in logs or reports.
 
-### 5. Keep auto-filled pressure steps within the deadline
+**Acceptance:** Record image identifier, environment, healthcheck result, and smoke-test result. Any deployment-only failures are tracked separately from local test results.
 
-**Relevant code:** `arc.py`, `fill_empty_pressures()` (around lines 1240–1251).
+### 6. Obtain CI results for the implementation branch
 
-The function checks whether a pressure is sufficiently far from its deadline before filling it, but generated steps can still be scheduled after the deadline. The current incremental offset can also push later generated steps farther out than intended.
+Draft PR creation was previously rejected by the GitHub integration with HTTP 403 (`Resource not accessible by integration`), so no CI run was available for the implementation commit.
 
-**Remaining work:** Calculate future step times against the effective deadline and the required minimum spacing. Do not create unreachable steps beyond the deadline; define a safe fallback when there is insufficient room for another step.
+**Remaining work:** Open a draft PR from the implementation branch against `handoff/steering-requirements-wp1` when repository permissions allow, then inspect all check runs and status contexts. Treat queued/in-progress checks as pending, not passing.
 
-**Acceptance:** Add tests near the deadline, including a case with a current clock of 160 and deadline of 300, and assert every generated step is reachable and respects spacing.
+**Acceptance:** Record the PR URL and quote the final CI check conclusions. Resolve any failing checks before marking the PR ready.
 
-### 6. Enforce the analyst prompt cap across the complete assembled prompt
+## Working rules
 
 **Relevant code:** `analyst.py`, `_cap_blocks()` and prompt assembly (around lines 577–604).
 
