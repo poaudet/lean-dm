@@ -1055,7 +1055,7 @@ def game_state():
         "last_words": _int(st.get("last_words", 0)),
         "word_budget": _int(st.get("word_budget", 0)),
         "arc_chip": arc_chip,
-        "arc_debug": arc_state,
+        "arc_debug": arc_state if (cfg.arc_debug and cfg.arc_enabled) else None,   # D-37: debug mode only
         "can_undo": can_undo,
         "can_retry": can_undo,
         "undo_blocked_reason": undo_reason,
@@ -1368,7 +1368,7 @@ def api_export_transcript():
 @app.route("/api/export/campaign.zip", methods=["GET"])
 def api_export_zip():
     buf = io.BytesIO()
-    include_arc = request.args.get("include_arc") == "1"
+    include_arc = bool(cfg.arc_debug) and request.args.get("include_arc") == "1"   # D-37: needs debug mode
     arc_names = {"arc.json", "arc_log.jsonl", "records.jsonl", "briefs.jsonl", "arc_snap"}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in ROOT.rglob("*"):

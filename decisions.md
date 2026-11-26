@@ -371,3 +371,13 @@ Alternatives considered: Require analyst_enabled whenever arc_enabled is true (u
 Decision: `active_hook` is an optional player-perceivable current lead supplied by the record pass, limited to 200 characters. Omission preserves the previous value; explicit null/empty clears it. It is a compact steering summary, not a secrecy boundary; the full arc remains inspectable under D-33.
 
 Alternatives considered: Derive it from the first pending beat in code (may surface a stale or contextually irrelevant lead); remove the field (loses the existing Now-panel contract).
+
+## D-37  Arc inspection needs debug mode
+
+Amends D-33. Reconciles D-33 with the handoff's I8 and D-10 intent: arc data is still not sensitive and nothing is sanitized, but it must not be one click from the play UI.
+
+Decision: a new global setting `arc_debug` (default `false`) is the debug mode. Only when it is on, and `arc_enabled` is on, does `/api/state` return the full arc as `arc_debug`, which is what makes the collapsed "Arc debug (spoilers)" panel appear. Campaign ZIP exports keep omitting arc internals by default; `?include_arc=1` is now honoured only when debug mode is on and is silently ignored otherwise. With debug mode off, `/api/state` carries only the non-spoiler arc chip and the player-facing steering fields, which restores D-10 for normal play.
+
+The setting is global-scoped on purpose: it lives in the global settings page, so on a non-loopback host it sits behind the existing global-settings lock and web_password, and a campaign file cannot switch it on. It is a visibility gate for the UI and API, not access control; anyone who can edit settings or read the campaign folder can still see the arc, which is accepted. `active_hook` and the steering fields stay player-facing and are unaffected.
+
+Alternatives considered: a per-campaign flag (a shared or imported campaign file could turn spoilers on); a `?debug=1` query parameter or a toggle on the play screen (one click from the spoilers, the problem this fixes); an environment variable only (not discoverable); owner-only auth (no role model exists, and the arc is not sensitive).

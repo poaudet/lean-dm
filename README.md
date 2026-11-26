@@ -9,7 +9,7 @@ Doctrine: **Files are the source of truth; context is assembled by code.**
 ## Features (v4)
 
 - **Verbatim Context & Sliding Window Folding**: Models see the verbatim recent play. Older turns are folded into summary chapters while key facts live in an indexed canon ledger appended to the latest message (provider prefix cache friendly).
-- **Story Arc & Difficulty Pacing (P3)**: Optional 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The complete arc is available in the collapsed Arc debug panel and `/api/state`; it is also included in campaign ZIP exports only when `?include_arc=1` is set.
+- **Story Arc & Difficulty Pacing (P3)**: Optional 3-act narrative arc (`arc.json`, `arc_snap/`, `records.jsonl`). Per-turn record passes track clock progression, pressure deadlines, and beat resolution. Pure function `allowed_moves()` schedules due antagonist pressure moves with difficulty bending (`story`, `standard`, `hard`). Hard never bends. The complete arc is only exposed in debug mode (`arc_debug: true`, global setting, off by default): then it appears in the collapsed Arc debug panel and `/api/state`, and campaign ZIP exports include it with `?include_arc=1`.
 - **Beat Hooks & Mandatory Moves (WP2)**: Each beat carries a spoiler-safe `hook` — a lead the player can perceive — which `allowed_moves()` pushes once the act stalls. Every due move is mandatory: the analyst plays it or lists it in `deferred`, and `clamp_brief` forces in anything it drops. A hook escalates subtle → overt → offer while it goes unanswered.
 - **Arc Drift & Act Pacing (WP6)**: The record pass tracks on-arc progress, replans after `drift_turns` consecutive off-arc turns, retains superseded beats for history, and can force an act transition after `act_max_turns`.
 - **Canon Naming & Merge (WP7)**: Ledger entries keep up to six alternate names; lookups resolve aliases, duplicate entries can be merged, and continuity audits report alias collisions.
@@ -95,6 +95,7 @@ Settings are stored in `campaigns/settings.json` (override with `DM_SETTINGS`). 
 | `arc_enabled` | bool | `false` | campaign | Gameplay | Enable narrative arc manager and Arc debug panel |
 | `drift_turns` | int | `4` | campaign | Arc | Consecutive off-arc turns before a replan is triggered |
 | `act_max_turns` | int | `0` | campaign | Arc | Max turns in an act before forced transition (0 = off) |
+| `arc_debug` | bool | `false` | global | Arc | Debug mode: expose the full arc (spoilers) in `/api/state`, the Arc debug panel and `?include_arc=1` exports |
 | `steering_enabled` | bool | `false` | campaign | Gameplay | Track the player-facing objective and open question |
 | `style_enabled` | bool | `false` | campaign | Style | Enable style enforcement |
 | `style_preset` | select | `none` | campaign | Style | Preset: `none`, `subtle`, `pulp`, `noir`, `terse` |
@@ -171,7 +172,7 @@ python dm.py --show-context
 - `GET /healthz`: Unauthenticated liveness probe for container healthchecks.
 - `GET /`: Game interface.
 - `GET /config`: Settings management interface.
-- `GET /api/state`: Returns game status, turns, ledger, premise, the arc chip, full `arc_debug` data when arc management is enabled, player-facing steering fields, and the `shape_ok` / `overlong` post-check flags.
+- `GET /api/state`: Returns game status, turns, ledger, premise, the arc chip, full `arc_debug` data only when arc management and debug mode (`arc_debug` setting) are both enabled (otherwise `null`), player-facing steering fields, and the `shape_ok` / `overlong` post-check flags.
 - `POST /api/turn`: Standard turn completion (`{"text": "..."}`).
 - `POST /api/stream`: Server-Sent Events (SSE) streaming turn with stages: `analyzing` → `narrating` → `recording`.
 - `POST /api/undo`: Rewinds last exchange.
@@ -181,7 +182,7 @@ python dm.py --show-context
 - `GET /api/notes`: Returns OOC notes list.
 - `POST /api/notes/<id>/canon`: Promotes an OOC note or proposal to canon.
 - `GET /api/export/transcript`: Downloads campaign transcript as Markdown.
-- `GET /api/export/campaign.zip`: Downloads campaign archive zip (arc internals excluded by default; add `?include_arc=1` to include them).
+- `GET /api/export/campaign.zip`: Downloads campaign archive zip (arc internals excluded by default; `?include_arc=1` includes them only when `arc_debug` is on).
 - `GET /api/campaigns` & `POST /api/campaigns`: List, create, or duplicate campaigns.
 
 ---

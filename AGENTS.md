@@ -4,11 +4,11 @@ This file tracks follow-up work left after the steering/arc review fixes in this
 
 ## Release verification still outstanding
 
-### 1. Arc visibility and debug access (resolved by D-33)
+### 1. Arc visibility and debug access (resolved by D-33, amended by D-37)
 
-The product decision is that arc data is not sensitive: players may inspect it, and the collapsed Arc debug panel plus `/api/state` payload are intentional. Do not add sanitization or owner-only access controls to hide arc data. Steering remains a separate compact summary for prompt/UI clarity, not a secrecy boundary.
+The product decision is that arc data is not sensitive, but it is gated behind debug mode (global setting `arc_debug`, default off, D-37). With debug mode on, the collapsed Arc debug panel and the `/api/state` payload expose the arc. Do not add sanitization or owner-only access controls to hide arc data, and do not add a play-screen toggle that turns debug mode on. Steering remains a separate compact summary for prompt/UI clarity, not a secrecy boundary.
 
-**Acceptance:** `arc_debug` exposes the full active arc when enabled, the UI renders it in a collapsed spoiler-labelled panel, and it is absent when arc management is disabled.
+**Acceptance:** `arc_debug` is `null` unless both `arc_enabled` and the `arc_debug` setting are on; then it exposes the full active arc and the UI renders it in a collapsed spoiler-labelled panel.
 
 ### 2. Execute the documented manual playtest
 
@@ -82,11 +82,11 @@ Arc and analyst flags are independently configurable, but due arc moves are curr
 
 **Acceptance:** Test all four combinations of arc/analyst enabled and disabled, especially arc on + analyst off with due moves.
 
-### 9. Arc export policy (resolved by D-33)
+### 9. Arc export policy (resolved by D-33, amended by D-37)
 
-`/api/export/campaign.zip` intentionally omits arc internals by default and includes them with `?include_arc=1`. Arc data is not sensitive, so no additional owner-only authorization is required; the app's existing global authentication configuration remains in force.
+`/api/export/campaign.zip` intentionally omits arc internals by default and includes them with `?include_arc=1` only when debug mode (`arc_debug`) is on. Arc data is not sensitive, so no additional owner-only authorization is required; the app's existing global authentication configuration remains in force.
 
-**Acceptance:** Keep regression coverage for both export modes and document the opt-in flag in the README.
+**Acceptance:** Keep regression coverage for both export modes, including `include_arc=1` being ignored without debug mode, and document the opt-in flag in the README.
 
 ## Low priority / contract clarification
 

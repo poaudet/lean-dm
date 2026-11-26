@@ -124,6 +124,9 @@ FIELDS = [
     # ---- arc pacing
     F("drift_turns", "Drift turns", "int", 4, "Arc", "Consecutive off-arc turns before a replan is triggered.", scope="campaign", min=1),
     F("act_max_turns", "Act max turns", "int", 0, "Arc", "Max turns in an act before forced transition (0 = off).", scope="campaign", min=0),
+    F("arc_debug", "Arc debug mode", "bool", False, "Arc",
+      "Developer mode. Exposes the full hidden arc (spoilers) in /api/state, the Arc debug panel and ZIP exports requested with ?include_arc=1. Off by default.",
+      scope="global"),
     # ---- prompt
     F("system_prompt", "DM system prompt", "text", DEFAULT_SYSTEM, "Prompt", "Persona and rules for the narrator. Applies from the next turn.", scope="global", required=True),
     # ---- app
